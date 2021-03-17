@@ -65,53 +65,107 @@ func TestClosedTimestampCanServe(t *testing.T) {
 	// drives up the test duration.
 	skip.UnderRace(t)
 
+	testutils.RunTrueAndFalse(t, "withNonVoters", func(t *testing.T, withNonVoters bool) {
+		ctx := context.Background()
+		dbName, tableName := "cttest", "kv"
+		clusterArgs := aggressiveResolvedTimestampClusterArgs
+		// Disable the replicateQueue so that it doesn't interfere with replica
+		// membership ranges.
+		clusterArgs.ReplicationMode = base.ReplicationManual
+		tc, db0, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
+			testingCloseFraction, clusterArgs, dbName, tableName)
+		defer tc.Stopper().Stop(ctx)
+
+		if _, err := db0.Exec(`INSERT INTO cttest.kv VALUES(1, $1)`, "foo"); err != nil {
+			t.Fatal(err)
+		}
+
+		if withNonVoters {
+			desc = tc.AddNonVotersOrFatal(t, desc.StartKey.AsRawKey(), tc.Target(1),
+				tc.Target(2))
+		} else {
+			desc = tc.AddVotersOrFatal(t, desc.StartKey.AsRawKey(), tc.Target(1),
+				tc.Target(2))
+		}
+
+		repls := replsForRange(ctx, t, tc, desc, numNodes)
+		ts := tc.Server(0).Clock().Now()
+		baRead := makeTxnReadBatchForDesc(desc, ts)
+		testutils.SucceedsSoon(t, func() error {
+			return verifyCanReadFromAllRepls(ctx, t, baRead, repls, expectRows(1))
+		})
+
+		// We just served a follower read. As a sanity check, make sure that we can't write at
+		// that same timestamp.
+		{
+			var baWrite roachpb.BatchRequest
+			r := &roachpb.DeleteRequest{}
+			r.Key = desc.StartKey.AsRawKey()
+			txn := roachpb.MakeTransaction("testwrite", r.Key, roachpb.NormalUserPriority, ts, 100)
+			baWrite.Txn = &txn
+			baWrite.Add(r)
+			baWrite.RangeID = repls[0].RangeID
+			if err := baWrite.SetActiveTimestamp(tc.Server(0).Clock().Now); err != nil {
+				t.Fatal(err)
+			}
+
+			var found bool
+			for _, repl := range repls {
+				resp, pErr := repl.Send(ctx, baWrite)
+				if errors.HasType(pErr.GoError(), (*roachpb.NotLeaseHolderError)(nil)) {
+					continue
+				} else if pErr != nil {
+					t.Fatal(pErr)
+				}
+				found = true
+				if resp.Txn.WriteTimestamp.LessEq(ts) || resp.Txn.ReadTimestamp == resp.Txn.WriteTimestamp {
+					t.Fatal("timestamp did not get bumped")
+				}
+				break
+			}
+			if !found {
+				t.Fatal("unable to send to any replica")
+			}
+		}
+	})
+}
+
+func TestClosedTimestampCanServeOnVoterIncoming(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Limiting how long transactions can run does not work well with race unless
+	// we're extremely lenient, which drives up the test duration.
+	skip.UnderRace(t)
+
 	ctx := context.Background()
-	tc, db0, desc, repls := setupClusterForClosedTimestampTesting(ctx, t, testingTargetDuration,
-		testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	dbName, tableName := "cttest", "kv"
+	clusterArgs := aggressiveResolvedTimestampClusterArgs
+	clusterArgs.ReplicationMode = base.ReplicationManual
+	knobs, ltk := makeReplicationTestKnobs()
+	clusterArgs.ServerArgs.Knobs = knobs
+	tc, db0, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration, testingCloseFraction,
+		clusterArgs, dbName, tableName)
 	defer tc.Stopper().Stop(ctx)
 
 	if _, err := db0.Exec(`INSERT INTO cttest.kv VALUES(1, $1)`, "foo"); err != nil {
 		t.Fatal(err)
 	}
+	// Add a new voting replica, which should get the range into a joint config.
+	// It will stay in that state because of the `VoterAddStopAfterJointConfig`
+	// testing knob `makeReplicationTestKnobs()`.
+	ltk.withStopAfterJointConfig(func() {
+		tc.AddVotersOrFatal(t, desc.StartKey.AsRawKey(), tc.Target(1), tc.Target(2))
+	})
 
-	ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-	baRead := makeReadBatchRequestForDesc(desc, ts)
+	reqTS := tc.Server(0).Clock().Now()
+	// Sleep for a sufficiently long time so that reqTS can be closed.
+	time.Sleep(3 * testingTargetDuration)
+	baRead := makeTxnReadBatchForDesc(desc, reqTS)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 	testutils.SucceedsSoon(t, func() error {
 		return verifyCanReadFromAllRepls(ctx, t, baRead, repls, expectRows(1))
 	})
-
-	// We just served a follower read. As a sanity check, make sure that we can't write at
-	// that same timestamp.
-	{
-		var baWrite roachpb.BatchRequest
-		r := &roachpb.DeleteRequest{}
-		r.Key = desc.StartKey.AsRawKey()
-		txn := roachpb.MakeTransaction("testwrite", r.Key, roachpb.NormalUserPriority, ts, 100)
-		baWrite.Txn = &txn
-		baWrite.Add(r)
-		baWrite.RangeID = repls[0].RangeID
-		if err := baWrite.SetActiveTimestamp(tc.Server(0).Clock().Now); err != nil {
-			t.Fatal(err)
-		}
-
-		var found bool
-		for _, repl := range repls {
-			resp, pErr := repl.Send(ctx, baWrite)
-			if errors.HasType(pErr.GoError(), (*roachpb.NotLeaseHolderError)(nil)) {
-				continue
-			} else if pErr != nil {
-				t.Fatal(pErr)
-			}
-			found = true
-			if resp.Txn.WriteTimestamp.LessEq(ts) || resp.Txn.ReadTimestamp == resp.Txn.WriteTimestamp {
-				t.Fatal("timestamp did not get bumped")
-			}
-			break
-		}
-		if !found {
-			t.Fatal("unable to send to any replica")
-		}
-	}
 }
 
 // TestClosedTimestampCanServerThroughoutLeaseTransfer verifies that lease
@@ -127,15 +181,16 @@ func TestClosedTimestampCanServeThroughoutLeaseTransfer(t *testing.T) {
 	skip.UnderRace(t)
 
 	ctx := context.Background()
-	tc, db0, desc, repls := setupClusterForClosedTimestampTesting(ctx, t, testingTargetDuration,
-		testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	tc, db0, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
+		testingCloseFraction, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 
 	if _, err := db0.Exec(`INSERT INTO cttest.kv VALUES(1, $1)`, "foo"); err != nil {
 		t.Fatal(err)
 	}
-	ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-	baRead := makeReadBatchRequestForDesc(desc, ts)
+	ts := tc.Server(0).Clock().Now()
+	baRead := makeTxnReadBatchForDesc(desc, ts)
 	testutils.SucceedsSoon(t, func() error {
 		return verifyCanReadFromAllRepls(ctx, t, baRead, repls, expectRows(1))
 	})
@@ -167,7 +222,7 @@ func TestClosedTimestampCanServeThroughoutLeaseTransfer(t *testing.T) {
 	// Attempt to send read requests to a replica in a tight loop until deadline
 	// is reached. If an error is seen on any replica then it is returned to the
 	// errgroup.
-	baRead = makeReadBatchRequestForDesc(desc, ts)
+	baRead = makeTxnReadBatchForDesc(desc, ts)
 	ensureCanReadFromReplicaUntilDeadline := func(r *kvserver.Replica) {
 		g.Go(func() error {
 			for timeutil.Now().Before(deadline) {
@@ -200,9 +255,10 @@ func TestClosedTimestampCanServeWithConflictingIntent(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc, _, desc, repls := setupClusterForClosedTimestampTesting(ctx, t, testingTargetDuration,
-		testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	tc, _, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
+		testingCloseFraction, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 	ds := tc.Server(0).DistSenderI().(*kvcoord.DistSender)
 
 	// Write N different intents for the same transaction, where N is the number
@@ -226,29 +282,21 @@ func TestClosedTimestampCanServeWithConflictingIntent(t *testing.T) {
 	// Read a different intent on each replica. All should begin waiting on the
 	// intents by pushing the transaction that wrote them. None should complete.
 	ts := txn.WriteTimestamp
-	respCh := make(chan struct{}, len(keys))
+	respCh := make(chan error, len(keys))
 	for i, key := range keys {
 		go func(repl *kvserver.Replica, key roachpb.Key) {
-			var baRead roachpb.BatchRequest
-			r := &roachpb.ScanRequest{}
-			r.Key = key
-			r.EndKey = key.Next()
-			baRead.Add(r)
-			baRead.Timestamp = ts
-			baRead.RangeID = desc.RangeID
-
-			testutils.SucceedsSoon(t, func() error {
+			baRead := makeTxnReadBatchForDesc(desc, ts)
+			respCh <- testutils.SucceedsSoonError(func() error {
 				// Expect 0 rows, because the intents will be aborted.
 				_, err := expectRows(0)(repl.Send(ctx, baRead))
 				return err
 			})
-			respCh <- struct{}{}
 		}(repls[i], key)
 	}
 
 	select {
-	case <-respCh:
-		t.Fatal("request unexpectedly succeeded, should block")
+	case err := <-respCh:
+		t.Fatalf("request unexpectedly returned, should block; err: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
 
@@ -263,7 +311,7 @@ func TestClosedTimestampCanServeWithConflictingIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range keys {
-		<-respCh
+		require.NoError(t, <-respCh)
 	}
 }
 
@@ -282,8 +330,9 @@ func TestClosedTimestampCanServeAfterSplitAndMerges(t *testing.T) {
 	skip.UnderRace(t)
 
 	ctx := context.Background()
-	tc, db0, desc, repls := setupClusterForClosedTimestampTesting(ctx, t, testingTargetDuration,
-		testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	tc, db0, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
+		testingCloseFraction, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 	// Disable the automatic merging.
 	if _, err := db0.Exec("SET CLUSTER SETTING kv.range_merge.queue_enabled = false"); err != nil {
 		t.Fatal(err)
@@ -298,8 +347,8 @@ func TestClosedTimestampCanServeAfterSplitAndMerges(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Start by ensuring that the values can be read from all replicas at ts.
-	ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-	baRead := makeReadBatchRequestForDesc(desc, ts)
+	ts := tc.Server(0).Clock().Now()
+	baRead := makeTxnReadBatchForDesc(desc, ts)
 	testutils.SucceedsSoon(t, func() error {
 		return verifyCanReadFromAllRepls(ctx, t, baRead, repls, expectRows(2))
 	})
@@ -325,10 +374,10 @@ func TestClosedTimestampCanServeAfterSplitAndMerges(t *testing.T) {
 	// Now immediately query both the ranges and there's 1 value per range.
 	// We need to tolerate RangeNotFound as the split range may not have been
 	// created yet.
-	baReadL := makeReadBatchRequestForDesc(lr, ts)
+	baReadL := makeTxnReadBatchForDesc(lr, ts)
 	require.Nil(t, verifyCanReadFromAllRepls(ctx, t, baReadL, lRepls,
 		respFuncs(retryOnRangeNotFound, expectRows(1))))
-	baReadR := makeReadBatchRequestForDesc(rr, ts)
+	baReadR := makeTxnReadBatchForDesc(rr, ts)
 	require.Nil(t, verifyCanReadFromAllRepls(ctx, t, baReadR, rRepls,
 		respFuncs(retryOnRangeNotFound, expectRows(1))))
 
@@ -340,7 +389,7 @@ func TestClosedTimestampCanServeAfterSplitAndMerges(t *testing.T) {
 	// The hazard here is that a follower is not yet aware of the merge and will
 	// return an error. We'll accept that because a client wouldn't see that error
 	// from distsender.
-	baReadMerged := makeReadBatchRequestForDesc(merged, ts)
+	baReadMerged := makeTxnReadBatchForDesc(merged, ts)
 	require.Nil(t, verifyCanReadFromAllRepls(ctx, t, baReadMerged, mergedRepls,
 		respFuncs(retryOnRangeKeyMismatch, expectRows(2))))
 }
@@ -351,7 +400,7 @@ func getTableID(db *gosql.DB, dbName, tableName string) (tableID descpb.ID, err 
 	return
 }
 
-func TestClosedTimestampCantServeBasedOnMaxTimestamp(t *testing.T) {
+func TestClosedTimestampCantServeBasedOnUncertaintyLimit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	// Limiting how long transactions can run does not work
@@ -362,35 +411,36 @@ func TestClosedTimestampCantServeBasedOnMaxTimestamp(t *testing.T) {
 	ctx := context.Background()
 	// Set up the target duration to be very long and rely on lease transfers to
 	// drive MaxClosed.
-	tc, db0, desc, repls := setupClusterForClosedTimestampTesting(ctx, t, time.Hour,
-		testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	tc, db0, desc := setupClusterForClosedTSTesting(ctx, t, time.Hour, testingCloseFraction,
+		aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 
 	if _, err := db0.Exec(`INSERT INTO cttest.kv VALUES(1, $1)`, "foo"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Grab a timestamp before initiating a lease transfer, transfer the lease,
-	// then ensure that reads	at that timestamp can occur from all the replicas.
-	ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+	// then ensure that reads at that timestamp can occur from all the replicas.
+	ts := tc.Server(0).Clock().Now()
 	lh := getCurrentLeaseholder(t, tc, desc)
 	target := pickRandomTarget(tc, lh, desc)
 	require.Nil(t, tc.TransferRangeLease(desc, target))
-	baRead := makeReadBatchRequestForDesc(desc, ts)
+	baRead := makeTxnReadBatchForDesc(desc, ts)
 	testutils.SucceedsSoon(t, func() error {
 		return verifyCanReadFromAllRepls(ctx, t, baRead, repls, expectRows(1))
 	})
-	// Make a non-writing transaction that has a MaxTimestamp after the lease
-	// transfer but a timestamp before.
-	roTxn := roachpb.MakeTransaction("test", nil, roachpb.NormalUserPriority, ts,
-		timeutil.Now().UnixNano()-ts.WallTime)
-	baRead.Header.Txn = &roTxn
+
+	// Update the batch to simulate a transaction that has a global uncertainty
+	// limit after the lease transfer. Keep its read timestamp from before the
+	// lease transfer.
+	baRead.Txn.GlobalUncertaintyLimit = tc.Server(0).Clock().Now().Add(time.Second.Nanoseconds(), 0)
 	// Send the request to all three replicas. One should succeed and
 	// the other two should return NotLeaseHolderErrors.
 	verifyNotLeaseHolderErrors(t, baRead, repls, 2)
 }
 
-func TestClosedTimestampCantServeForWritingTransaction(t *testing.T) {
+func TestClosedTimestampCanServeForWritingTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -400,27 +450,41 @@ func TestClosedTimestampCantServeForWritingTransaction(t *testing.T) {
 	skip.UnderRace(t)
 
 	ctx := context.Background()
-	tc, db0, desc, repls := setupClusterForClosedTimestampTesting(ctx, t, testingTargetDuration,
-		testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	tc, db0, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
+		testingCloseFraction, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 
 	if _, err := db0.Exec(`INSERT INTO cttest.kv VALUES(1, $1)`, "foo"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Verify that we can serve a follower read at a timestamp. Wait if necessary.
-	ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-	baRead := makeReadBatchRequestForDesc(desc, ts)
+	ts := tc.Server(0).Clock().Now()
+	baRead := makeTxnReadBatchForDesc(desc, ts)
 	testutils.SucceedsSoon(t, func() error {
 		return verifyCanReadFromAllRepls(ctx, t, baRead, repls, expectRows(1))
 	})
 
-	// Create a read-only batch and attach a read-write transaction.
-	rwTxn := roachpb.MakeTransaction("test", []byte("key"), roachpb.NormalUserPriority, ts, 0)
-	baRead.Txn = &rwTxn
+	// Update the batch to simulate a transaction that has written an intent.
+	baRead.Txn.Key = []byte("key")
+	baRead.Txn.Sequence++
 
-	// Send the request to all three replicas. One should succeed and
-	// the other two should return NotLeaseHolderErrors.
+	// The write timestamp of the transaction is still closed, so a read-only
+	// request by the transaction should be servicable by followers. This is
+	// because the writing transaction can still read its writes on the
+	// followers.
+	testutils.SucceedsSoon(t, func() error {
+		return verifyCanReadFromAllRepls(ctx, t, baRead, repls, expectRows(1))
+	})
+
+	// Update the batch to simulate a transaction that has written past its read
+	// timestamp and past the expected closed timestamp. This should prevent its
+	// reads from being served by followers.
+	baRead.Txn.WriteTimestamp = tc.Server(0).Clock().Now().Add(time.Second.Nanoseconds(), 0)
+
+	// Send the request to all three replicas. One should succeed and the other
+	// two should return NotLeaseHolderErrors.
 	verifyNotLeaseHolderErrors(t, baRead, repls, 2)
 }
 
@@ -434,17 +498,19 @@ func TestClosedTimestampCantServeForNonTransactionalReadRequest(t *testing.T) {
 	skip.UnderRace(t)
 
 	ctx := context.Background()
-	tc, db0, desc, repls := setupClusterForClosedTimestampTesting(ctx, t, testingTargetDuration,
-		testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	tc, db0, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
+		testingCloseFraction, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 
 	if _, err := db0.Exec(`INSERT INTO cttest.kv VALUES(1, $1)`, "foo"); err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify that we can serve a follower read at a timestamp. Wait if necessary
-	ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-	baRead := makeReadBatchRequestForDesc(desc, ts)
+	// Verify that we can serve a follower read at a timestamp. Wait if
+	// necessary.
+	ts := tc.Server(0).Clock().Now()
+	baRead := makeTxnReadBatchForDesc(desc, ts)
 	testutils.SucceedsSoon(t, func() error {
 		return verifyCanReadFromAllRepls(ctx, t, baRead, repls, expectRows(1))
 	})
@@ -459,9 +525,41 @@ func TestClosedTimestampCantServeForNonTransactionalReadRequest(t *testing.T) {
 	baQueryTxn.Add(r)
 	baQueryTxn.Timestamp = ts
 
-	// Send the request to all three replicas. One should succeed and
-	// the other two should return NotLeaseHolderErrors.
+	// Send the request to all three replicas. One should succeed and the other
+	// two should return NotLeaseHolderErrors.
 	verifyNotLeaseHolderErrors(t, baQueryTxn, repls, 2)
+}
+
+func TestClosedTimestampCantServeForNonTransactionalBatch(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Limiting how long transactions can run does not work
+	// well with race unless we're extremely lenient, which
+	// drives up the test duration.
+	skip.UnderRace(t)
+
+	ctx := context.Background()
+	tc, db0, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration, testingCloseFraction, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
+	defer tc.Stopper().Stop(ctx)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
+
+	if _, err := db0.Exec(`INSERT INTO cttest.kv VALUES(1, $1)`, "foo"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify that we can serve a follower read at a timestamp with a
+	// transactional batch. Wait if necessary.
+	ts := tc.Server(0).Clock().Now()
+	baRead := makeTxnReadBatchForDesc(desc, ts)
+	testutils.SucceedsSoon(t, func() error {
+		return verifyCanReadFromAllRepls(ctx, t, baRead, repls, expectRows(1))
+	})
+
+	// Remove the transaction and send the request to all three replicas. One
+	// should succeed and the other two should return NotLeaseHolderErrors.
+	baRead.Txn = nil
+	verifyNotLeaseHolderErrors(t, baRead, repls, 2)
 }
 
 // TestClosedTimestampInactiveAfterSubsumption verifies that, during a merge,
@@ -469,6 +567,7 @@ func TestClosedTimestampCantServeForNonTransactionalReadRequest(t *testing.T) {
 // timestamps after the subsumption time.
 func TestClosedTimestampInactiveAfterSubsumption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 59448, "flaky test")
 	// Skipping under short because this test pauses for a few seconds in order to
 	// trigger a node liveness expiration.
 	skip.UnderShort(t)
@@ -556,7 +655,14 @@ func TestClosedTimestampInactiveAfterSubsumption(t *testing.T) {
 				},
 			},
 		}
-		tc, _, leftDesc, rightDesc := initClusterWithSplitRanges(ctx, t, testingTargetDuration,
+		// If the initial phase of the merge txn takes longer than the closed
+		// timestamp target duration, its initial CPuts can have their write
+		// timestamps bumped due to an intervening closed timestamp update. This
+		// causes the entire merge txn to retry. So we use a long closed timestamp
+		// duration at the beginning of the test until we have the merge txn
+		// suspended at its commit trigger, and then change it back down to
+		// `testingTargetDuration`.
+		tc, leftDesc, rightDesc := setupClusterForClosedTSTestingWithSplitRanges(ctx, t, 5*time.Second,
 			testingCloseFraction, clusterArgs)
 		defer tc.Stopper().Stop(ctx)
 
@@ -591,6 +697,13 @@ func TestClosedTimestampInactiveAfterSubsumption(t *testing.T) {
 		case <-time.After(45 * time.Second):
 			t.Fatal("did not receive merge commit trigger as expected")
 		}
+		// Reduce the closed timestamp target duration in order to make the rest of
+		// the test faster.
+		db := tc.ServerConn(0)
+		if _, err := db.Exec(fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s';`,
+			testingTargetDuration)); err != nil {
+			t.Fatal(err)
+		}
 		// inactiveClosedTSBoundary indicates the low water mark for closed
 		// timestamp updates beyond which we expect none of the followers to be able
 		// to serve follower reads until the merge is complete.
@@ -619,7 +732,7 @@ func TestClosedTimestampInactiveAfterSubsumption(t *testing.T) {
 		case <-time.After(30 * time.Second):
 			t.Fatal("failed to receive next closed timestamp update")
 		}
-		baReadAfterLeaseTransfer := makeReadBatchRequestForDesc(rightDesc, inactiveClosedTSBoundary.Next())
+		baReadAfterLeaseTransfer := makeTxnReadBatchForDesc(rightDesc, inactiveClosedTSBoundary.Next())
 		rightReplFollowers := getFollowerReplicas(ctx, t, tc, rightDesc, rightLeaseholder)
 		log.Infof(ctx, "sending read requests from followers after the inactiveClosedTSBoundary")
 		verifyNotLeaseHolderErrors(t, baReadAfterLeaseTransfer, rightReplFollowers, 2 /* expectedNLEs */)
@@ -671,16 +784,16 @@ func forceLeaseTransferOnSubsumedRange(
 		}
 		return nil
 	})
-	restartHeartbeats := oldLeaseholderStore.NodeLiveness().PauseAllHeartbeatsForTest()
+	restartHeartbeats := oldLeaseholderStore.GetStoreConfig().NodeLiveness.PauseAllHeartbeatsForTest()
 	defer restartHeartbeats()
 	log.Infof(ctx, "test: paused RHS rightLeaseholder's liveness heartbeats")
-	time.Sleep(oldLeaseholderStore.NodeLiveness().GetLivenessThreshold())
+	time.Sleep(oldLeaseholderStore.GetStoreConfig().NodeLiveness.GetLivenessThreshold())
 
 	// Send a read request from one of the followers of RHS so that it notices
 	// that the current rightLeaseholder has stopped heartbeating. This will prompt
 	// it to acquire the range lease for itself.
 	g.Go(func() error {
-		leaseAcquisitionRequest := makeReadBatchRequestForDesc(rightDesc, freezeStartTimestamp)
+		leaseAcquisitionRequest := makeTxnReadBatchForDesc(rightDesc, freezeStartTimestamp)
 		log.Infof(ctx,
 			"sending a read request from a follower of RHS (store %d) in order to trigger lease acquisition",
 			newRightLeaseholder.StoreID())
@@ -715,7 +828,7 @@ func forceLeaseTransferOnSubsumedRange(
 		if newLease.Sequence == oldLease.Sequence {
 			return errors.New("RHS lease not updated")
 		}
-		leaseStart = newLease.Start
+		leaseStart = newLease.Start.ToTimestamp()
 		return nil
 	})
 	if err != nil {
@@ -842,7 +955,7 @@ func (filter *mergeFilter) SuspendMergeTrigger(
 			// We block the LHS leaseholder from applying the merge trigger. Note
 			// that RHS followers will have already caught up to the leaseholder
 			// well before this point.
-			blocker.signal(freezeStart)
+			blocker.signal(freezeStart.ToTimestamp())
 			// Wait for the merge to be unblocked.
 			<-blocker.unblockCh
 		}
@@ -856,50 +969,73 @@ func mergeTxn(ctx context.Context, store *kvserver.Store, leftDesc roachpb.Range
 	return err.GoError()
 }
 
-func initClusterWithSplitRanges(
+func setupClusterForClosedTSTestingWithSplitRanges(
 	ctx context.Context,
 	t *testing.T,
 	targetDuration time.Duration,
 	closeFraction float64,
 	clusterArgs base.TestClusterArgs,
-) (
-	serverutils.TestClusterInterface,
-	*gosql.DB,
-	roachpb.RangeDescriptor,
-	roachpb.RangeDescriptor,
-) {
-	tc, db0, desc, repls := setupClusterForClosedTimestampTesting(ctx, t, targetDuration,
-		closeFraction, clusterArgs)
+) (serverutils.TestClusterInterface, roachpb.RangeDescriptor, roachpb.RangeDescriptor) {
+	dbName, tableName := "cttest", "kv"
+	tc, _, _ := setupClusterForClosedTSTesting(ctx, t, targetDuration, closeFraction,
+		clusterArgs, dbName, tableName)
+	leftDesc, rightDesc := splitDummyRangeInTestCluster(t, tc, dbName, tableName,
+		hlc.Timestamp{} /* splitExpirationTime */)
+	return tc, leftDesc, rightDesc
+}
 
-	if _, err := db0.Exec(`INSERT INTO cttest.kv VALUES(1, $1)`, "foo"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db0.Exec(`INSERT INTO cttest.kv VALUES(3, $1)`, "foo"); err != nil {
-		t.Fatal(err)
-	}
-	// Start by ensuring that the values can be read from all replicas at ts.
-	ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-	baRead := makeReadBatchRequestForDesc(desc, ts)
-	testutils.SucceedsSoon(t, func() error {
-		return verifyCanReadFromAllRepls(ctx, t, baRead, repls, expectRows(2))
-	})
-	// Manually split the table to have easier access to descriptors.
-	tableID, err := getTableID(db0, "cttest", "kv")
+func getEncodedKeyForTable(
+	t *testing.T, db *gosql.DB, dbName, tableName string, val tree.Datum,
+) roachpb.Key {
+	tableID, err := getTableID(db, dbName, tableName)
 	if err != nil {
 		t.Fatalf("failed to lookup ids: %+v", err)
 	}
-
 	idxPrefix := keys.SystemSQLCodec.IndexPrefix(uint32(tableID), 1)
-	k, err := rowenc.EncodeTableKey(idxPrefix, tree.NewDInt(2), encoding.Ascending)
+	k, err := rowenc.EncodeTableKey(idxPrefix, val, encoding.Ascending)
 	if err != nil {
 		t.Fatalf("failed to encode split key: %+v", err)
 	}
-	tcImpl := tc.(*testcluster.TestCluster)
-	leftDesc, rightDesc := tcImpl.SplitRangeOrFatal(t, k)
-	if err := tcImpl.WaitForFullReplication(); err != nil {
+	return k
+}
+
+// splitDummyRangeInTestCluster is supposed to be used in conjunction with the
+// dummy table created in setupTestClusterWithDummyRange. It adds two rows to
+// the given table and performs splits on the table's range such that the 2
+// resulting ranges contain exactly one of the rows each.
+func splitDummyRangeInTestCluster(
+	t *testing.T,
+	tc serverutils.TestClusterInterface,
+	dbName, tableName string,
+	splitExpirationTime hlc.Timestamp,
+) (roachpb.RangeDescriptor, roachpb.RangeDescriptor) {
+	db0 := tc.ServerConn(0)
+	if _, err := db0.Exec(fmt.Sprintf(`INSERT INTO %s.%s VALUES(1, '%s')`,
+		dbName, tableName, "foo")); err != nil {
 		t.Fatal(err)
 	}
-	return tc, db0, leftDesc, rightDesc
+	if _, err := db0.Exec(fmt.Sprintf(`INSERT INTO %s.%s VALUES(3, '%s')`,
+		dbName, tableName, "foo")); err != nil {
+		t.Fatal(err)
+	}
+	// Manually split the table to have easier access to descriptors.
+	k := getEncodedKeyForTable(t, db0, dbName, tableName, tree.NewDInt(1))
+	tcImpl := tc.(*testcluster.TestCluster)
+	// Split at `1` and `2` so that the table has exactly two ranges: [1,2) and
+	// [2, Max). This first split will never be merged by the merge queue so the
+	// expiration time doesn't matter here.
+	tcImpl.SplitRangeOrFatal(t, k)
+
+	k = getEncodedKeyForTable(t, db0, dbName, tableName, tree.NewDInt(2))
+	leftDesc, rightDesc, err := tcImpl.SplitRangeWithExpiration(k, splitExpirationTime)
+	require.NoError(t, err)
+
+	if tc.ReplicationMode() != base.ReplicationManual {
+		if err := tcImpl.WaitForFullReplication(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return leftDesc, rightDesc
 }
 
 func getCurrentMaxClosed(
@@ -914,7 +1050,7 @@ func getCurrentMaxClosed(
 	attempts := 0
 	for attempts == 0 || timeutil.Now().Before(deadline) {
 		attempts++
-		store.ClosedTimestamp().Storage.VisitDescending(target.NodeID, func(entry ctpb.Entry) (done bool) {
+		store.GetStoreConfig().ClosedTimestamp.Storage.VisitDescending(target.NodeID, func(entry ctpb.Entry) (done bool) {
 			if _, ok := entry.MLAI[desc.RangeID]; ok {
 				maxClosed = entry
 				return true
@@ -990,6 +1126,7 @@ func getTargetStoreOrFatal(
 func verifyNotLeaseHolderErrors(
 	t *testing.T, ba roachpb.BatchRequest, repls []*kvserver.Replica, expectedNLEs int,
 ) {
+	t.Helper()
 	notLeaseholderErrs, err := countNotLeaseHolderErrors(ba, repls)
 	if err != nil {
 		t.Fatal(err)
@@ -1038,11 +1175,14 @@ func replsForRange(
 	testutils.SucceedsSoon(t, func() error {
 		repls = nil
 		for i := 0; i < numNodes; i++ {
-			repl, _, err := tc.Server(i).GetStores().(*kvserver.Stores).GetReplicaForRangeID(desc.RangeID)
+			repl, _, err := tc.Server(i).GetStores().(*kvserver.Stores).GetReplicaForRangeID(ctx, desc.RangeID)
 			if err != nil {
 				return err
 			}
 			if repl != nil {
+				if !repl.IsInitialized() {
+					return errors.Errorf("%s not initialized", repl)
+				}
 				repls = append(repls, repl)
 			}
 		}
@@ -1092,100 +1232,85 @@ func aggressiveResolvedTimestampPushKnobs() *kvserver.StoreTestingKnobs {
 	}
 }
 
-// setupClusterForClosedTimestampTesting creates a test cluster that is prepared
-// to exercise follower reads. The returned test cluster has follower reads
-// enabled using the given targetDuration and testingCloseFraction. In addition
-// to the newly minted test cluster, this function returns a db handle to node
-// 0, a range descriptor for the range used by the table `cttest.kv` and the
-// replica objects corresponding to the replicas for the range. It is the
-// caller's responsibility to Stop the Stopper on the returned test cluster when
-// done.
-func setupClusterForClosedTimestampTesting(
+// setupClusterForClosedTSTesting creates a test cluster that is prepared to
+// exercise follower reads. The returned test cluster has follower reads enabled
+// using the given targetDuration and testingCloseFraction. In addition to the
+// newly minted test cluster, this function returns a db handle to node 0, a
+// range descriptor for the range used by the table `{dbName}.{tableName}`. It
+// is the caller's responsibility to Stop the Stopper on the returned test
+// cluster when done.
+func setupClusterForClosedTSTesting(
 	ctx context.Context,
 	t *testing.T,
 	targetDuration time.Duration,
 	closeFraction float64,
 	clusterArgs base.TestClusterArgs,
-) (
-	tc serverutils.TestClusterInterface,
-	db0 *gosql.DB,
-	kvTableDesc roachpb.RangeDescriptor,
-	repls []*kvserver.Replica,
-) {
-	tc = serverutils.StartNewTestCluster(t, numNodes, clusterArgs)
-	db0 = tc.ServerConn(0)
+	dbName, tableName string,
+) (tc serverutils.TestClusterInterface, db0 *gosql.DB, kvTableDesc roachpb.RangeDescriptor) {
+	tc, desc := setupTestClusterWithDummyRange(t, clusterArgs, dbName, tableName, numNodes)
+	require.NoError(t, enableFollowerReadsForTesting(tc.ServerConn(0), targetDuration, closeFraction))
+	return tc, tc.ServerConn(0), desc
+}
+
+func enableFollowerReadsForTesting(
+	db *gosql.DB, targetDuration time.Duration, closeFraction float64,
+) error {
+	if _, err := db.Exec(fmt.Sprintf(`
+SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s';
+SET CLUSTER SETTING kv.closed_timestamp.close_fraction = %.3f;
+SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true;
+`, targetDuration, closeFraction)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// setupTestClusterWithDummyRange creates a TestCluster with an empty table. It
+// returns a handle to the range descriptor corresponding to this table.
+func setupTestClusterWithDummyRange(
+	t *testing.T, clusterArgs base.TestClusterArgs, dbName, tableName string, numNodes int,
+) (serverutils.TestClusterInterface, roachpb.RangeDescriptor) {
+	tc := serverutils.StartNewTestCluster(t, numNodes, clusterArgs)
+	db0 := tc.ServerConn(0)
 
 	if _, err := db0.Exec(fmt.Sprintf(`
 -- Set a timeout to get nicer test failures from these statements. Because of
 -- the aggressiveResolvedTimestampPushKnobs() these statements can restart
 -- forever under high load (testrace under high concurrency).
 SET statement_timeout='30s';
-SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s';
-SET CLUSTER SETTING kv.closed_timestamp.close_fraction = %.3f;
-SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true;
-CREATE DATABASE cttest;
-CREATE TABLE cttest.kv (id INT PRIMARY KEY, value STRING);
+CREATE DATABASE %[1]s;
+CREATE TABLE %[1]s.%[2]s (id INT PRIMARY KEY CHECK (id >= 0), value STRING);
 -- Reset the timeout set above.
 RESET statement_timeout;
-`, targetDuration, closeFraction)); err != nil {
+`, dbName, tableName)); err != nil {
 		t.Fatal(err)
 	}
 
-	var rangeID roachpb.RangeID
-	var startKey roachpb.Key
 	var numReplicas int
-	testutils.SucceedsSoon(t, func() error {
-		if err := db0.QueryRow(
-			`SELECT range_id, start_key, array_length(replicas, 1) FROM crdb_internal.ranges WHERE table_name = 'kv' AND database_name = 'cttest'`,
-		).Scan(&rangeID, &startKey, &numReplicas); err != nil {
-			return err
-		}
-		if numReplicas != 3 {
-			return errors.New("not fully replicated yet")
-		}
-		return nil
-	})
-
-	desc, err := tc.LookupRange(startKey)
-	require.Nil(t, err)
-
-	// First, we perform an arbitrary lease transfer because that will turn the
-	// lease into an epoch based one (the initial lease is likely expiration based
-	// since the range just split off from the very first range which is expiration
-	// based).
-	var lh roachpb.ReplicationTarget
-	testutils.SucceedsSoon(t, func() error {
-		var err error
-		lh, err = tc.FindRangeLeaseHolder(desc, nil)
-		return err
-	})
-
-	for i := 0; i < numNodes; i++ {
-		target := tc.Target(i)
-		if target != lh {
-			if err := tc.TransferRangeLease(desc, target); err != nil {
-				t.Fatal(err)
+	var err error
+	var desc roachpb.RangeDescriptor
+	// If replicate queue is not disabled, wait until the table's range is fully
+	// replicated.
+	if clusterArgs.ReplicationMode != base.ReplicationManual {
+		testutils.SucceedsSoon(t, func() error {
+			if err := db0.QueryRow(
+				fmt.Sprintf(
+					`SELECT array_length(replicas, 1) FROM crdb_internal.ranges
+WHERE table_name = '%s' AND database_name = '%s'`, tableName, dbName),
+			).Scan(&numReplicas); err != nil {
+				return err
 			}
-			break
-		}
-	}
-	repls = replsForRange(ctx, t, tc, desc, numNodes)
-	require.Equal(t, numReplicas, len(repls))
-	// Wait until we see an epoch based lease on our chosen range. This should
-	// happen fairly quickly since we just transferred a lease (as a means to make
-	// it epoch based). If the lease transfer fails, we'll be sitting out the lease
-	// expiration, which is on the order of seconds. Not great, but good enough since
-	// the transfer basically always works.
-	for ok := false; !ok; time.Sleep(10 * time.Millisecond) {
-		for _, repl := range repls {
-			lease, _ := repl.GetLease()
-			if lease.Epoch != 0 {
-				ok = true
-				break
+			if numReplicas != numNodes {
+				return errors.New("not fully replicated yet")
 			}
-		}
+			require.Nil(t, err)
+			return nil
+		})
 	}
-	return tc, db0, desc, repls
+	startKey := getEncodedKeyForTable(t, tc.ServerConn(0), dbName, tableName, tree.NewDInt(0))
+	_, desc, err = tc.Server(0).SplitRange(startKey)
+	require.NoError(t, err)
+	return tc, desc
 }
 
 type respFunc func(*roachpb.BatchResponse, *roachpb.Error) (shouldRetry bool, err error)
@@ -1268,15 +1393,16 @@ func verifyCanReadFromAllRepls(
 	return g.Wait()
 }
 
-func makeReadBatchRequestForDesc(
-	desc roachpb.RangeDescriptor, ts hlc.Timestamp,
-) roachpb.BatchRequest {
+func makeTxnReadBatchForDesc(desc roachpb.RangeDescriptor, ts hlc.Timestamp) roachpb.BatchRequest {
+	txn := roachpb.MakeTransaction("txn", nil, 0, ts, 0)
+
 	var baRead roachpb.BatchRequest
 	baRead.Header.RangeID = desc.RangeID
+	baRead.Header.Timestamp = ts
+	baRead.Header.Txn = &txn
 	r := &roachpb.ScanRequest{}
 	r.Key = desc.StartKey.AsRawKey()
 	r.EndKey = desc.EndKey.AsRawKey()
 	baRead.Add(r)
-	baRead.Timestamp = ts
 	return baRead
 }

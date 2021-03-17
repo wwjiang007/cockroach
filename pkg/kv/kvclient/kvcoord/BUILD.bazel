@@ -1,4 +1,5 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//build:STRINGER.bzl", "stringer")
 
 go_library(
     name = "kvcoord",
@@ -27,13 +28,12 @@ go_library(
         "txn_interceptor_span_refresher.go",
         "txn_lock_gatekeeper.go",
         "txn_metrics.go",
-        "txnstate_string.go",
+        ":gen-txnstate-stringer",  # keep
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
-        "//pkg/clusterversion",
         "//pkg/gossip",
         "//pkg/keys",
         "//pkg/kv",
@@ -48,7 +48,6 @@ go_library(
         "//pkg/storage/enginepb",
         "//pkg/util",
         "//pkg/util/ctxgroup",
-        "//pkg/util/duration",
         "//pkg/util/errorutil/unimplemented",
         "//pkg/util/grpcutil",
         "//pkg/util/hlc",
@@ -71,6 +70,7 @@ go_library(
 
 go_test(
     name = "kvcoord_test",
+    size = "medium",
     srcs = [
         "batch_test.go",
         "condensable_span_set_test.go",
@@ -105,7 +105,6 @@ go_test(
         "//pkg/gossip/simulation",
         "//pkg/keys",
         "//pkg/kv",
-        "//pkg/kv/kvclient/kvcoord",
         "//pkg/kv/kvclient/rangecache",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/concurrency/lock",
@@ -146,7 +145,13 @@ go_test(
         "@com_github_gogo_protobuf//proto",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
-        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//:go_default_library",
         "@org_golang_x_sync//errgroup",
     ],
+)
+
+stringer(
+    name = "gen-txnstate-stringer",
+    src = "txn_coord_sender.go",
+    typ = "txnState",
 )

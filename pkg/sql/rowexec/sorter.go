@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -54,7 +53,7 @@ func (s *sorterBase) init(
 	opts execinfra.ProcStateOpts,
 ) error {
 	ctx := flowCtx.EvalCtx.Ctx()
-	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(ctx, flowCtx) {
 		input = newInputStatCollector(input)
 		s.ExecStatsForTrace = s.execStatsForTrace
 	}
@@ -69,7 +68,7 @@ func (s *sorterBase) init(
 		return err
 	}
 
-	s.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, fmt.Sprintf("%s-disk", processorName))
+	s.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, fmt.Sprintf("%s-disk", processorName))
 	rc := rowcontainer.DiskBackedRowContainer{}
 	rc.Init(
 		ordering,
@@ -117,11 +116,10 @@ func (s *sorterBase) close() {
 		if s.i != nil {
 			s.i.Close()
 		}
-		ctx := s.Ctx
-		s.rows.Close(ctx)
-		s.MemMonitor.Stop(ctx)
+		s.rows.Close(s.Ctx)
+		s.MemMonitor.Stop(s.Ctx)
 		if s.diskMonitor != nil {
-			s.diskMonitor.Stop(ctx)
+			s.diskMonitor.Stop(s.Ctx)
 		}
 	}
 }
@@ -215,7 +213,7 @@ func newSortAllProcessor(
 		spec.OrderingMatchLen,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{input},
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				proc.close()
 				return nil
 			},
@@ -227,15 +225,14 @@ func newSortAllProcessor(
 }
 
 // Start is part of the RowSource interface.
-func (s *sortAllProcessor) Start(ctx context.Context) context.Context {
-	s.input.Start(ctx)
+func (s *sortAllProcessor) Start(ctx context.Context) {
 	ctx = s.StartInternal(ctx, sortAllProcName)
+	s.input.Start(ctx)
 
 	valid, err := s.fill()
 	if !valid || err != nil {
 		s.MoveToDraining(err)
 	}
-	return ctx
 }
 
 // fill fills s.rows with the input's rows.
@@ -328,7 +325,7 @@ func newSortTopKProcessor(
 		ordering, spec.OrderingMatchLen,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{input},
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				proc.close()
 				return nil
 			},
@@ -340,9 +337,9 @@ func newSortTopKProcessor(
 }
 
 // Start is part of the RowSource interface.
-func (s *sortTopKProcessor) Start(ctx context.Context) context.Context {
-	s.input.Start(ctx)
+func (s *sortTopKProcessor) Start(ctx context.Context) {
 	ctx = s.StartInternal(ctx, sortTopKProcName)
+	s.input.Start(ctx)
 
 	// The execution loop for the SortTopK processor is similar to that of the
 	// SortAll processor; the difference is that we push rows into a max-heap
@@ -385,7 +382,6 @@ func (s *sortTopKProcessor) Start(ctx context.Context) context.Context {
 	s.rows.Sort(ctx)
 	s.i = s.rows.NewFinalIterator(ctx)
 	s.i.Rewind()
-	return ctx
 }
 
 // ConsumerClosed is part of the RowSource interface.
@@ -426,7 +422,7 @@ func newSortChunksProcessor(
 		proc, flowCtx, processorID, sortChunksProcName, input, post, out, ordering, spec.OrderingMatchLen,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{input},
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				proc.close()
 				return nil
 			},
@@ -524,9 +520,9 @@ func (s *sortChunksProcessor) fill() (bool, error) {
 }
 
 // Start is part of the RowSource interface.
-func (s *sortChunksProcessor) Start(ctx context.Context) context.Context {
+func (s *sortChunksProcessor) Start(ctx context.Context) {
+	ctx = s.StartInternal(ctx, sortChunksProcName)
 	s.input.Start(ctx)
-	return s.StartInternal(ctx, sortChunksProcName)
 }
 
 // Next is part of the RowSource interface.

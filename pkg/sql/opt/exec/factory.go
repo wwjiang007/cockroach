@@ -12,11 +12,12 @@ package exec
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -41,7 +42,7 @@ type ScanParams struct {
 	// At most one of IndexConstraint or InvertedConstraint is non-nil, depending
 	// on the index type.
 	IndexConstraint    *constraint.Constraint
-	InvertedConstraint invertedexpr.InvertedSpans
+	InvertedConstraint inverted.Spans
 
 	// If non-zero, the scan returns this many rows.
 	HardLimit int64
@@ -61,6 +62,11 @@ type ScanParams struct {
 	Locking *tree.LockingItem
 
 	EstimatedRowCount float64
+
+	// If true, we are performing a locality optimized search. In order for this
+	// to work correctly, the execution engine must create a local DistSQL plan
+	// for the main query (subqueries and postqueries need not be local).
+	LocalityOptimized bool
 }
 
 // OutputOrdering indicates the required output ordering on a Node that is being
@@ -286,6 +292,12 @@ type EstimatedStats struct {
 	TableStatsAvailable bool
 	// RowCount is the estimated number of rows produced by the operator.
 	RowCount float64
+	// TableStatsRowCount is set only for scans; it is the estimated total number
+	// of rows in the table we are scanning.
+	TableStatsRowCount uint64
+	// TableStatsCreatedAt is set only for scans; it is the time when the latest
+	// table statistics were collected.
+	TableStatsCreatedAt time.Time
 	// Cost is the estimated cost of the operator. This cost includes the costs of
 	// the child operators.
 	Cost float64
@@ -301,6 +313,9 @@ type ExecutionStats struct {
 
 	KVBytesRead optional.Uint
 	KVRowsRead  optional.Uint
+
+	// Nodes on which this operator was executed.
+	Nodes []string
 }
 
 // BuildPlanForExplainFn builds an execution plan against the given

@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -58,15 +57,17 @@ type namespaceReverseMap map[int64][]descpb.NameInfo
 // JobsTable represents data read from `system.jobs`.
 type JobsTable []jobs.JobMetadata
 
-func newDescGetter(ctx context.Context, rows []DescriptorTableRow) (catalog.MapDescGetter, error) {
+func newDescGetter(rows []DescriptorTableRow) (catalog.MapDescGetter, error) {
 	pg := catalog.MapDescGetter{}
 	for _, r := range rows {
 		var d descpb.Descriptor
 		if err := protoutil.Unmarshal(r.DescBytes, &d); err != nil {
 			return nil, errors.Errorf("failed to unmarshal descriptor %d: %v", r.ID, err)
 		}
-		descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(ctx, &d, r.ModTime)
-		pg[descpb.ID(r.ID)] = catalogkv.UnwrapDescriptorRaw(ctx, &d)
+		b := catalogkv.NewBuilderWithMVCCTimestamp(&d, r.ModTime)
+		if b != nil {
+			pg[descpb.ID(r.ID)] = b.BuildImmutable()
+		}
 	}
 	return pg, nil
 }
@@ -120,10 +121,11 @@ func ExamineDescriptors(
 	fmt.Fprintf(
 		stdout, "Examining %d descriptors and %d namespace entries...\n",
 		len(descTable), len(namespaceTable))
-	descGetter, err := newDescGetter(ctx, descTable)
+	descGetter, err := newDescGetter(descTable)
 	if err != nil {
 		return false, err
 	}
+
 	nMap := newNamespaceMap(namespaceTable)
 
 	var problemsFound bool
@@ -140,36 +142,9 @@ func ExamineDescriptors(
 			continue
 		}
 
-		_, parentExists := descGetter[desc.GetParentID()]
-		_, parentSchemaExists := descGetter[desc.GetParentSchemaID()]
-		switch d := desc.(type) {
-		case catalog.TableDescriptor:
-			if err := d.Validate(ctx, descGetter); err != nil {
-				problemsFound = true
-				fmt.Fprint(stdout, reportMsg(desc, "%s", err))
-			}
-			// Table has been already validated.
-			parentExists = true
-			parentSchemaExists = true
-		case catalog.TypeDescriptor:
-			typ := typedesc.NewImmutable(*d.TypeDesc())
-			if err := typ.Validate(ctx, descGetter); err != nil {
-				problemsFound = true
-				fmt.Fprint(stdout, reportMsg(desc, "%s", err))
-			}
-		case catalog.SchemaDescriptor:
-			// parent schema id is always 0.
-			parentSchemaExists = true
-		}
-		if desc.GetParentID() != descpb.InvalidID && !parentExists {
+		for _, err := range validateSafely(ctx, descGetter, desc) {
 			problemsFound = true
-			fmt.Fprint(stdout, reportMsg(desc, "invalid parent id %d", desc.GetParentID()))
-		}
-		if desc.GetParentSchemaID() != descpb.InvalidID &&
-			desc.GetParentSchemaID() != keys.PublicSchemaID &&
-			!parentSchemaExists {
-			problemsFound = true
-			fmt.Fprint(stdout, reportMsg(desc, "invalid parent schema id %d", desc.GetParentSchemaID()))
+			fmt.Fprint(stdout, reportMsg(desc, "%s", err))
 		}
 
 		// Process namespace entries pointing to this descriptor.
@@ -264,6 +239,23 @@ func ExamineDescriptors(
 	return !problemsFound, err
 }
 
+func validateSafely(
+	ctx context.Context, descGetter catalog.MapDescGetter, desc catalog.Descriptor,
+) (errs []error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err, ok := r.(error)
+			if !ok {
+				err = errors.Newf("%v", r)
+			}
+			err = errors.WithAssertionFailure(errors.Wrap(err, "validation"))
+			errs = append(errs, err)
+		}
+	}()
+	errs = append(errs, catalog.Validate(ctx, descGetter, catalog.ValidationLevelSelfAndCrossReferences, desc).Errors()...)
+	return errs
+}
+
 // ExamineJobs runs a suite of consistency checks over the system.jobs table.
 func ExamineJobs(
 	ctx context.Context,
@@ -273,7 +265,7 @@ func ExamineJobs(
 	stdout io.Writer,
 ) (ok bool, err error) {
 	fmt.Fprintf(stdout, "Examining %d running jobs...\n", len(jobsTable))
-	descGetter, err := newDescGetter(ctx, descTable)
+	descGetter, err := newDescGetter(descTable)
 	if err != nil {
 		return false, err
 	}
@@ -314,18 +306,13 @@ func ExamineJobs(
 }
 
 func reportMsg(desc catalog.Descriptor, format string, args ...interface{}) string {
-	var header string
-	switch desc.(type) {
-	case catalog.TypeDescriptor:
-		header = "    Type"
-	case catalog.TableDescriptor:
-		header = "   Table"
-	case catalog.SchemaDescriptor:
-		header = "  Schema"
-	case catalog.DatabaseDescriptor:
-		header = "Database"
+	msg := fmt.Sprintf(format, args...)
+	// Add descriptor-identifying prefix if it isn't there already.
+	// The prefix has the same format as the validation error wrapper.
+	msgPrefix := fmt.Sprintf("%s %q (%d): ", desc.DescriptorType(), desc.GetName(), desc.GetID())
+	if msg[:len(msgPrefix)] == msgPrefix {
+		msgPrefix = ""
 	}
-	return fmt.Sprintf("%s %3d: ParentID %3d, ParentSchemaID %2d, Name '%s': ",
-		header, desc.GetID(), desc.GetParentID(), desc.GetParentSchemaID(), desc.GetName()) +
-		fmt.Sprintf(format, args...) + "\n"
+	return fmt.Sprintf("  ParentID %3d, ParentSchemaID %2d: %s%s\n",
+		desc.GetParentID(), desc.GetParentSchemaID(), msgPrefix, msg)
 }

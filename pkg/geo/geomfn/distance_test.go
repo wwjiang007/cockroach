@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geos"
 	"github.com/stretchr/testify/require"
-	"github.com/twpayne/go-geom"
 )
 
 var distanceTestCases = []struct {
@@ -790,11 +789,8 @@ func TestFrechetDistanceDensify(t *testing.T) {
 		densifyFrac float64
 	}{
 		// Very small densifyFrac causes a SIGFPE in GEOS due to division-by-zero.
-		// The threshold was empirically found to be at 1e-20, while at 1e-19
-		// GEOS instead returns the error "geos error: vector". We explicitly
-		// disallow <1e-19 in the code, and test that both of these error. We do
-		// not test larger values, since very small densify values consume a
-		// large amount of memory causing out-of-memory errors.
+		// We explicitly disallow <1e-6 in the code, and test that both of these error.
+		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 1e-7},
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 1e-19},
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 1e-20},
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 1e-100},
@@ -867,8 +863,6 @@ func TestHausdorffDistanceDensify(t *testing.T) {
 		{"LINESTRING EMPTY", "LINESTRING EMPTY", 0.5, nil},
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING EMPTY", 0.5, nil},
 		{"LINESTRING EMPTY", "LINESTRING (10 10, 10 150, 130 10)", 0.5, nil},
-		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 1e-100, pf(14.142135623730951)},
-		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 1e-20, pf(14.142135623730951)},
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 0.2, pf(66)},
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 0.4, pf(56.66666666666667)},
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 0.6, pf(70)},
@@ -902,6 +896,7 @@ func TestHausdorffDistanceDensify(t *testing.T) {
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", -1},
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", -0.1},
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 0.0},
+		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 0.0000001},
 		{"LINESTRING (130 0, 0 0, 0 150)", "LINESTRING (10 10, 10 150, 130 10)", 1.1},
 	}
 
@@ -983,18 +978,12 @@ func TestClosestPoint(t *testing.T) {
 			gB, err := geo.ParseGeometry(tc.geomB)
 			require.NoError(t, err)
 
-			ret, err := ClosestPoint(gA, gB)
-			require.NoError(t, err)
-			retAsGeomT, err := ret.AsGeomT()
-			require.NoError(t, err)
-
 			expected, err := geo.ParseGeometry(tc.expected)
 			require.NoError(t, err)
-			expectedAsGeomT, err := expected.AsGeomT()
+			ret, err := ClosestPoint(gA, gB)
 			require.NoError(t, err)
 
-			require.InEpsilon(t, expectedAsGeomT.(*geom.Point).X(), retAsGeomT.(*geom.Point).X(), 2e-10)
-			require.InEpsilon(t, expectedAsGeomT.(*geom.Point).Y(), retAsGeomT.(*geom.Point).Y(), 2e-10)
+			requireGeometryWithinEpsilon(t, expected, ret, 2e-10)
 		})
 	}
 

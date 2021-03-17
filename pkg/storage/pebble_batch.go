@@ -11,9 +11,12 @@
 package storage
 
 import (
+	"context"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -33,17 +36,21 @@ type pebbleBatch struct {
 	// need separate iterators for EngineKey and MVCCKey iteration since
 	// iterators that make separated locks/intents look as interleaved need to
 	// use both simultaneously.
+	// When the first iterator is initialized, the underlying *pebble.Iterator
+	// is stashed in iter, so that subsequent iterator initialization can use
+	// Iterator.Clone to use the same underlying engine state. This relies on
+	// the fact that all pebbleIterators created here are marked as reusable,
+	// which causes pebbleIterator.Close to not close iter. iter will be closed
+	// when pebbleBatch.Close is called.
 	prefixIter       pebbleIterator
 	normalIter       pebbleIterator
 	prefixEngineIter pebbleIterator
 	normalEngineIter pebbleIterator
+	iter             cloneableIter
+	writeOnly        bool
 	closed           bool
-	isDistinct       bool
-	distinctOpen     bool
-	parentBatch      *pebbleBatch
 
-	useWrappedIntentWriter bool
-	wrappedIntentWriter    intentDemuxWriter
+	wrappedIntentWriter intentDemuxWriter
 	// scratch space for wrappedIntentWriter.
 	scratch []byte
 }
@@ -57,7 +64,9 @@ var pebbleBatchPool = sync.Pool{
 }
 
 // Instantiates a new pebbleBatch.
-func newPebbleBatch(db *pebble.DB, batch *pebble.Batch) *pebbleBatch {
+func newPebbleBatch(
+	db *pebble.DB, batch *pebble.Batch, writeOnly bool, settings *cluster.Settings,
+) *pebbleBatch {
 	pb := pebbleBatchPool.Get().(*pebbleBatch)
 	*pb = pebbleBatch{
 		db:    db,
@@ -83,8 +92,10 @@ func newPebbleBatch(db *pebble.DB, batch *pebble.Batch) *pebbleBatch {
 			upperBoundBuf: pb.normalEngineIter.upperBoundBuf,
 			reusable:      true,
 		},
+		writeOnly: writeOnly,
 	}
-	pb.wrappedIntentWriter, pb.useWrappedIntentWriter = tryWrapIntentWriter(pb)
+	pb.wrappedIntentWriter =
+		wrapIntentWriter(context.Background(), pb, settings, false /* isLongLived */)
 	return pb
 }
 
@@ -95,19 +106,17 @@ func (p *pebbleBatch) Close() {
 	}
 	p.closed = true
 
+	// Setting iter to nil is sufficient since it will be closed by one of the
+	// subsequent destroy calls.
+	p.iter = nil
 	// Destroy the iterators before closing the batch.
 	p.prefixIter.destroy()
 	p.normalIter.destroy()
 	p.prefixEngineIter.destroy()
 	p.normalEngineIter.destroy()
 
-	if !p.isDistinct {
-		_ = p.batch.Close()
-		p.batch = nil
-	} else {
-		p.parentBatch.distinctOpen = false
-		p.isDistinct = false
-	}
+	_ = p.batch.Close()
+	p.batch = nil
 
 	pebbleBatchPool.Put(p)
 }
@@ -133,23 +142,19 @@ func (p *pebbleBatch) MVCCGet(key MVCCKey) ([]byte, error) {
 	if len(key.Key) == 0 {
 		return nil, emptyKeyError()
 	}
-	if r, wrapped := tryWrapReader(p, MVCCKeyAndIntentsIterKind); wrapped {
-		return r.MVCCGet(key)
-	}
-	p.buf = EncodeKeyToBuf(p.buf[:0], key)
-	return p.rawGet(p.buf)
+	r := wrapReader(p)
+	// Doing defer r.Free() does not inline.
+	v, err := r.MVCCGet(key)
+	r.Free()
+	return v, err
 }
 
 func (p *pebbleBatch) rawGet(key []byte) ([]byte, error) {
 	r := pebble.Reader(p.batch)
-	if !p.isDistinct {
-		if !p.batch.Indexed() {
-			panic("write-only batch")
-		}
-		if p.distinctOpen {
-			panic("distinct batch open")
-		}
-	} else if !p.batch.Indexed() {
+	if p.writeOnly {
+		panic("write-only batch")
+	}
+	if !p.batch.Indexed() {
 		r = p.db
 	}
 
@@ -177,11 +182,14 @@ func (p *pebbleBatch) MVCCGetProto(
 func (p *pebbleBatch) MVCCIterate(
 	start, end roachpb.Key, iterKind MVCCIterKind, f func(MVCCKeyValue) error,
 ) error {
-	if p.distinctOpen {
-		panic("distinct batch open")
+	if iterKind == MVCCKeyAndIntentsIterKind {
+		r := wrapReader(p)
+		// Doing defer r.Free() does not inline.
+		err := iterateOnReader(r, start, end, iterKind, f)
+		r.Free()
+		return err
 	}
-	r, _ := tryWrapReader(p, iterKind)
-	return iterateOnReader(r, start, end, iterKind, f)
+	return iterateOnReader(p, start, end, iterKind, f)
 }
 
 // NewMVCCIterator implements the Batch interface.
@@ -190,22 +198,28 @@ func (p *pebbleBatch) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) M
 		panic("iterator must set prefix or upper bound or lower bound")
 	}
 
-	if !p.batch.Indexed() && !p.isDistinct {
+	if p.writeOnly {
 		panic("write-only batch")
-	}
-	if p.distinctOpen {
-		panic("distinct batch open")
 	}
 
 	if iterKind == MVCCKeyAndIntentsIterKind {
-		if r, wrapped := tryWrapReader(p, iterKind); wrapped {
-			return r.NewMVCCIterator(iterKind, opts)
+		r := wrapReader(p)
+		// Doing defer r.Free() does not inline.
+		iter := r.NewMVCCIterator(iterKind, opts)
+		r.Free()
+		if util.RaceEnabled {
+			iter = wrapInUnsafeIter(iter)
 		}
+		return iter
 	}
 
 	if !opts.MinTimestampHint.IsEmpty() {
 		// MVCCIterators that specify timestamp bounds cannot be cached.
-		return newPebbleIterator(p.batch, opts)
+		iter := MVCCIterator(newPebbleIterator(p.batch, nil, opts))
+		if util.RaceEnabled {
+			iter = wrapInUnsafeIter(iter)
+		}
+		return iter
 	}
 
 	iter := &p.normalIter
@@ -215,17 +229,29 @@ func (p *pebbleBatch) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) M
 	if iter.inuse {
 		panic("iterator already in use")
 	}
+	// Ensures no timestamp hints etc.
+	checkOptionsForIterReuse(opts)
 
 	if iter.iter != nil {
-		iter.setOptions(opts)
-	} else if p.batch.Indexed() {
-		iter.init(p.batch, opts)
+		iter.setBounds(opts.LowerBound, opts.UpperBound)
 	} else {
-		iter.init(p.db, opts)
+		if p.batch.Indexed() {
+			iter.init(p.batch, p.iter, opts)
+		} else {
+			iter.init(p.db, p.iter, opts)
+		}
+		if p.iter == nil {
+			// For future cloning.
+			p.iter = iter.iter
+		}
 	}
 
 	iter.inuse = true
-	return iter
+	var rv MVCCIterator = iter
+	if util.RaceEnabled {
+		rv = wrapInUnsafeIter(rv)
+	}
+	return rv
 }
 
 // NewEngineIterator implements the Batch interface.
@@ -234,11 +260,8 @@ func (p *pebbleBatch) NewEngineIterator(opts IterOptions) EngineIterator {
 		panic("iterator must set prefix or upper bound or lower bound")
 	}
 
-	if !p.batch.Indexed() && !p.isDistinct {
+	if p.writeOnly {
 		panic("write-only batch")
-	}
-	if p.distinctOpen {
-		panic("distinct batch open")
 	}
 
 	iter := &p.normalEngineIter
@@ -248,25 +271,34 @@ func (p *pebbleBatch) NewEngineIterator(opts IterOptions) EngineIterator {
 	if iter.inuse {
 		panic("iterator already in use")
 	}
+	// Ensures no timestamp hints etc.
+	checkOptionsForIterReuse(opts)
 
 	if iter.iter != nil {
-		iter.setOptions(opts)
-	} else if p.batch.Indexed() {
-		iter.init(p.batch, opts)
+		iter.setBounds(opts.LowerBound, opts.UpperBound)
 	} else {
-		iter.init(p.db, opts)
+		if p.batch.Indexed() {
+			iter.init(p.batch, p.iter, opts)
+		} else {
+			iter.init(p.db, p.iter, opts)
+		}
+		if p.iter == nil {
+			// For future cloning.
+			p.iter = iter.iter
+		}
 	}
 
 	iter.inuse = true
 	return iter
 }
 
+// ConsistentIterators implements the Batch interface.
+func (p *pebbleBatch) ConsistentIterators() bool {
+	return true
+}
+
 // NewMVCCIterator implements the Batch interface.
 func (p *pebbleBatch) ApplyBatchRepr(repr []byte, sync bool) error {
-	if p.distinctOpen {
-		panic("distinct batch open")
-	}
-
 	var batch pebble.Batch
 	if err := batch.SetRepr(repr); err != nil {
 		return err
@@ -291,21 +323,16 @@ func (p *pebbleBatch) ClearUnversioned(key roachpb.Key) error {
 // ClearIntent implements the Batch interface.
 func (p *pebbleBatch) ClearIntent(
 	key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-) error {
-	if p.useWrappedIntentWriter {
-		var err error
-		p.scratch, err =
-			p.wrappedIntentWriter.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID, p.scratch)
-		return err
-	}
-	return p.clear(MVCCKey{Key: key})
+) (int, error) {
+	var err error
+	var separatedIntentCountDelta int
+	p.scratch, separatedIntentCountDelta, err =
+		p.wrappedIntentWriter.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID, p.scratch)
+	return separatedIntentCountDelta, err
 }
 
 // ClearEngineKey implements the Batch interface.
 func (p *pebbleBatch) ClearEngineKey(key EngineKey) error {
-	if p.distinctOpen {
-		panic("distinct batch open")
-	}
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
@@ -314,9 +341,6 @@ func (p *pebbleBatch) ClearEngineKey(key EngineKey) error {
 }
 
 func (p *pebbleBatch) clear(key MVCCKey) error {
-	if p.distinctOpen {
-		panic("distinct batch open")
-	}
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
@@ -327,9 +351,6 @@ func (p *pebbleBatch) clear(key MVCCKey) error {
 
 // SingleClearEngineKey implements the Batch interface.
 func (p *pebbleBatch) SingleClearEngineKey(key EngineKey) error {
-	if p.distinctOpen {
-		panic("distinct batch open")
-	}
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
@@ -345,12 +366,9 @@ func (p *pebbleBatch) ClearRawRange(start, end roachpb.Key) error {
 
 // ClearMVCCRangeAndIntents implements the Batch interface.
 func (p *pebbleBatch) ClearMVCCRangeAndIntents(start, end roachpb.Key) error {
-	if p.useWrappedIntentWriter {
-		var err error
-		p.scratch, err = p.wrappedIntentWriter.ClearMVCCRangeAndIntents(start, end, p.scratch)
-		return err
-	}
-	return p.clearRange(MVCCKey{Key: start}, MVCCKey{Key: end})
+	var err error
+	p.scratch, err = p.wrappedIntentWriter.ClearMVCCRangeAndIntents(start, end, p.scratch)
+	return err
 }
 
 // ClearMVCCRange implements the Batch interface.
@@ -359,10 +377,6 @@ func (p *pebbleBatch) ClearMVCCRange(start, end MVCCKey) error {
 }
 
 func (p *pebbleBatch) clearRange(start, end MVCCKey) error {
-	if p.distinctOpen {
-		panic("distinct batch open")
-	}
-
 	p.buf = EncodeKeyToBuf(p.buf[:0], start)
 	buf2 := EncodeKey(end)
 	return p.batch.DeleteRange(p.buf, buf2, nil)
@@ -370,10 +384,6 @@ func (p *pebbleBatch) clearRange(start, end MVCCKey) error {
 
 // Clear implements the Batch interface.
 func (p *pebbleBatch) ClearIterRange(iter MVCCIterator, start, end roachpb.Key) error {
-	if p.distinctOpen {
-		panic("distinct batch open")
-	}
-
 	// Note that this method has the side effect of modifying iter's bounds.
 	// Since all calls to `ClearIterRange` are on new throwaway iterators with no
 	// lower bounds, calling SetUpperBound should be sufficient and safe.
@@ -401,9 +411,6 @@ func (p *pebbleBatch) ClearIterRange(iter MVCCIterator, start, end roachpb.Key) 
 
 // Merge implements the Batch interface.
 func (p *pebbleBatch) Merge(key MVCCKey, value []byte) error {
-	if p.distinctOpen {
-		panic("distinct batch open")
-	}
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
@@ -427,26 +434,22 @@ func (p *pebbleBatch) PutUnversioned(key roachpb.Key, value []byte) error {
 
 // PutIntent implements the Batch interface.
 func (p *pebbleBatch) PutIntent(
+	ctx context.Context,
 	key roachpb.Key,
 	value []byte,
 	state PrecedingIntentState,
 	txnDidNotUpdateMeta bool,
 	txnUUID uuid.UUID,
-) error {
-	if p.useWrappedIntentWriter {
-		var err error
-		p.scratch, err =
-			p.wrappedIntentWriter.PutIntent(key, value, state, txnDidNotUpdateMeta, txnUUID, p.scratch)
-		return err
-	}
-	return p.put(MVCCKey{Key: key}, value)
+) (int, error) {
+	var err error
+	var separatedIntentCountDelta int
+	p.scratch, separatedIntentCountDelta, err =
+		p.wrappedIntentWriter.PutIntent(ctx, key, value, state, txnDidNotUpdateMeta, txnUUID, p.scratch)
+	return separatedIntentCountDelta, err
 }
 
 // PutEngineKey implements the Batch interface.
 func (p *pebbleBatch) PutEngineKey(key EngineKey, value []byte) error {
-	if p.distinctOpen {
-		panic("distinct batch open")
-	}
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
@@ -455,10 +458,12 @@ func (p *pebbleBatch) PutEngineKey(key EngineKey, value []byte) error {
 	return p.batch.Set(p.buf, value, nil)
 }
 
+// SafeToWriteSeparatedIntents implements the Batch interface.
+func (p *pebbleBatch) SafeToWriteSeparatedIntents(ctx context.Context) (bool, error) {
+	return p.wrappedIntentWriter.safeToWriteSeparatedIntents(ctx)
+}
+
 func (p *pebbleBatch) put(key MVCCKey, value []byte) error {
-	if p.distinctOpen {
-		panic("distinct batch open")
-	}
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
@@ -490,28 +495,6 @@ func (p *pebbleBatch) Commit(sync bool) error {
 		panic(err)
 	}
 	return err
-}
-
-// Distinct implements the Batch interface.
-func (p *pebbleBatch) Distinct() ReadWriter {
-	if p.distinctOpen {
-		panic("distinct batch already open")
-	}
-	// Distinct batches are regular batches with isDistinct set to true. The
-	// parent batch is stored in parentBatch, and all writes on it are disallowed
-	// while the distinct batch is open. Both the distinct batch and the parent
-	// batch share the same underlying pebble.Batch instance.
-	//
-	// The need for distinct batches is distinctly less in Pebble than
-	// RocksDB. In RocksDB, a distinct batch allows reading from a batch without
-	// flushing the buffered writes which is a significant performance
-	// optimization. In Pebble we're still using the same underlying batch and if
-	// it is indexed we'll still be indexing it as we Go.
-	p.distinctOpen = true
-	d := newPebbleBatch(p.db, p.batch)
-	d.parentBatch = p
-	d.isDistinct = true
-	return d
 }
 
 // Empty implements the Batch interface.

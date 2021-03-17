@@ -12,6 +12,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"io"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -41,10 +42,15 @@ type writeCloseSyncer interface {
 // SSTs have bloom filters disabled and format set to LevelDB.
 func MakeBackupSSTWriter(f writeCloseSyncer) SSTWriter {
 	opts := DefaultPebbleOptions().MakeWriterOptions(0)
-	opts.TableFormat = sstable.TableFormatLevelDB
-	// Disable bloom filters to produce SSTs matching those from
-	// RocksDBSstFileWriter.
+	opts.TableFormat = sstable.TableFormatRocksDBv2
+
+	// Disable bloom filters since we only ever iterate backups.
 	opts.FilterPolicy = nil
+	// Bump up block size, since we almost never seek or do point lookups, so more
+	// block checksums and more index entries are just overhead and smaller blocks
+	// reduce compression ratio.
+	opts.BlockSize = 128 << 10
+
 	opts.MergerName = "nullptr"
 	sst := sstable.NewWriter(f, opts)
 	return SSTWriter{fw: sst, f: f}
@@ -137,13 +143,14 @@ func (fw *SSTWriter) PutUnversioned(key roachpb.Key, value []byte) error {
 // (according to the comparator configured during writer creation). `Close`
 // cannot have been called.
 func (fw *SSTWriter) PutIntent(
+	ctx context.Context,
 	key roachpb.Key,
 	value []byte,
 	state PrecedingIntentState,
 	txnDidNotUpdateMeta bool,
 	txnUUID uuid.UUID,
-) error {
-	return fw.put(MVCCKey{Key: key}, value)
+) (int, error) {
+	return 0, fw.put(MVCCKey{Key: key}, value)
 }
 
 // PutEngineKey implements the Writer interface.
@@ -157,6 +164,11 @@ func (fw *SSTWriter) PutEngineKey(key EngineKey, value []byte) error {
 	fw.DataSize += int64(len(key.Key)) + int64(len(value))
 	fw.scratch = key.EncodeToBuf(fw.scratch[:0])
 	return fw.fw.Set(fw.scratch, value)
+}
+
+// SafeToWriteSeparatedIntents implements the Writer interface.
+func (fw *SSTWriter) SafeToWriteSeparatedIntents(context.Context) (bool, error) {
+	return false, errors.Errorf("SSTWriter does not support SafeToWriteSeparatedIntents")
 }
 
 // put puts a kv entry into the sstable being built. An error is returned if it
@@ -201,7 +213,7 @@ func (fw *SSTWriter) ClearUnversioned(key roachpb.Key) error {
 // called.
 func (fw *SSTWriter) ClearIntent(
 	key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-) error {
+) (int, error) {
 	panic("ClearIntent is unsupported")
 }
 

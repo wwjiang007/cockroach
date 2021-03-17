@@ -9,6 +9,7 @@ go_library(
         "//pkg/base",
         "//pkg/gossip",
         "//pkg/keys",
+        "//pkg/kv",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/roachpb",
@@ -18,19 +19,24 @@ go_library(
         "//pkg/storage",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
+        "//pkg/util/contextutil",
         "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/retry",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
+        "//pkg/util/tracing",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
+        "@com_github_stretchr_testify//require",
+        "@io_etcd_go_etcd_raft_v3//:raft",
     ],
 )
 
 go_test(
     name = "testcluster_test",
+    size = "medium",
     srcs = [
         "main_test.go",
         "testcluster_test.go",
@@ -39,6 +45,7 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/keys",
+        "//pkg/kv",
         "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/security",
@@ -52,5 +59,6 @@ go_test(
         "//pkg/util/httputil",
         "//pkg/util/leaktest",
         "//pkg/util/log",
+        "@com_github_stretchr_testify//require",
     ],
 )

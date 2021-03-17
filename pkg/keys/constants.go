@@ -22,7 +22,7 @@ import (
 // These constants are single bytes for performance. They allow single-byte
 // comparisons which are considerably faster than bytes.HasPrefix.
 const (
-	localPrefixByte  = '\x01'
+	LocalPrefixByte  = '\x01'
 	localMaxByte     = '\x02'
 	meta1PrefixByte  = localMaxByte
 	meta2PrefixByte  = '\x03'
@@ -42,8 +42,8 @@ var (
 	// MaxKey is the infinity marker which is larger than any other key.
 	MaxKey = roachpb.KeyMax
 
-	// localPrefix is the prefix for all local keys.
-	localPrefix = roachpb.Key{localPrefixByte}
+	// LocalPrefix is the prefix for all local keys.
+	LocalPrefix = roachpb.Key{LocalPrefixByte}
 	// LocalMax is the end of the local key range. It is itself a global
 	// key.
 	LocalMax = roachpb.Key{localMaxByte}
@@ -53,8 +53,8 @@ var (
 	localSuffixLength = 4
 
 	// There are five types of local key data enumerated below: replicated
-	// range-ID, unreplicated range-ID, range local, range lock, and
-	// store-local keys.
+	// range-ID, unreplicated range-ID, range local, store-local, and range lock
+	// keys.
 
 	// 1. Replicated Range-ID keys
 	//
@@ -64,7 +64,7 @@ var (
 	// metadata is identified by one of the suffixes listed below, along
 	// with potentially additional encoded key info, for instance in the
 	// case of AbortSpan entry.
-	LocalRangeIDPrefix = roachpb.RKey(makeKey(localPrefix, roachpb.Key("i")))
+	LocalRangeIDPrefix = roachpb.RKey(makeKey(LocalPrefix, roachpb.Key("i")))
 	// LocalRangeIDReplicatedInfix is the post-Range ID specifier for all Raft
 	// replicated per-range data. By appending this after the Range ID, these
 	// keys will be sorted directly before the local unreplicated keys for the
@@ -93,6 +93,11 @@ var (
 	// LocalLeaseAppliedIndexLegacySuffix is the suffix for the applied lease
 	// index.
 	LocalLeaseAppliedIndexLegacySuffix = []byte("rlla")
+	// LocalRangePriorReadSummarySuffix is the suffix for a range's prior read
+	// summary.
+	LocalRangePriorReadSummarySuffix = []byte("rprs")
+	// LocalRangeVersionSuffix is the suffix for the range version.
+	LocalRangeVersionSuffix = []byte("rver")
 	// LocalRangeStatsLegacySuffix is the suffix for range statistics.
 	LocalRangeStatsLegacySuffix = []byte("stat")
 	// localTxnSpanGCThresholdSuffix is DEPRECATED and remains to prevent reuse.
@@ -132,7 +137,7 @@ var (
 	// specific sort of per-range metadata is identified by one of the
 	// suffixes listed below, along with potentially additional encoded
 	// key info, such as the txn ID in the case of a transaction record.
-	LocalRangePrefix = roachpb.Key(makeKey(localPrefix, roachpb.RKey("k")))
+	LocalRangePrefix = roachpb.Key(makeKey(LocalPrefix, roachpb.RKey("k")))
 	LocalRangeMax    = LocalRangePrefix.PrefixEnd()
 	// LocalQueueLastProcessedSuffix is the suffix for replica queue state keys.
 	LocalQueueLastProcessedSuffix = roachpb.RKey("qlpt")
@@ -143,36 +148,10 @@ var (
 	// transaction records. The additional detail is the transaction id.
 	LocalTransactionSuffix = roachpb.RKey("txn-")
 
-	// 4. Lock table keys
+	// 4. Store local keys
 	//
-	// LocalRangeLockTablePrefix specifies the key prefix for the lock
-	// table. It is immediately followed by the LockTableSingleKeyInfix,
-	// and then the key being locked.
-	//
-	// The lock strength and txn UUID are not in the part of the key that
-	// the keys package deals with. They are in the versioned part of the
-	// key (see EngineKey.Version). This permits the storage engine to use
-	// bloom filters when searching for all locks for a lockable key.
-	//
-	// Different lock strengths may use different value types. The exclusive
-	// lock strength uses MVCCMetadata as the value type, since it does
-	// double duty as a reference to a provisional MVCC value.
-	// TODO(sumeer): remember to adjust this comment when adding locks of
-	// other strengths, or range locks.
-	LocalRangeLockTablePrefix = roachpb.Key(makeKey(localPrefix, roachpb.RKey("l")))
-	LockTableSingleKeyInfix   = []byte("k")
-	// LockTableSingleKeyStart is the inclusive start key of the key range
-	// containing single key locks.
-	LockTableSingleKeyStart = roachpb.Key(makeKey(LocalRangeLockTablePrefix, LockTableSingleKeyInfix))
-	// LockTableSingleKeyEnd is the exclusive end key of the key range
-	// containing single key locks.
-	LockTableSingleKeyEnd = roachpb.Key(
-		makeKey(LocalRangeLockTablePrefix, roachpb.Key(LockTableSingleKeyInfix).PrefixEnd()))
-
-	// 5. Store local keys
-	//
-	// localStorePrefix is the prefix identifying per-store data.
-	localStorePrefix = makeKey(localPrefix, roachpb.Key("s"))
+	// LocalStorePrefix is the prefix identifying per-store data.
+	LocalStorePrefix = makeKey(LocalPrefix, roachpb.Key("s"))
 	// localStoreSuggestedCompactionSuffix stores suggested compactions to
 	// be aggregated and processed on the store.
 	localStoreSuggestedCompactionSuffix = []byte("comp")
@@ -207,6 +186,32 @@ var (
 	LocalStoreCachedSettingsKeyMin = MakeStoreKey(localStoreCachedSettingsSuffix, nil)
 	// LocalStoreCachedSettingsKeyMax is the end of span of possible cached settings keys.
 	LocalStoreCachedSettingsKeyMax = LocalStoreCachedSettingsKeyMin.PrefixEnd()
+
+	// 5. Lock table keys
+	//
+	// LocalRangeLockTablePrefix specifies the key prefix for the lock
+	// table. It is immediately followed by the LockTableSingleKeyInfix,
+	// and then the key being locked.
+	//
+	// The lock strength and txn UUID are not in the part of the key that
+	// the keys package deals with. They are in the versioned part of the
+	// key (see EngineKey.Version). This permits the storage engine to use
+	// bloom filters when searching for all locks for a lockable key.
+	//
+	// Different lock strengths may use different value types. The exclusive
+	// lock strength uses MVCCMetadata as the value type, since it does
+	// double duty as a reference to a provisional MVCC value.
+	// TODO(sumeer): remember to adjust this comment when adding locks of
+	// other strengths, or range locks.
+	LocalRangeLockTablePrefix = roachpb.Key(makeKey(LocalPrefix, roachpb.RKey("z")))
+	LockTableSingleKeyInfix   = []byte("k")
+	// LockTableSingleKeyStart is the inclusive start key of the key range
+	// containing single key locks.
+	LockTableSingleKeyStart = roachpb.Key(makeKey(LocalRangeLockTablePrefix, LockTableSingleKeyInfix))
+	// LockTableSingleKeyEnd is the exclusive end key of the key range
+	// containing single key locks.
+	LockTableSingleKeyEnd = roachpb.Key(
+		makeKey(LocalRangeLockTablePrefix, roachpb.Key(LockTableSingleKeyInfix).PrefixEnd()))
 
 	// The global keyspace includes the meta{1,2}, system, system tenant SQL
 	// keys, and non-system tenant SQL keys.
@@ -397,6 +402,7 @@ const (
 	ScheduledJobsTableID                = 37
 	TenantsRangesID                     = 38 // pseudo
 	SqllivenessID                       = 39
+	MigrationsID                        = 40
 
 	// CommentType is type for system.comments
 	DatabaseCommentType = 0

@@ -178,6 +178,11 @@ type LocalOnlySessionData struct {
 	// OptimizerUseMultiColStats indicates whether we should use multi-column
 	// statistics for cardinality estimation in the optimizer.
 	OptimizerUseMultiColStats bool
+	// LocalityOptimizedSearch indicates that the optimizer will try to plan scans
+	// and lookup joins in which local nodes (i.e., nodes in the gateway region)
+	// are searched for matching rows before remote nodes, in the hope that the
+	// execution engine can avoid visiting remote nodes.
+	LocalityOptimizedSearch bool
 	// SafeUpdates causes errors when the client
 	// sends syntax that may have unwanted side effects.
 	SafeUpdates bool
@@ -201,6 +206,14 @@ type LocalOnlySessionData struct {
 	AllowPrepareAsOptPlan bool
 	// TempTablesEnabled indicates whether temporary tables can be created or not.
 	TempTablesEnabled bool
+	// ImplicitPartitioningEnabled indicates whether implicit column partitioning
+	// can be created.
+	ImplicitColumnPartitioningEnabled bool
+	// DropEnumValueEnabled indicates whether enum values can be dropped.
+	DropEnumValueEnabled bool
+	// OverrideMultiRegionZoneConfigEnabled indicates whether zone configurations can be
+	// modified for multi-region databases and tables/indexes/partitions.
+	OverrideMultiRegionZoneConfigEnabled bool
 	// HashShardedIndexesEnabled indicates whether hash sharded indexes can be created.
 	HashShardedIndexesEnabled bool
 	// DisallowFullTableScans indicates whether queries that plan full table scans
@@ -219,22 +232,23 @@ type LocalOnlySessionData struct {
 	SynchronousCommit bool
 	// EnableSeqScan is a dummy setting for the enable_seqscan var.
 	EnableSeqScan bool
-	// EnableMultiColumnInvertedIndexes indicates whether creating multi-column
-	// inverted indexes is allowed.
-	// TODO(mgartner): remove this once multi-column inverted indexes are fully
-	// supported.
-	EnableMultiColumnInvertedIndexes bool
-
-	// VirtualColumnsEnabled indicates whether we allow virtual (non-stored)
-	// computed columns.
-	// TODO(radu): remove this once the feature is stable.
-	VirtualColumnsEnabled bool
 
 	// EnableUniqueWithoutIndexConstraints indicates whether creating unique
 	// constraints without an index is allowed.
 	// TODO(rytaft): remove this once unique without index constraints are fully
 	// supported.
 	EnableUniqueWithoutIndexConstraints bool
+
+	// NewSchemaChangerMode indicates whether to use the new schema changer.
+	NewSchemaChangerMode NewSchemaChangerMode
+
+	// EnableStreamReplication indicates whether to allow setting up a replication
+	// stream.
+	EnableStreamReplication bool
+
+	// SequenceCache stores sequence values which have been cached using the
+	// CACHE sequence option.
+	SequenceCache SequenceCache
 	///////////////////////////////////////////////////////////////////////////
 	// WARNING: consider whether a session parameter you're adding needs to  //
 	// be propagated to the remote nodes. If so, that parameter should live  //
@@ -368,8 +382,18 @@ const (
 	// use INT NOT NULL DEFAULT nextval(...).
 	SerialUsesVirtualSequences
 	// SerialUsesSQLSequences means create a regular SQL sequence and
-	// use INT NOT NULL DEFAULT nextval(...).
+	// use INT NOT NULL DEFAULT nextval(...). Each call to nextval()
+	// is a distributed call to kv. This minimizes the size of gaps
+	// between successive sequence numbers (which occur due to
+	// node failures or errors), but the multiple kv calls
+	// can impact performance negatively.
 	SerialUsesSQLSequences
+	// SerialUsesCachedSQLSequences is identical to SerialUsesSQLSequences with
+	// the exception that nodes can cache sequence values. This significantly
+	// reduces contention and distributed calls to kv, which results in better
+	// performance. Gaps between sequences may be larger as a result of cached
+	// values being lost to errors and/or node failures.
+	SerialUsesCachedSQLSequences
 )
 
 func (m SerialNormalizationMode) String() string {
@@ -380,6 +404,8 @@ func (m SerialNormalizationMode) String() string {
 		return "virtual_sequence"
 	case SerialUsesSQLSequences:
 		return "sql_sequence"
+	case SerialUsesCachedSQLSequences:
+		return "sql_sequence_cached"
 	default:
 		return fmt.Sprintf("invalid (%d)", m)
 	}
@@ -394,6 +420,52 @@ func SerialNormalizationModeFromString(val string) (_ SerialNormalizationMode, o
 		return SerialUsesVirtualSequences, true
 	case "SQL_SEQUENCE":
 		return SerialUsesSQLSequences, true
+	case "SQL_SEQUENCE_CACHED":
+		return SerialUsesCachedSQLSequences, true
+	default:
+		return 0, false
+	}
+}
+
+// NewSchemaChangerMode controls if and when the new schema changer (in
+// sql/schemachanger) is in use.
+type NewSchemaChangerMode int64
+
+const (
+	// UseNewSchemaChangerOff means that we never use the new schema changer.
+	UseNewSchemaChangerOff NewSchemaChangerMode = iota
+	// UseNewSchemaChangerOn means that we use the new schema changer for
+	// supported statements in implicit transactions, but fall back to the old
+	// schema changer otherwise.
+	UseNewSchemaChangerOn
+	// UseNewSchemaChangerUnsafeAlways means that we attempt to use the new schema
+	// changer for all statements and return errors for unsupported statements.
+	// Used for testing/development.
+	UseNewSchemaChangerUnsafeAlways
+)
+
+func (m NewSchemaChangerMode) String() string {
+	switch m {
+	case UseNewSchemaChangerOff:
+		return "off"
+	case UseNewSchemaChangerOn:
+		return "on"
+	case UseNewSchemaChangerUnsafeAlways:
+		return "unsafe_always"
+	default:
+		return fmt.Sprintf("invalid (%d)", m)
+	}
+}
+
+// NewSchemaChangerModeFromString converts a string into a NewSchemaChangerMode
+func NewSchemaChangerModeFromString(val string) (_ NewSchemaChangerMode, ok bool) {
+	switch strings.ToUpper(val) {
+	case "OFF":
+		return UseNewSchemaChangerOff, true
+	case "ON":
+		return UseNewSchemaChangerOn, true
+	case "UNSAFE_ALWAYS":
+		return UseNewSchemaChangerUnsafeAlways, true
 	default:
 		return 0, false
 	}

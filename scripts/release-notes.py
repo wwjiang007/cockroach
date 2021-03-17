@@ -155,6 +155,7 @@ def lookup_person(name, email):
 # Section titles for release notes.
 relnotetitles = {
     'cli change': "Command-line changes",
+    'ops change': "Operational changes",
     'sql change': "SQL language changes",
     'api change': "API endpoint changes",
     'ui change': "DB Console changes",
@@ -174,6 +175,7 @@ relnote_sec_order = [
     'general change',
     'enterprise change',
     'sql change',
+    'ops change',
     'cli change',
     'api change',
     'ui change',
@@ -191,6 +193,7 @@ cat_misspells = {
     'performance change': 'performance improvement',
     'performance': 'performance improvement',
     'ui': 'ui change',
+    'operational change': 'ops change',
     'admin ui': 'ui change',
     'api': 'api change',
     'http': 'api change',
@@ -845,18 +848,8 @@ if options.prod_release:
 if not hidedownloads:
     print("""Get future release notes emailed to you:
 
-<div class="hubspot-install-form install-form-1 clearfix">
-    <script>
-        hbspt.forms.create({
-            css: '',
-            cssClass: 'install-form',
-            portalId: '1753393',
-            formId: '39686297-81d2-45e7-a73f-55a596a8d5ff',
-            formInstanceId: 1,
-            target: '.install-form-1'
-        });
-    </script>
-</div>""")
+{% include marketo.html %}
+""")
     print()
 
     print("""### Downloads

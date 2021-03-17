@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -57,12 +58,12 @@ func init() {
 }
 
 func declareKeysExport(
-	desc *roachpb.RangeDescriptor,
+	rs batcheval.ImmutableRangeState,
 	header roachpb.Header,
 	req roachpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
 ) {
-	batcheval.DefaultDeclareIsolatedKeys(desc, header, req, latchSpans, lockSpans)
+	batcheval.DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans)
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeLastGCKey(header.RangeID)})
 }
 
@@ -101,13 +102,10 @@ func evalExport(
 	}
 
 	if makeExternalStorage {
-		// TODO(dt): this blanket ban means we must do all uploads from the caller
-		// which is nice and simple but imposes extra copies/overhead/cost. We might
-		// want to instead allow *some* forms of external storage for *some* tenants
-		// e.g. allow some tenants to dial out to s3 directly -- if we do though we
-		// would need to continue to restrict unsafe ones like userfile here.
 		if _, ok := roachpb.TenantFromContext(ctx); ok {
-			return result.Result{}, errors.Errorf("requests on behalf of tenants are not allowed to contact external storage")
+			if args.Storage.Provider == roachpb.ExternalStorageProvider_FileTable {
+				return result.Result{}, errors.Errorf("requests to userfile on behalf of tenants must be made by the tenant's SQL process")
+			}
 		}
 	}
 
@@ -147,6 +145,15 @@ func evalExport(
 
 	e := spanset.GetDBEngine(batch, roachpb.Span{Key: args.Key, EndKey: args.EndKey})
 	targetSize := uint64(args.TargetFileSize)
+	// TODO(adityamaru): Remove this once we are able to set tenant specific
+	// cluster settings. This takes the minimum of the system tenant's cluster
+	// setting and the target size sent as part of the ExportRequest from the
+	// tenant.
+	clusterSettingTargetSize := uint64(ExportRequestTargetFileSize.Get(&cArgs.EvalCtx.ClusterSettings().SV))
+	if targetSize > clusterSettingTargetSize {
+		targetSize = clusterSettingTargetSize
+	}
+
 	var maxSize uint64
 	allowedOverage := ExportRequestMaxAllowedFileSizeOverage.Get(&cArgs.EvalCtx.ClusterSettings().SV)
 	if targetSize > 0 && allowedOverage > 0 {
@@ -155,6 +162,7 @@ func evalExport(
 
 	// Time-bound iterators only make sense to use if the start time is set.
 	useTBI := args.EnableTimeBoundIteratorOptimization && !args.StartTime.IsEmpty()
+	var curSizeOfExportedSSTs int64
 	for start := args.Key; start != nil; {
 		data, summary, resume, err := e.ExportMVCCToSst(start, args.EndKey, args.StartTime,
 			h.Timestamp, exportAllRevisions, targetSize, maxSize, useTBI)
@@ -179,7 +187,12 @@ func evalExport(
 		}
 
 		if args.Encryption != nil {
-			data, err = EncryptFile(data, args.Encryption.Key)
+			// NonVotingReplicas was minted after chunked encryption reader merged.
+			if cArgs.EvalCtx.ClusterSettings().Version.IsActive(ctx, clusterversion.NonVotingReplicas) {
+				data, err = EncryptFileChunked(data, args.Encryption.Key)
+			} else {
+				data, err = EncryptFile(data, args.Encryption.Key)
+			}
 			if err != nil {
 				return result.Result{}, err
 			}
@@ -220,6 +233,49 @@ func evalExport(
 		}
 		reply.Files = append(reply.Files, exported)
 		start = resume
+
+		// If we are not returning the SSTs to the processor, there is no need to
+		// paginate the ExportRequest since the reply size will not grow large
+		// enough to cause an OOM.
+		if args.ReturnSST && h.TargetBytes > 0 {
+			curSizeOfExportedSSTs += summary.DataSize
+			// There could be a situation where the size of exported SSTs is larger
+			// than the TargetBytes. In such a scenario, we want to report back
+			// TargetBytes as the size of the processed SSTs otherwise the DistSender
+			// will error out with an "exceeded limit". In every other case we want to
+			// report back the actual size so that the DistSender can shrink the limit
+			// for subsequent range requests.
+			// This is semantically OK for two reasons:
+			//
+			// - DistSender does not parallelize requests with TargetBytes > 0.
+			//
+			// - DistSender uses NumBytes to shrink the limit for subsequent requests.
+			// By returning TargetBytes, no more requests will be processed (and there
+			// are no parallel running requests) which is what we expect.
+			//
+			// The ResumeSpan is what is used as the source of truth by the caller
+			// issuing the request, and that contains accurate information about what
+			// is left to be exported.
+			targetSize := h.TargetBytes
+			if curSizeOfExportedSSTs < targetSize {
+				targetSize = curSizeOfExportedSSTs
+			}
+			reply.NumBytes = targetSize
+			reply.ResumeReason = roachpb.RESUME_KEY_LIMIT
+			// NB: This condition means that we will allow another SST to be created
+			// even if we have less room in our TargetBytes than the target size of
+			// the next SST. In the worst case this could lead to us exceeding our
+			// TargetBytes by SST target size + overage.
+			if reply.NumBytes == h.TargetBytes {
+				if resume != nil {
+					reply.ResumeSpan = &roachpb.Span{
+						Key:    resume,
+						EndKey: args.EndKey,
+					}
+				}
+				break
+			}
+		}
 	}
 
 	return result.Result{}, nil

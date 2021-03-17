@@ -14,13 +14,14 @@ go_library(
 
 go_test(
     name = "workloadimpl_test",
+    size = "small",
     srcs = [
         "precomputedrand_test.go",
         "random_test.go",
     ],
     deps = [
+        ":workloadimpl",
         "//pkg/util/timeutil",
-        "//pkg/workload/workloadimpl",
         "@com_github_stretchr_testify//require",
         "@org_golang_x_exp//rand",
     ],

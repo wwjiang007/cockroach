@@ -23,9 +23,10 @@ go_library(
 
 go_test(
     name = "lex_test",
+    size = "small",
     srcs = ["encode_test.go"],
     deps = [
-        "//pkg/sql/lex",
+        ":lex",
         "//pkg/sql/lexbase",
         "//pkg/sql/parser",
         "//pkg/sql/sessiondatapb",
@@ -42,7 +43,6 @@ genrule(
     outs = ["keywords.go"],
     cmd = """
         $(location //pkg/sql/lex/allkeywords) < $(location //pkg/sql/parser:sql.y) > $@
-        gofmt -s -w $@
     """,
 )
 

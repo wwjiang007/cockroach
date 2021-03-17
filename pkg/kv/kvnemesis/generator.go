@@ -42,6 +42,7 @@ type OperationConfig struct {
 	Split          SplitConfig
 	Merge          MergeConfig
 	ChangeReplicas ChangeReplicasConfig
+	ChangeLease    ChangeLeaseConfig
 }
 
 // ClosureTxnConfig configures the relative probability of running some
@@ -72,8 +73,14 @@ type ClosureTxnConfig struct {
 type ClientOperationConfig struct {
 	// GetMissing is an operation that Gets a key that definitely doesn't exist.
 	GetMissing int
+	// GetMissingForUpdate is an operation that Gets a key that definitely
+	// doesn't exist using a locking read.
+	GetMissingForUpdate int
 	// GetExisting is an operation that Gets a key that likely exists.
 	GetExisting int
+	// GetExistingForUpdate is an operation that Gets a key that likely exists
+	// using a locking read.
+	GetExistingForUpdate int
 	// PutMissing is an operation that Puts a key that definitely doesn't exist.
 	PutMissing int
 	// PutExisting is an operation that Puts a key that likely exists.
@@ -129,18 +136,27 @@ type ChangeReplicasConfig struct {
 	AtomicSwapReplica int
 }
 
+// ChangeLeaseConfig configures the relative probability of generating an
+// operation that causes a leaseholder change.
+type ChangeLeaseConfig struct {
+	// Transfer the lease to a random replica.
+	TransferLease int
+}
+
 // newAllOperationsConfig returns a GeneratorConfig that exercises *all*
 // options. You probably want NewDefaultConfig. Most of the time, these will be
 // the same, but having both allows us to merge code for operations that do not
 // yet pass (for example, if the new operation finds a kv bug or edge case).
 func newAllOperationsConfig() GeneratorConfig {
 	clientOpConfig := ClientOperationConfig{
-		GetMissing:    1,
-		GetExisting:   1,
-		PutMissing:    1,
-		PutExisting:   1,
-		Scan:          1,
-		ScanForUpdate: 1,
+		GetMissing:           1,
+		GetMissingForUpdate:  1,
+		GetExisting:          1,
+		GetExistingForUpdate: 1,
+		PutMissing:           1,
+		PutExisting:          1,
+		Scan:                 1,
+		ScanForUpdate:        1,
 	}
 	batchOpConfig := BatchOperationConfig{
 		Batch: 4,
@@ -169,6 +185,9 @@ func newAllOperationsConfig() GeneratorConfig {
 			AddReplica:        1,
 			RemoveReplica:     1,
 			AtomicSwapReplica: 1,
+		},
+		ChangeLease: ChangeLeaseConfig{
+			TransferLease: 1,
 		},
 	}}
 }
@@ -324,6 +343,8 @@ func (g *generator) RandStep(rng *rand.Rand) Step {
 		removeReplicaFn := makeRemoveReplicaFn(key, current)
 		addOpGen(&allowed, removeReplicaFn, g.Config.Ops.ChangeReplicas.RemoveReplica)
 	}
+	transferLeaseFn := makeTransferLeaseFn(key, current)
+	addOpGen(&allowed, transferLeaseFn, g.Config.Ops.ChangeLease.TransferLease)
 
 	return step(g.selectOp(rng, allowed))
 }
@@ -357,9 +378,11 @@ func (g *generator) selectOp(rng *rand.Rand, contextuallyValid []opGen) Operatio
 
 func (g *generator) registerClientOps(allowed *[]opGen, c *ClientOperationConfig) {
 	addOpGen(allowed, randGetMissing, c.GetMissing)
+	addOpGen(allowed, randGetMissingForUpdate, c.GetMissingForUpdate)
 	addOpGen(allowed, randPutMissing, c.PutMissing)
 	if len(g.keys) > 0 {
 		addOpGen(allowed, randGetExisting, c.GetExisting)
+		addOpGen(allowed, randGetExistingForUpdate, c.GetExistingForUpdate)
 		addOpGen(allowed, randPutExisting, c.PutExisting)
 	}
 	addOpGen(allowed, randScan, c.Scan)
@@ -374,9 +397,22 @@ func randGetMissing(_ *generator, rng *rand.Rand) Operation {
 	return get(randKey(rng))
 }
 
+func randGetMissingForUpdate(_ *generator, rng *rand.Rand) Operation {
+	op := get(randKey(rng))
+	op.Get.ForUpdate = true
+	return op
+}
+
 func randGetExisting(g *generator, rng *rand.Rand) Operation {
 	key := randMapKey(rng, g.keys)
 	return get(key)
+}
+
+func randGetExistingForUpdate(g *generator, rng *rand.Rand) Operation {
+	key := randMapKey(rng, g.keys)
+	op := get(key)
+	op.Get.ForUpdate = true
+	return op
 }
 
 func randPutMissing(g *generator, rng *rand.Rand) Operation {
@@ -470,6 +506,13 @@ func makeAddReplicaFn(key string, current []roachpb.ReplicationTarget, atomicSwa
 			})
 		}
 		return changeReplicas(key, changes...)
+	}
+}
+
+func makeTransferLeaseFn(key string, current []roachpb.ReplicationTarget) opGenFunc {
+	return func(g *generator, rng *rand.Rand) Operation {
+		target := current[rng.Intn(len(current))]
+		return transferLease(key, target.StoreID)
 	}
 }
 
@@ -577,6 +620,10 @@ func get(key string) Operation {
 	return Operation{Get: &GetOperation{Key: []byte(key)}}
 }
 
+func getForUpdate(key string) Operation {
+	return Operation{Get: &GetOperation{Key: []byte(key), ForUpdate: true}}
+}
+
 func put(key, value string) Operation {
 	return Operation{Put: &PutOperation{Key: []byte(key), Value: []byte(value)}}
 }
@@ -599,4 +646,8 @@ func merge(key string) Operation {
 
 func changeReplicas(key string, changes ...roachpb.ReplicationChange) Operation {
 	return Operation{ChangeReplicas: &ChangeReplicasOperation{Key: []byte(key), Changes: changes}}
+}
+
+func transferLease(key string, target roachpb.StoreID) Operation {
+	return Operation{TransferLease: &TransferLeaseOperation{Key: []byte(key), Target: target}}
 }

@@ -16,9 +16,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
@@ -48,11 +51,11 @@ func (p *planner) AlterIndex(ctx context.Context, n *tree.AlterIndex) (planNode,
 	// different copy than the one in the tableDesc. To make it easier for the
 	// code below, get a pointer to the index descriptor that's actually in
 	// tableDesc.
-	indexDesc, err = tableDesc.FindIndexByID(indexDesc.ID)
+	index, err := tableDesc.FindIndexWithID(indexDesc.ID)
 	if err != nil {
 		return nil, err
 	}
-	return &alterIndexNode{n: n, tableDesc: tableDesc, indexDesc: indexDesc}, nil
+	return &alterIndexNode{n: n, tableDesc: tableDesc, indexDesc: index.IndexDesc()}, nil
 }
 
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
@@ -71,24 +74,58 @@ func (n *alterIndexNode) startExec(params runParams) error {
 		switch t := cmd.(type) {
 		case *tree.AlterIndexPartitionBy:
 			telemetry.Inc(sqltelemetry.SchemaChangeAlterCounterWithExtra("index", "partition_by"))
-			partitioning, err := CreatePartitioning(
-				params.ctx, params.extendedEvalCtx.Settings,
-				params.EvalContext(),
-				n.tableDesc, n.indexDesc, t.PartitionBy)
-			if err != nil {
-				return err
+			if n.tableDesc.GetLocalityConfig() != nil {
+				return pgerror.Newf(
+					pgcode.FeatureNotSupported,
+					"cannot change the partitioning of an index if the table is part of a multi-region database",
+				)
 			}
-			descriptorChanged = !n.indexDesc.Partitioning.Equal(&partitioning)
-			err = deleteRemovedPartitionZoneConfigs(
-				params.ctx, params.p.txn,
-				n.tableDesc, n.indexDesc,
-				&n.indexDesc.Partitioning, &partitioning,
-				params.extendedEvalCtx.ExecCfg,
+			if n.tableDesc.PartitionAllBy {
+				return pgerror.Newf(
+					pgcode.FeatureNotSupported,
+					"cannot change the partitioning of an index if the table has PARTITION ALL BY defined",
+				)
+			}
+			if n.indexDesc.Partitioning.NumImplicitColumns > 0 {
+				return unimplemented.New(
+					"ALTER INDEX PARTITION BY",
+					"cannot ALTER INDEX PARTITION BY on an index which already has implicit column partitioning",
+				)
+			}
+			allowImplicitPartitioning := params.p.EvalContext().SessionData.ImplicitColumnPartitioningEnabled ||
+				n.tableDesc.IsLocalityRegionalByRow()
+			newIndexDesc, err := CreatePartitioning(
+				params.ctx,
+				params.extendedEvalCtx.Settings,
+				params.EvalContext(),
+				n.tableDesc,
+				*n.indexDesc,
+				t.PartitionBy,
+				nil, /* allowedNewColumnNames */
+				allowImplicitPartitioning,
 			)
 			if err != nil {
 				return err
 			}
-			n.indexDesc.Partitioning = partitioning
+			if newIndexDesc.Partitioning.NumImplicitColumns > 0 {
+				return unimplemented.New(
+					"ALTER INDEX PARTITION BY",
+					"cannot ALTER INDEX and change the partitioning to contain implicit columns",
+				)
+			}
+			descriptorChanged = !n.indexDesc.Equal(&newIndexDesc)
+			if err = deleteRemovedPartitionZoneConfigs(
+				params.ctx,
+				params.p.txn,
+				n.tableDesc,
+				n.indexDesc,
+				&n.indexDesc.Partitioning,
+				&newIndexDesc.Partitioning,
+				params.extendedEvalCtx.ExecCfg,
+			); err != nil {
+				return err
+			}
+			*n.indexDesc = newIndexDesc
 		default:
 			return errors.AssertionFailedf(
 				"unsupported alter command: %T", cmd)

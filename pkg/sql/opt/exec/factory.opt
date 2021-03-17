@@ -23,7 +23,7 @@ define Filter {
 # node.
 define InvertedFilter {
     Input exec.Node
-    InvFilter *invertedexpr.SpanExpression
+    InvFilter *inverted.SpanExpression
     PreFiltererExpr tree.TypedExpr
     PreFiltererType *types.T
     InvColumn exec.NodeColumnOrdinal
@@ -164,11 +164,18 @@ define Distinct {
 # SetOp performs a UNION / INTERSECT / EXCEPT operation (either the ALL or the
 # DISTINCT version). The left and right nodes must have the same number of
 # columns.
+#
+# HardLimit can only be set for UNION ALL operations. It is used to implement
+# locality optimized search, and instructs the execution engine that it should
+# execute the left node to completion and possibly short-circuit if the limit is
+# reached before executing the right node. The limit is guaranteed but the
+# short-circuit behavior is not.
 define SetOp {
     Typ tree.UnionType
     All bool
     Left exec.Node
     Right exec.Node
+    HardLimit uint64
 }
 
 # Sort performs a resorting of the rows produced by the input node.
@@ -202,8 +209,13 @@ define IndexJoin {
 
 # LookupJoin performs a lookup join.
 #
-# The eqCols are columns from the input used
-# as keys for the columns of the index (or a prefix of them); lookupCols are
+# The eqCols are columns from the input used as keys for the columns of the
+# index (or a prefix of them); eqColsAreKey is set to true if the eqCols form a
+# key in the table (and thus each input row matches with at most one index row);
+# lookupExpr is used instead of eqCols when the lookup condition is more
+# complicated than a simple equality between input columns and index columns
+# (eqColsAreKey will be true in this case if the columns that are part of the
+# simple equality join conditions form a key in the table); lookupCols are
 # ordinals for the table columns we are retrieving.
 #
 # The node produces the columns in the input and (unless join type is
@@ -216,6 +228,7 @@ define LookupJoin {
     Index cat.Index
     EqCols []exec.NodeColumnOrdinal
     EqColsAreKey bool
+    LookupExpr tree.TypedExpr
     LookupCols exec.TableColumnOrdinalSet
     OnCond tree.TypedExpr
     IsSecondJoinInPairedJoiner bool
@@ -225,8 +238,10 @@ define LookupJoin {
 
 # InvertedJoin performs a lookup join into an inverted index.
 #
-# invertedExpr is used to find the keys to look up in the index; lookupCols
-# are ordinals for the table columns we are retrieving.
+# invertedExpr is used to find the keys to look up in the index; prefixEqCols
+# are columns from the input used as keys for the non-inverted prefix columns,
+# if the index is a multi-column inverted index; lookupCols are ordinals for the
+# table columns we are retrieving.
 #
 # The node produces the columns in the input and (unless join type is
 # LeftSemiJoin or LeftAntiJoin) the lookupCols, ordered by ordinal. The ON
@@ -238,6 +253,7 @@ define InvertedJoin {
     Input exec.Node
     Table cat.Table
     Index cat.Index
+    PrefixEqCols []exec.NodeColumnOrdinal
     LookupCols exec.TableColumnOrdinalSet
     OnCond tree.TypedExpr
     IsFirstJoinInPairedJoiner bool
@@ -350,7 +366,8 @@ define ShowTrace {
 define Insert {
     Input exec.Node
     Table cat.Table
-    Arbiters cat.IndexOrdinals
+    ArbiterIndexes cat.IndexOrdinals
+    ArbiterConstraints cat.UniqueOrdinals
     InsertCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
     CheckCols exec.CheckOrdinalSet
@@ -448,7 +465,8 @@ define Update {
 define Upsert {
     Input exec.Node
     Table cat.Table
-    Arbiters cat.IndexOrdinals
+    ArbiterIndexes cat.IndexOrdinals
+    ArbiterConstraints cat.UniqueOrdinals
     CanaryCol exec.NodeColumnOrdinal
     InsertCols exec.TableColumnOrdinalSet
     FetchCols exec.TableColumnOrdinalSet

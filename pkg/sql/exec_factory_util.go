@@ -102,8 +102,16 @@ func makeScanColumnsConfig(table cat.Table, cols exec.TableColumnOrdinalSet) sca
 		col := table.Column(ord)
 		colOrd := ord
 		if col.Kind() == cat.VirtualInverted {
+			typ := col.DatumType()
 			colOrd = col.InvertedSourceColumnOrdinal()
 			col = table.Column(colOrd)
+			colCfg.virtualColumn = &struct {
+				colID tree.ColumnID
+				typ   *types.T
+			}{
+				colID: tree.ColumnID(col.ColID()),
+				typ:   typ,
+			}
 		}
 		colCfg.wantedColumns = append(colCfg.wantedColumns, tree.ColumnID(col.ColID()))
 		colCfg.wantedColumnsOrdinals = append(colCfg.wantedColumnsOrdinals, uint32(colOrd))
@@ -217,7 +225,7 @@ func constructVirtualScan(
 	indexDesc := index.(*optVirtualIndex).desc
 	columns, constructor := virtual.getPlanInfo(
 		table.(*optVirtualTable).desc,
-		indexDesc, params.IndexConstraint)
+		indexDesc, params.IndexConstraint, p.execCfg.DistSQLPlanner.stopper)
 
 	n, err := delayedNodeCallback(&delayedNode{
 		name:            fmt.Sprintf("%s@%s", table.Name(), index.Name()),

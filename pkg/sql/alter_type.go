@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
@@ -22,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
@@ -85,11 +85,12 @@ func (p *planner) AlterType(ctx context.Context, n *tree.AlterType) (planNode, e
 func (n *alterTypeNode) startExec(params runParams) error {
 	telemetry.Inc(n.n.Cmd.TelemetryCounter())
 
+	typeName := tree.AsStringWithFQNames(n.n.Type, params.p.Ann())
 	eventLogDone := false
 	var err error
 	switch t := n.n.Cmd.(type) {
 	case *tree.AlterTypeAddValue:
-		err = params.p.addEnumValue(params.ctx, n, t)
+		err = params.p.addEnumValue(params.ctx, n.desc, t, tree.AsStringWithFQNames(n.n, params.p.Ann()))
 	case *tree.AlterTypeRenameValue:
 		err = params.p.renameTypeValue(params.ctx, n, string(t.OldVal), string(t.NewVal))
 	case *tree.AlterTypeRename:
@@ -97,9 +98,7 @@ func (n *alterTypeNode) startExec(params runParams) error {
 			return err
 		}
 		err = params.p.logEvent(params.ctx, n.desc.ID, &eventpb.RenameType{
-			// TODO(knz): This name is insufficiently qualified.
-			// See: https://github.com/cockroachdb/cockroach/issues/57734
-			TypeName:    n.desc.Name,
+			TypeName:    typeName,
 			NewTypeName: string(t.NewName),
 		})
 		eventLogDone = true
@@ -112,16 +111,24 @@ func (n *alterTypeNode) startExec(params runParams) error {
 			return err
 		}
 		eventLogDone = true // done inside alterTypeOwner().
+	case *tree.AlterTypeDropValue:
+		if !params.p.SessionData().DropEnumValueEnabled {
+			return pgerror.WithCandidateCode(
+				errors.WithHint(
+					errors.WithIssueLink(
+						errors.New("ALTER TYPE ... DROP VALUE ... is only supported as an alpha feature "+
+							"since view, default, or computed expressions will stop working if they reference the "+
+							"ENUM value"),
+						errors.IssueLink{IssueURL: build.MakeIssueURL(61594)}),
+					"you can enable alter type drop value by running "+
+						"`SET enable_drop_enum_value = true`"),
+				pgcode.FeatureNotSupported)
+		}
+		err = params.p.dropEnumValue(params.ctx, n.desc, t.Val)
 	default:
 		err = errors.AssertionFailedf("unknown alter type cmd %s", t)
 	}
 	if err != nil {
-		return err
-	}
-
-	// Validate the type descriptor after the changes.
-	dg := catalogkv.NewOneLevelUncachedDescGetter(params.p.txn, params.ExecCfg().Codec)
-	if err := n.desc.Validate(params.ctx, dg); err != nil {
 		return err
 	}
 
@@ -130,7 +137,7 @@ func (n *alterTypeNode) startExec(params runParams) error {
 		if err := params.p.logEvent(params.ctx,
 			n.desc.ID,
 			&eventpb.AlterType{
-				TypeName: n.desc.Name,
+				TypeName: typeName,
 			}); err != nil {
 			return err
 		}
@@ -138,54 +145,83 @@ func (n *alterTypeNode) startExec(params runParams) error {
 	return nil
 }
 
-func (p *planner) addEnumValue(
-	ctx context.Context, n *alterTypeNode, node *tree.AlterTypeAddValue,
-) error {
-	if n.desc.Kind != descpb.TypeDescriptor_ENUM {
-		return pgerror.Newf(pgcode.WrongObjectType, "%q is not an enum", n.desc.Name)
-	}
-	// See if the value already exists in the enum or not.
-	for _, member := range n.desc.EnumMembers {
-		if member.LogicalRepresentation == string(node.NewVal) {
-			if node.IfNotExists {
-				p.BufferClientNotice(
-					ctx,
-					pgnotice.Newf("enum label %q already exists, skipping", node.NewVal),
-				)
-				return nil
-			}
-			return pgerror.Newf(pgcode.DuplicateObject, "enum label %q already exists", node.NewVal)
+func findEnumMemberByName(
+	desc *typedesc.Mutable, val tree.EnumValue,
+) (bool, *descpb.TypeDescriptor_EnumMember) {
+	for _, member := range desc.EnumMembers {
+		if member.LogicalRepresentation == string(val) {
+			return true, &member
 		}
 	}
+	return false, nil
+}
 
-	if err := n.desc.AddEnumValue(node); err != nil {
+func (p *planner) addEnumValue(
+	ctx context.Context, desc *typedesc.Mutable, node *tree.AlterTypeAddValue, jobDesc string,
+) error {
+	if desc.Kind != descpb.TypeDescriptor_ENUM &&
+		desc.Kind != descpb.TypeDescriptor_MULTIREGION_ENUM {
+		return pgerror.Newf(pgcode.WrongObjectType, "%q is not an enum", desc.Name)
+	}
+	// See if the value already exists in the enum or not.
+	found, member := findEnumMemberByName(desc, node.NewVal)
+	if found {
+		if enumMemberIsRemoving(member) {
+			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+				"enum value %q is being dropped, try again later", node.NewVal)
+		}
+		if node.IfNotExists {
+			p.BufferClientNotice(
+				ctx,
+				pgnotice.Newf("enum value %q already exists, skipping", node.NewVal),
+			)
+			return nil
+		}
+		return pgerror.Newf(pgcode.DuplicateObject, "enum value %q already exists", node.NewVal)
+	}
+
+	if err := desc.AddEnumValue(node); err != nil {
 		return err
 	}
-	return p.writeTypeSchemaChange(
-		ctx,
-		n.desc,
-		tree.AsStringWithFQNames(n.n, p.Ann()),
-	)
+	return p.writeTypeSchemaChange(ctx, desc, jobDesc)
+}
+
+func (p *planner) dropEnumValue(
+	ctx context.Context, desc *typedesc.Mutable, val tree.EnumValue,
+) error {
+	if desc.Kind != descpb.TypeDescriptor_ENUM &&
+		desc.Kind != descpb.TypeDescriptor_MULTIREGION_ENUM {
+		return pgerror.Newf(pgcode.WrongObjectType, "%q is not an enum", desc.Name)
+	}
+
+	found, member := findEnumMemberByName(desc, val)
+	if !found {
+		return pgerror.Newf(pgcode.UndefinedObject, "enum value %q does not exist", val)
+	}
+	// Do not allow drops if the enum value isn't public yet.
+	if enumMemberIsRemoving(member) {
+		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"enum value %q is already being dropped", val)
+	}
+	if enumMemberIsAdding(member) {
+		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"enum value %q is being added, try again later", val)
+	}
+
+	desc.DropEnumValue(val)
+	return p.writeTypeSchemaChange(ctx, desc, desc.Name)
 }
 
 func (p *planner) renameType(ctx context.Context, n *alterTypeNode, newName string) error {
-	// See if there is a name collision with the new name.
-	exists, id, err := catalogkv.LookupObjectID(
+	err := catalogkv.CheckObjectCollision(
 		ctx,
 		p.txn,
 		p.ExecCfg().Codec,
 		n.desc.ParentID,
 		n.desc.ParentSchemaID,
-		newName,
+		tree.NewUnqualifiedTypeName(tree.Name(newName)),
 	)
-	if err == nil && exists {
-		// Try and see what kind of object we collided with.
-		desc, err := catalogkv.GetAnyDescriptorByID(ctx, p.txn, p.ExecCfg().Codec, id, catalogkv.Immutable)
-		if err != nil {
-			return sqlerrors.WrapErrorWhileConstructingObjectAlreadyExistsErr(err)
-		}
-		return sqlerrors.MakeObjectAlreadyExistsError(desc.DescriptorProto(), newName)
-	} else if err != nil {
+	if err != nil {
 		return err
 	}
 
@@ -277,14 +313,24 @@ func (p *planner) renameTypeValue(
 			enumMemberIndex = i
 		} else if member.LogicalRepresentation == newVal {
 			return pgerror.Newf(pgcode.DuplicateObject,
-				"enum label %s already exists", newVal)
+				"enum value %s already exists", newVal)
 		}
 	}
 
 	// An enum member with the name oldVal was not found.
 	if enumMemberIndex == -1 {
 		return pgerror.Newf(pgcode.InvalidParameterValue,
-			"%s is not an existing enum label", oldVal)
+			"%s is not an existing enum value", oldVal)
+	}
+
+	if enumMemberIsRemoving(&n.desc.EnumMembers[enumMemberIndex]) {
+		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"enum value %q is being dropped", oldVal)
+	}
+	if enumMemberIsAdding(&n.desc.EnumMembers[enumMemberIndex]) {
+		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"enum value %q is being added, try again later", oldVal)
+
 	}
 
 	n.desc.EnumMembers[enumMemberIndex].LogicalRepresentation = newVal
@@ -299,6 +345,11 @@ func (p *planner) renameTypeValue(
 func (p *planner) setTypeSchema(ctx context.Context, n *alterTypeNode, schema string) error {
 	typeDesc := n.desc
 	schemaID := typeDesc.GetParentSchemaID()
+
+	oldName, err := p.getQualifiedTypeName(ctx, typeDesc)
+	if err != nil {
+		return err
+	}
 
 	desiredSchemaID, err := p.prepareSetSchema(ctx, typeDesc, schema)
 	if err != nil {
@@ -324,8 +375,26 @@ func (p *planner) setTypeSchema(ctx context.Context, n *alterTypeNode, schema st
 		return err
 	}
 
-	return p.performRenameTypeDesc(
+	if err := p.performRenameTypeDesc(
 		ctx, arrayDesc, arrayDesc.Name, desiredSchemaID, tree.AsStringWithFQNames(n.n, p.Ann()),
+	); err != nil {
+		return err
+	}
+
+	newName, err := p.getQualifiedTypeName(ctx, typeDesc)
+	if err != nil {
+		return err
+	}
+
+	return p.logEvent(ctx,
+		desiredSchemaID,
+		&eventpb.SetSchema{
+			CommonEventDetails:    eventpb.CommonEventDetails{},
+			CommonSQLEventDetails: eventpb.CommonSQLEventDetails{},
+			DescriptorName:        oldName.FQString(),
+			NewDescriptorName:     newName.FQString(),
+			DescriptorType:        "type",
+		},
 	)
 }
 
@@ -333,13 +402,7 @@ func (p *planner) alterTypeOwner(
 	ctx context.Context, n *alterTypeNode, newOwner security.SQLUsername,
 ) error {
 	typeDesc := n.desc
-
-	privs := typeDesc.GetPrivileges()
-
-	// If the owner we want to set to is the current owner, do a no-op.
-	if newOwner == privs.Owner() {
-		return nil
-	}
+	oldOwner := typeDesc.GetPrivileges().Owner()
 
 	arrayDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeDesc.ArrayTypeID)
 	if err != nil {
@@ -348,6 +411,11 @@ func (p *planner) alterTypeOwner(
 
 	if err := p.checkCanAlterTypeAndSetNewOwner(ctx, typeDesc, arrayDesc, newOwner); err != nil {
 		return err
+	}
+
+	// If the owner we want to set to is the current owner, do a no-op.
+	if newOwner == oldOwner {
+		return nil
 	}
 
 	if err := p.writeTypeSchemaChange(

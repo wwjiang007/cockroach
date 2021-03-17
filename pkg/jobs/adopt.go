@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -25,19 +26,28 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-const claimableStatusTupleString = `(` +
-	`'` + string(StatusRunning) + `', ` +
-	`'` + string(StatusPending) + `', ` +
-	`'` + string(StatusCancelRequested) + `', ` +
-	`'` + string(StatusPauseRequested) + `', ` +
-	`'` + string(StatusReverting) + `'` +
-	`)`
+const (
+	claimableStatusList = `'` + string(StatusRunning) + `', ` +
+		`'` + string(StatusPending) + `', ` +
+		`'` + string(StatusCancelRequested) + `', ` +
+		`'` + string(StatusPauseRequested) + `', ` +
+		`'` + string(StatusReverting) + `'`
+
+	claimableStatusTupleString = `(` + claimableStatusList + `)`
+
+	nonTerminalStatusList = claimableStatusList + `, ` +
+		`'` + string(StatusPaused) + `'`
+
+	// NonTerminalStatusTupleString is a sql tuple corresponding to statuses of
+	// non-terminal jobs.
+	NonTerminalStatusTupleString = `(` + nonTerminalStatusList + `)`
+)
 
 // claimJobs places a claim with the given SessionID to job rows that are
 // available.
 func (r *Registry) claimJobs(ctx context.Context, s sqlliveness.Session) error {
 	return r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		rows, err := r.ex.Query(
+		numRows, err := r.ex.Exec(
 			ctx, "claim-jobs", txn, `
    UPDATE system.jobs
       SET claim_session_id = $1, claim_instance_id = $2
@@ -51,8 +61,8 @@ RETURNING id;`,
 		if err != nil {
 			return errors.Wrap(err, "could not query jobs table")
 		}
-		if log.ExpensiveLogEnabled(ctx, 1) || len(rows) > 0 {
-			log.Infof(ctx, "claimed %d jobs", len(rows))
+		if log.ExpensiveLogEnabled(ctx, 1) || numRows > 0 {
+			log.Infof(ctx, "claimed %d jobs", numRows)
 		}
 		return nil
 	})
@@ -60,7 +70,7 @@ RETURNING id;`,
 
 // processClaimedJobs processes all jobs currently claimed by the registry.
 func (r *Registry) processClaimedJobs(ctx context.Context, s sqlliveness.Session) error {
-	rows, err := r.ex.QueryEx(
+	it, err := r.ex.QueryIteratorEx(
 		ctx, "select-running/get-claimed-jobs", nil,
 		sessiondata.InternalExecutorOverride{User: security.NodeUserName()}, `
 SELECT id FROM system.jobs
@@ -68,16 +78,21 @@ WHERE (status = $1 OR status = $2) AND (claim_session_id = $3 AND claim_instance
 		StatusRunning, StatusReverting, s.ID().UnsafeBytes(), r.ID(),
 	)
 	if err != nil {
-		return errors.Wrapf(err, "could query for claimed jobs")
+		return errors.Wrapf(err, "could not query for claimed jobs")
 	}
 
 	// This map will eventually contain the job ids that must be resumed.
-	claimedToResume := make(map[int64]struct{}, len(rows))
+	claimedToResume := make(map[jobspb.JobID]struct{})
 	// Initially all claimed jobs are supposed to be resumed but some may be
 	// running on this registry already so we will filter them out later.
-	for _, row := range rows {
-		id := int64(*row[0].(*tree.DInt))
+	var ok bool
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+		row := it.Cur()
+		id := jobspb.JobID(*row[0].(*tree.DInt))
 		claimedToResume[id] = struct{}{}
+	}
+	if err != nil {
+		return errors.Wrapf(err, "could not query for claimed jobs")
 	}
 
 	r.filterAlreadyRunningAndCancelFromPreviousSessions(ctx, s, claimedToResume)
@@ -88,7 +103,7 @@ WHERE (status = $1 OR status = $2) AND (claim_session_id = $3 AND claim_instance
 // resumeClaimedJobs invokes r.resumeJob for each job in claimedToResume. It
 // does so concurrently.
 func (r *Registry) resumeClaimedJobs(
-	ctx context.Context, s sqlliveness.Session, claimedToResume map[int64]struct{},
+	ctx context.Context, s sqlliveness.Session, claimedToResume map[jobspb.JobID]struct{},
 ) {
 	const resumeConcurrency = 64
 	sem := make(chan struct{}, resumeConcurrency)
@@ -97,7 +112,7 @@ func (r *Registry) resumeClaimedJobs(
 	done := func() { <-sem; wg.Done() }
 	for id := range claimedToResume {
 		add()
-		go func(id int64) {
+		go func(id jobspb.JobID) {
 			defer done()
 			if err := r.resumeJob(ctx, id, s); err != nil && ctx.Err() == nil {
 				log.Errorf(ctx, "could not run claimed job %d: %v", id, err)
@@ -112,7 +127,7 @@ func (r *Registry) resumeClaimedJobs(
 // claimedToResume. Additionally it verifies that the session associated with the
 // running job matches the current session, canceling the job if not.
 func (r *Registry) filterAlreadyRunningAndCancelFromPreviousSessions(
-	ctx context.Context, s sqlliveness.Session, claimedToResume map[int64]struct{},
+	ctx context.Context, s sqlliveness.Session, claimedToResume map[jobspb.JobID]struct{},
 ) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -133,7 +148,7 @@ func (r *Registry) filterAlreadyRunningAndCancelFromPreviousSessions(
 }
 
 // resumeJob resumes a claimed job.
-func (r *Registry) resumeJob(ctx context.Context, jobID int64, s sqlliveness.Session) error {
+func (r *Registry) resumeJob(ctx context.Context, jobID jobspb.JobID, s sqlliveness.Session) error {
 	log.Infof(ctx, "job %d: resuming execution", jobID)
 	row, err := r.ex.QueryRowEx(
 		ctx, "get-job-row", nil,
@@ -150,6 +165,10 @@ FROM system.jobs WHERE id = $1 AND claim_session_id = $2`,
 	}
 
 	status := Status(*row[0].(*tree.DString))
+	if status == StatusSucceeded {
+		// A concurrent registry could have already executed the job.
+		return nil
+	}
 	if status != StatusRunning && status != StatusReverting {
 		// A concurrent registry could have requested the job to be paused or canceled.
 		return errors.Errorf("job %d: status changed to %s which is not resumable`", jobID, status)
@@ -176,7 +195,7 @@ FROM system.jobs WHERE id = $1 AND claim_session_id = $2`,
 	if err != nil {
 		return err
 	}
-	job := &Job{id: &jobID, registry: r}
+	job := &Job{id: jobID, registry: r}
 	job.mu.payload = *payload
 	job.mu.progress = *progress
 	job.sessionID = s.ID()
@@ -186,57 +205,35 @@ FROM system.jobs WHERE id = $1 AND claim_session_id = $2`,
 		return err
 	}
 	resumeCtx, cancel := r.makeCtx()
-	resultsCh := make(chan tree.Datums)
 
-	errCh := make(chan error, 1)
 	aj := &adoptedJob{sid: s.ID(), cancel: cancel}
 	r.addAdoptedJob(jobID, aj)
 	if err := r.stopper.RunAsyncTask(ctx, job.taskName(), func(ctx context.Context) {
-		r.runJob(resumeCtx, resumer, resultsCh, errCh, job, status, job.taskName(), nil)
+		// Wait for the job to finish. No need to print the error because if there
+		// was one it's been set in the job status already.
+		_ = r.runJob(resumeCtx, resumer, job, status, job.taskName())
 	}); err != nil {
 		r.removeAdoptedJob(jobID)
 		return err
 	}
-	go func() {
-		// Drain and ignore results.
-		for range resultsCh {
-		}
-	}()
-	go func() {
-		// Wait for the job to finish. No need to print the error because if there
-		// was one it's been set in the job status already.
-		<-errCh
-		close(resultsCh)
-	}()
 	return nil
 }
 
-func (r *Registry) removeAdoptedJob(jobID int64) {
+func (r *Registry) removeAdoptedJob(jobID jobspb.JobID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.mu.adoptedJobs, jobID)
 }
 
-func (r *Registry) addAdoptedJob(jobID int64, aj *adoptedJob) {
+func (r *Registry) addAdoptedJob(jobID jobspb.JobID, aj *adoptedJob) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.mu.adoptedJobs[jobID] = aj
 }
 
 func (r *Registry) runJob(
-	ctx context.Context,
-	resumer Resumer,
-	resultsCh chan<- tree.Datums,
-	errCh chan<- error,
-	job *Job,
-	status Status,
-	taskName string,
-	onDone func(),
-) {
-	if onDone != nil {
-		defer onDone()
-	}
-
+	ctx context.Context, resumer Resumer, job *Job, status Status, taskName string,
+) error {
 	job.mu.Lock()
 	var finalResumeError error
 	if job.mu.payload.FinalResumeError != nil {
@@ -249,26 +246,30 @@ func (r *Registry) runJob(
 	// Bookkeeping.
 	execCtx, cleanup := r.execCtx("resume-"+taskName, username)
 	defer cleanup()
-	spanName := fmt.Sprintf(`%s-%d`, typ, *job.ID())
+	spanName := fmt.Sprintf(`%s-%d`, typ, job.ID())
 	var span *tracing.Span
 	ctx, span = r.ac.AnnotateCtxWithSpan(ctx, spanName)
 	defer span.Finish()
 
 	// Run the actual job.
-	err := r.stepThroughStateMachine(ctx, execCtx, resumer, resultsCh, job, status, finalResumeError)
+	err := r.stepThroughStateMachine(ctx, execCtx, resumer, job, status, finalResumeError)
 	// If the context has been canceled, disregard errors for the sake of logging
 	// as presumably they are due to the context cancellation which commonly
 	// happens during shutdown.
 	if err != nil && ctx.Err() == nil {
-		log.Errorf(ctx, "job %d: adoption completed with error %v", *job.ID(), err)
+		log.Errorf(ctx, "job %d: adoption completed with error %v", job.ID(), err)
 	}
-	r.unregister(*job.ID())
-	errCh <- err
+	r.unregister(job.ID())
+	return err
 }
 
 func (r *Registry) servePauseAndCancelRequests(ctx context.Context, s sqlliveness.Session) error {
 	return r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		rows, err := r.ex.QueryEx(
+		// Note that we have to buffer all rows first - before processing each
+		// job - because we have to make sure that the query executes without an
+		// error (otherwise, the system.jobs table might diverge from the jobs
+		// registry).
+		rows, err := r.ex.QueryBufferedEx(
 			ctx, "cancel/pause-requested", txn, sessiondata.InternalExecutorOverride{User: security.NodeUserName()}, `
 UPDATE system.jobs
 SET status =
@@ -287,15 +288,15 @@ RETURNING id, status`,
 			return errors.Wrap(err, "could not query jobs table")
 		}
 		for _, row := range rows {
-			id := int64(*row[0].(*tree.DInt))
-			job := &Job{id: &id, registry: r}
+			id := jobspb.JobID(*row[0].(*tree.DInt))
+			job := &Job{id: id, registry: r}
 			statusString := *row[1].(*tree.DString)
 			switch Status(statusString) {
 			case StatusPaused:
 				r.unregister(id)
 				log.Infof(ctx, "job %d, session %s: paused", id, s.ID())
 			case StatusReverting:
-				if err := job.WithTxn(txn).Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
+				if err := job.Update(ctx, txn, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
 					r.unregister(id)
 					md.Payload.Error = errJobCanceled.Error()
 					encodedErr := errors.EncodeError(ctx, errJobCanceled)

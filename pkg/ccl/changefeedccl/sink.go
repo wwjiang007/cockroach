@@ -27,10 +27,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -47,11 +46,23 @@ import (
 	"github.com/cockroachdb/logtags"
 )
 
+// TopicDescriptor describes topic emitted by the sink.
+type TopicDescriptor interface {
+	// GetName returns topic name.
+	GetName() string
+	// GetID returns topic identifier.
+	GetID() descpb.ID
+	// GetVersion returns topic version.
+	// For example, the underlying data source (e.g. table) may change, in which case
+	// we may want to emit same Name/ID, but a different version number.
+	GetVersion() descpb.DescriptorVersion
+}
+
 // Sink is an abstraction for anything that a changefeed may emit into.
 type Sink interface {
 	// EmitRow enqueues a row message for asynchronous delivery on the sink. An
 	// error may be returned if a previously enqueued message has failed.
-	EmitRow(ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp) error
+	EmitRow(ctx context.Context, topic TopicDescriptor, key, value []byte, updated hlc.Timestamp) error
 	// EmitResolvedTimestamp enqueues a resolved timestamp message for
 	// asynchronous delivery on every topic that has been seen by EmitRow. An
 	// error may be returned if a previously enqueued message has failed.
@@ -68,7 +79,7 @@ type Sink interface {
 func getSink(
 	ctx context.Context,
 	sinkURI string,
-	nodeID roachpb.NodeID,
+	srcID base.SQLInstanceID,
 	opts map[string]string,
 	targets jobspb.ChangefeedTargets,
 	settings *cluster.Settings,
@@ -157,6 +168,23 @@ func getSink(
 			}
 			cfg.saslHandshake = b
 		}
+
+		cfg.saslMechanism = q.Get(changefeedbase.SinkParamSASLMechanism)
+		q.Del(changefeedbase.SinkParamSASLMechanism)
+		if cfg.saslMechanism != `` && !cfg.saslEnabled {
+			return nil, errors.Errorf(`%s must be enabled to configure SASL mechanism`, changefeedbase.SinkParamSASLEnabled)
+		}
+		if cfg.saslMechanism == `` {
+			cfg.saslMechanism = sarama.SASLTypePlaintext
+		}
+		switch cfg.saslMechanism {
+		case sarama.SASLTypeSCRAMSHA256, sarama.SASLTypeSCRAMSHA512, sarama.SASLTypePlaintext:
+		default:
+			return nil, errors.Errorf(`param %s must be one of %s, %s, or %s`,
+				changefeedbase.SinkParamSASLMechanism,
+				sarama.SASLTypeSCRAMSHA256, sarama.SASLTypeSCRAMSHA512, sarama.SASLTypePlaintext)
+		}
+
 		cfg.saslUser = q.Get(changefeedbase.SinkParamSASLUser)
 		q.Del(changefeedbase.SinkParamSASLUser)
 		cfg.saslPassword = q.Get(changefeedbase.SinkParamSASLPassword)
@@ -196,7 +224,7 @@ func getSink(
 		q = url.Values{}
 		makeSink = func() (Sink, error) {
 			return makeCloudStorageSink(
-				ctx, u.String(), nodeID, fileSize, settings,
+				ctx, u.String(), srcID, fileSize, settings,
 				opts, timestampOracle, makeExternalStorageFromURI, user,
 			)
 		}
@@ -239,9 +267,9 @@ type errorWrapperSink struct {
 }
 
 func (s errorWrapperSink) EmitRow(
-	ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context, topicDescr TopicDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
-	if err := s.wrapped.EmitRow(ctx, table, key, value, updated); err != nil {
+	if err := s.wrapped.EmitRow(ctx, topicDescr, key, value, updated); err != nil {
 		return MarkRetryableError(err)
 	}
 	return nil
@@ -305,6 +333,8 @@ type kafkaSinkConfig struct {
 	saslHandshake    bool
 	saslUser         string
 	saslPassword     string
+	saslMechanism    string
+	targetNames      map[descpb.ID]string
 }
 
 // kafkaSink emits to Kafka asynchronously. It is not concurrency-safe; all
@@ -330,14 +360,20 @@ type kafkaSink struct {
 	}
 }
 
+func (s *kafkaSink) setTargets(targets jobspb.ChangefeedTargets) {
+	s.topics = make(map[string]struct{})
+	s.cfg.targetNames = make(map[descpb.ID]string)
+	for id, t := range targets {
+		s.cfg.targetNames[id] = t.StatementTimeName
+		s.topics[s.cfg.kafkaTopicPrefix+SQLNameToKafkaName(t.StatementTimeName)] = struct{}{}
+	}
+}
+
 func makeKafkaSink(
 	cfg kafkaSinkConfig, bootstrapServers string, targets jobspb.ChangefeedTargets,
 ) (Sink, error) {
 	sink := &kafkaSink{cfg: cfg}
-	sink.topics = make(map[string]struct{})
-	for _, t := range targets {
-		sink.topics[cfg.kafkaTopicPrefix+SQLNameToKafkaName(t.StatementTimeName)] = struct{}{}
-	}
+	sink.setTargets(targets)
 
 	config := sarama.NewConfig()
 	config.ClientID = `CockroachDB`
@@ -386,6 +422,13 @@ func makeKafkaSink(
 		config.Net.SASL.Handshake = cfg.saslHandshake
 		config.Net.SASL.User = cfg.saslUser
 		config.Net.SASL.Password = cfg.saslPassword
+		config.Net.SASL.Mechanism = sarama.SASLMechanism(cfg.saslMechanism)
+		switch config.Net.SASL.Mechanism {
+		case sarama.SASLTypeSCRAMSHA512:
+			config.Net.SASL.SCRAMClientGeneratorFunc = sha512ClientGenerator
+		case sarama.SASLTypeSCRAMSHA256:
+			config.Net.SASL.SCRAMClientGeneratorFunc = sha256ClientGenerator
+		}
 	}
 
 	// When we emit messages to sarama, they're placed in a queue (as does any
@@ -464,9 +507,9 @@ func (s *kafkaSink) Close() error {
 
 // EmitRow implements the Sink interface.
 func (s *kafkaSink) EmitRow(
-	ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context, topicDescr TopicDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
-	topic := s.cfg.kafkaTopicPrefix + SQLNameToKafkaName(table.GetName())
+	topic := s.cfg.kafkaTopicPrefix + SQLNameToKafkaName(s.cfg.targetNames[topicDescr.GetID()])
 	if _, ok := s.topics[topic]; !ok {
 		return errors.Errorf(`cannot emit to undeclared topic: %s`, topic)
 	}
@@ -667,6 +710,8 @@ type sqlSink struct {
 
 	rowBuf  []interface{}
 	scratch bufalloc.ByteAllocator
+
+	targetNames map[descpb.ID]string
 }
 
 func makeSQLSink(uri, tableName string, targets jobspb.ChangefeedTargets) (*sqlSink, error) {
@@ -685,22 +730,24 @@ func makeSQLSink(uri, tableName string, targets jobspb.ChangefeedTargets) (*sqlS
 	}
 
 	s := &sqlSink{
-		db:        db,
-		tableName: tableName,
-		topics:    make(map[string]struct{}),
-		hasher:    fnv.New32a(),
+		db:          db,
+		tableName:   tableName,
+		topics:      make(map[string]struct{}),
+		hasher:      fnv.New32a(),
+		targetNames: make(map[descpb.ID]string),
 	}
-	for _, t := range targets {
+	for id, t := range targets {
 		s.topics[t.StatementTimeName] = struct{}{}
+		s.targetNames[id] = t.StatementTimeName
 	}
 	return s, nil
 }
 
 // EmitRow implements the Sink interface.
 func (s *sqlSink) EmitRow(
-	ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context, topicDescr TopicDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
-	topic := table.GetName()
+	topic := s.targetNames[topicDescr.GetID()]
 	if _, ok := s.topics[topic]; !ok {
 		return errors.Errorf(`cannot emit to undeclared topic: %s`, topic)
 	}
@@ -812,17 +859,16 @@ type bufferSink struct {
 
 // EmitRow implements the Sink interface.
 func (s *bufferSink) EmitRow(
-	ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context, topic TopicDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
 	if s.closed {
 		return errors.New(`cannot EmitRow on a closed sink`)
 	}
-	topic := table.GetName()
 	s.buf.Push(rowenc.EncDatumRow{
 		{Datum: tree.DNull}, // resolved span
-		{Datum: s.alloc.NewDString(tree.DString(topic))}, // topic
-		{Datum: s.alloc.NewDBytes(tree.DBytes(key))},     // key
-		{Datum: s.alloc.NewDBytes(tree.DBytes(value))},   //value
+		{Datum: s.alloc.NewDString(tree.DString(topic.GetName()))}, // topic
+		{Datum: s.alloc.NewDBytes(tree.DBytes(key))},               // key
+		{Datum: s.alloc.NewDBytes(tree.DBytes(value))},             // value
 	})
 	return nil
 }

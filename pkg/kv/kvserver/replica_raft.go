@@ -58,6 +58,10 @@ func makeIDKey() kvserverbase.CmdIDKey {
 // caller should relinquish all ownership of it. If it does return an error, the
 // caller retains full ownership over the guard.
 //
+// evalAndPropose takes ownership of the supplied token; the caller should
+// tok.Move() it into this method. It will be used to untrack the request once
+// it comes out of the proposal buffer.
+//
 // Return values:
 // - a channel which receives a response or error upon application
 // - a closure used to attempt to abandon the command. When called, it unbinds
@@ -68,21 +72,28 @@ func makeIDKey() kvserverbase.CmdIDKey {
 // - any error obtained during the creation or proposal of the command, in
 //   which case the other returned values are zero.
 func (r *Replica) evalAndPropose(
-	ctx context.Context, ba *roachpb.BatchRequest, g *concurrency.Guard, lease *roachpb.Lease,
+	ctx context.Context,
+	ba *roachpb.BatchRequest,
+	g *concurrency.Guard,
+	st kvserverpb.LeaseStatus,
+	lul hlc.Timestamp,
+	tok TrackedRequestToken,
 ) (chan proposalResult, func(), int64, *roachpb.Error) {
+	defer tok.DoneIfNotMoved(ctx)
 	idKey := makeIDKey()
-	proposal, pErr := r.requestToProposal(ctx, idKey, ba, g.LatchSpans())
+	proposal, pErr := r.requestToProposal(ctx, idKey, ba, st, lul, g.LatchSpans())
 	log.Event(proposal.ctx, "evaluated request")
 
 	// If the request hit a server-side concurrency retry error, immediately
 	// proagate the error. Don't assume ownership of the concurrency guard.
 	if isConcurrencyRetryError(pErr) {
+		pErr = maybeAttachLease(pErr, &st.Lease)
 		return nil, nil, 0, pErr
 	}
 
 	// Attach the endCmds to the proposal and assume responsibility for
 	// releasing the concurrency guard if the proposal makes it to Raft.
-	proposal.ec = endCmds{repl: r, g: g}
+	proposal.ec = endCmds{repl: r, g: g, st: st}
 
 	// Pull out proposal channel to return. proposal.doneCh may be set to
 	// nil if it is signaled in this function.
@@ -123,7 +134,7 @@ func (r *Replica) evalAndPropose(
 
 		// Fork the proposal's context span so that the proposal's context
 		// can outlive the original proposer's context.
-		proposal.ctx, proposal.sp = tracing.ForkCtxSpan(ctx, "async consensus")
+		proposal.ctx, proposal.sp = tracing.ForkSpan(ctx, "async consensus")
 
 		// Signal the proposal's response channel immediately.
 		reply := *proposal.Local.Reply
@@ -138,7 +149,11 @@ func (r *Replica) evalAndPropose(
 	}
 
 	// Attach information about the proposer to the command.
-	proposal.command.ProposerLeaseSequence = lease.Sequence
+	proposal.command.ProposerLeaseSequence = st.Lease.Sequence
+	// Perform a sanity check that the lease is owned by this replica.
+	if !st.Lease.OwnedBy(r.store.StoreID()) && !ba.IsLeaseRequest() {
+		log.Fatalf(ctx, "cannot propose %s on follower with remotely owned lease %s", ba, st.Lease)
+	}
 
 	// Once a command is written to the raft log, it must be loaded into memory
 	// and replayed on all replicas. If a command is too big, stop it here. If
@@ -184,7 +199,7 @@ func (r *Replica) evalAndPropose(
 		}
 	}
 
-	maxLeaseIndex, pErr := r.propose(ctx, proposal)
+	maxLeaseIndex, pErr := r.propose(ctx, proposal, tok.Move(ctx))
 	if pErr != nil {
 		return nil, nil, 0, pErr
 	}
@@ -204,7 +219,7 @@ func (r *Replica) evalAndPropose(
 		defer r.raftMu.Unlock()
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		// TODO(radu): Should this context be created via tracer.ForkCtxSpan?
+		// TODO(radu): Should this context be created via tracer.ForkSpan?
 		// We'd need to make sure the span is finished eventually.
 		proposal.ctx = r.AnnotateCtx(context.TODO())
 	}
@@ -218,7 +233,14 @@ func (r *Replica) evalAndPropose(
 // the method returns, all access to the command must be performed while holding
 // Replica.mu and Replica.raftMu. If a non-nil error is returned the
 // MaxLeaseIndex is not updated.
-func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pErr *roachpb.Error) {
+//
+// propose takes ownership of the supplied token; the caller should tok.Move()
+// it into this method. It will be used to untrack the request once it comes out
+// of the proposal buffer.
+func (r *Replica) propose(
+	ctx context.Context, p *ProposalData, tok TrackedRequestToken,
+) (index int64, pErr *roachpb.Error) {
+	defer tok.DoneIfNotMoved(ctx)
 
 	// If an error occurs reset the command's MaxLeaseIndex to its initial value.
 	// Failure to propose will propagate to the client. An invariant of this
@@ -232,7 +254,7 @@ func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pE
 
 	// Make sure the maximum lease index is unset. This field will be set in
 	// propBuf.Insert and its encoded bytes will be appended to the encoding
-	// buffer as a RaftCommandFooter.
+	// buffer as a MaxLeaseFooter.
 	p.command.MaxLeaseIndex = 0
 
 	// Determine the encoding style for the Raft command.
@@ -288,8 +310,12 @@ func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pE
 		preLen = raftCommandPrefixLen
 	}
 	cmdLen := p.command.Size()
-	cap := preLen + cmdLen + kvserverpb.MaxRaftCommandFooterSize()
-	data := make([]byte, preLen, cap)
+	// Allocate the data slice with enough capacity to eventually hold the two
+	// "footers" that are filled later.
+	needed := preLen + cmdLen +
+		kvserverpb.MaxMaxLeaseFooterSize() +
+		kvserverpb.MaxClosedTimestampFooterSize()
+	data := make([]byte, preLen, needed)
 	// Encode prefix with command ID, if necessary.
 	if prefix {
 		encodeRaftCommandPrefix(data, version, p.idKey)
@@ -329,7 +355,7 @@ func (r *Replica) propose(ctx context.Context, p *ProposalData) (index int64, pE
 	//
 	// NB: we must not hold r.mu while using the proposal buffer, see comment
 	// on the field.
-	maxLeaseIndex, err := r.mu.proposalBuf.Insert(ctx, p, data)
+	maxLeaseIndex, err := r.mu.proposalBuf.Insert(ctx, p, data, tok.Move(ctx))
 	if err != nil {
 		return 0, roachpb.NewError(err)
 	}
@@ -474,6 +500,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		unquiesceAndWakeLeader := hasReady || numFlushed > 0 || len(r.mu.proposals) > 0
 		return unquiesceAndWakeLeader, nil
 	})
+	r.mu.applyingEntries = len(rd.CommittedEntries) > 0
 	r.mu.Unlock()
 	if errors.Is(err, errRemoved) {
 		// If we've been removed then just return.
@@ -654,13 +681,10 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	r.sendRaftMessages(ctx, msgApps)
 
 	// Use a more efficient write-only batch because we don't need to do any
-	// reads from the batch. Any reads are performed via the "distinct" batch
-	// which passes the reads through to the underlying DB.
-	batch := r.store.Engine().NewWriteOnlyBatch()
+	// reads from the batch. Any reads are performed on the underlying DB.
+	batch := r.store.Engine().NewUnindexedBatch(false /* writeOnly */)
 	defer batch.Close()
 
-	// We know that all of the writes from here forward will be to distinct keys.
-	writer := batch.Distinct()
 	prevLastIndex := lastIndex
 	if len(rd.Entries) > 0 {
 		// All of the entries are appended to distinct keys, returning a new
@@ -672,7 +696,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		}
 		raftLogSize += sideLoadedEntriesSize
 		if lastIndex, lastTerm, raftLogSize, err = r.append(
-			ctx, writer, lastIndex, lastTerm, raftLogSize, thinEntries,
+			ctx, batch, lastIndex, lastTerm, raftLogSize, thinEntries,
 		); err != nil {
 			const expl = "during append"
 			return stats, expl, errors.Wrap(err, expl)
@@ -690,12 +714,11 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		//
 		// We have both in the same batch, so there's no problem. If that ever
 		// changes, we must write and sync the Entries before the HardState.
-		if err := r.raftMu.stateLoader.SetHardState(ctx, writer, rd.HardState); err != nil {
+		if err := r.raftMu.stateLoader.SetHardState(ctx, batch, rd.HardState); err != nil {
 			const expl = "during setHardState"
 			return stats, expl, errors.Wrap(err, expl)
 		}
 	}
-	writer.Close()
 	// Synchronously commit the batch with the Raft log entries and Raft hard
 	// state as we're promising not to lose this data.
 	//
@@ -759,7 +782,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	// queue. We might have been handed leadership by a remote node which wanted
 	// to remove itself from the range.
 	if becameLeader && r.store.replicateQueue != nil {
-		r.store.replicateQueue.MaybeAddAsync(ctx, r, r.store.Clock().Now())
+		r.store.replicateQueue.MaybeAddAsync(ctx, r, r.store.Clock().NowAsClockTimestamp())
 	}
 
 	// Update raft log entry cache. We clear any older, uncommitted log entries
@@ -835,6 +858,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		}
 		return true, nil
 	})
+	r.mu.applyingEntries = false
 	r.mu.Unlock()
 	if err != nil {
 		return stats, expl, errors.Wrap(err, expl)
@@ -964,6 +988,9 @@ const (
 // ensuring that the proposer will eventually get a reply on the channel it's
 // waiting on.
 // mu must be held.
+//
+// Note that reproposals don't need to worry about checking the closed timestamp
+// before reproposing, since they're reusing the original LAI.
 //
 // refreshAtDelta only applies for reasonTicks and specifies how old (in ticks)
 // a command must be for it to be inspected; the usual value is the number of
@@ -1450,10 +1477,7 @@ func (r *Replica) withRaftGroup(
 }
 
 func shouldCampaignOnWake(
-	leaseStatus kvserverpb.LeaseStatus,
-	lease roachpb.Lease,
-	storeID roachpb.StoreID,
-	raftStatus raft.BasicStatus,
+	leaseStatus kvserverpb.LeaseStatus, storeID roachpb.StoreID, raftStatus raft.BasicStatus,
 ) bool {
 	// When waking up a range, campaign unless we know that another
 	// node holds a valid lease (this is most important after a split,
@@ -1461,7 +1485,7 @@ func shouldCampaignOnWake(
 	// time, with a lease pre-assigned to one of them). Note that
 	// thanks to PreVote, unnecessary campaigns are not disruptive so
 	// we should err on the side of campaigining here.
-	anotherOwnsLease := leaseStatus.State == kvserverpb.LeaseState_VALID && !lease.OwnedBy(storeID)
+	anotherOwnsLease := leaseStatus.IsValid() && !leaseStatus.OwnedBy(storeID)
 
 	// If we're already campaigning or know who the leader is, don't
 	// start a new term.
@@ -1480,9 +1504,9 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 		return
 	}
 
-	leaseStatus := r.leaseStatus(ctx, *r.mu.state.Lease, r.store.Clock().Now(), r.mu.minLeaseProposedTS)
+	leaseStatus := r.leaseStatusAtRLocked(ctx, r.store.Clock().NowAsClockTimestamp())
 	raftStatus := r.mu.internalRaftGroup.BasicStatus()
-	if shouldCampaignOnWake(leaseStatus, *r.mu.state.Lease, r.store.StoreID(), raftStatus) {
+	if shouldCampaignOnWake(leaseStatus, r.store.StoreID(), raftStatus) {
 		log.VEventf(ctx, 3, "campaigning")
 		if err := r.mu.internalRaftGroup.Campaign(); err != nil {
 			log.VEventf(ctx, 1, "failed to campaign: %s", err)
@@ -1672,6 +1696,7 @@ func handleTruncatedStateBelowRaft(
 	oldTruncatedState, newTruncatedState *roachpb.RaftTruncatedState,
 	loader stateloader.StateLoader,
 	readWriter storage.ReadWriter,
+	assertNoLegacy bool,
 ) (_apply bool, _ error) {
 	// If this is a log truncation, load the resulting unreplicated or legacy
 	// replicated truncated state (in that order). If the migration is happening
@@ -1684,6 +1709,10 @@ func handleTruncatedStateBelowRaft(
 	truncStatePostApply, truncStateIsLegacy, err := loader.LoadRaftTruncatedState(ctx, readWriter)
 	if err != nil {
 		return false, errors.Wrap(err, "loading truncated state")
+	}
+
+	if assertNoLegacy && truncStateIsLegacy {
+		log.Fatalf(ctx, "found legacy truncated state which should no longer exist")
 	}
 
 	// Truncate the Raft log from the entry after the previous
@@ -1800,7 +1829,7 @@ func maybeCampaignAfterConfChange(
 	// If the leader is no longer in the descriptor but we are the first voter,
 	// campaign.
 	_, leaderStillThere := desc.GetReplicaDescriptorByID(roachpb.ReplicaID(st.Lead))
-	if !leaderStillThere && storeID == desc.Replicas().Voters()[0].StoreID {
+	if !leaderStillThere && storeID == desc.Replicas().VoterDescriptors()[0].StoreID {
 		log.VEventf(ctx, 3, "leader got removed by conf change; campaigning")
 		_ = raftGroup.Campaign()
 	}

@@ -1,10 +1,10 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//build:STRINGER.bzl", "stringer")
 
 go_library(
     name = "execinfra",
     srcs = [
         "base.go",
-        "consumerstatus_string.go",
         "flow_context.go",
         "metadata_test_receiver.go",
         "metadata_test_sender.go",
@@ -12,12 +12,14 @@ go_library(
         "operator.go",
         "outboxbase.go",
         "processorsbase.go",
-        "procstate_string.go",
         "readerbase.go",
         "scanbase.go",
         "server_config.go",
+        "stats.go",
         "testutils.go",
         "version.go",
+        ":gen-consumerstatus-stringer",  # keep
+        ":gen-procstate-stringer",  # keep
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/execinfra",
     visibility = ["//visibility:public"],
@@ -34,7 +36,6 @@ go_library(
         "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/rpc/nodedialer",
-        "//pkg/server/serverpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql/catalog/descpb",
@@ -61,13 +62,15 @@ go_library(
         "//pkg/util/tracing/tracingpb",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_gogo_protobuf//types",
         "@com_github_marusama_semaphore//:semaphore",
-        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//:go_default_library",
     ],
 )
 
 go_test(
     name = "execinfra_test",
+    size = "small",
     srcs = [
         "base_test.go",
         "dep_test.go",
@@ -88,4 +91,16 @@ go_test(
         "//pkg/util/leaktest",
         "//pkg/util/randutil",
     ],
+)
+
+stringer(
+    name = "gen-procstate-stringer",
+    src = "processorsbase.go",
+    typ = "procState",
+)
+
+stringer(
+    name = "gen-consumerstatus-stringer",
+    src = "base.go",
+    typ = "ConsumerStatus",
 )

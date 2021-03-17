@@ -925,16 +925,16 @@ SELECT k FROM e WHERE i IS NOT DISTINCT FROM NULL::FLOAT
 ----
 project
  ├── columns: k:1(int!null)
- ├── stats: [rows=10]
- ├── cost: 14.52
+ ├── stats: [rows=10.0000001]
+ ├── cost: 14.5200001
  ├── key: (1)
  ├── prune: (1)
  ├── interesting orderings: (+1)
  └── scan t.public.e@secondary
       ├── columns: t.public.e.k:1(int!null) t.public.e.i:2(int)
       ├── constraint: /2/1: [/NULL - /NULL]
-      ├── stats: [rows=10, distinct(2)=1, null(2)=10]
-      ├── cost: 14.41
+      ├── stats: [rows=10.0000001, distinct(2)=1, null(2)=10]
+      ├── cost: 14.4100001
       ├── key: (1)
       ├── fd: ()-->(2)
       ├── prune: (1)
@@ -1537,7 +1537,7 @@ project
  │    │    │    │    │    ├── cardinality: [0 - 1]
  │    │    │    │    │    ├── multiplicity: left-rows(exactly-one), right-rows(zero-or-one)
  │    │    │    │    │    ├── key: ()
- │    │    │    │    │    ├── fd: ()-->(7,13)
+ │    │    │    │    │    ├── fd: ()-->(7,13), (13)==(7), (7)==(13)
  │    │    │    │    │    ├── select
  │    │    │    │    │    │    ├── columns: b.k:7!null
  │    │    │    │    │    │    ├── outer: (1)
@@ -1834,3 +1834,51 @@ project
  │    └── key: (1)
  └── projections
       └── (k:1 IS NOT DISTINCT FROM CAST(NULL AS INT8)) AND CAST(NULL AS BOOL) [as="?column?":7, outer=(1)]
+
+# --------------------------------------------------
+# SimplifyNotDisjoint
+# --------------------------------------------------
+
+exec-ddl
+CREATE TABLE g
+(
+    id1 INT PRIMARY KEY,
+    geom1 GEOMETRY,
+    geom2 GEOMETRY,
+    INVERTED INDEX (geom1),
+    INVERTED INDEX (geom2)
+)
+----
+
+norm expect=SimplifyNotDisjoint
+SELECT NOT st_disjoint(geom1, geom2) FROM g;
+----
+project
+ ├── columns: "?column?":7
+ ├── immutable
+ ├── scan g
+ │    └── columns: geom1:2 geom2:3
+ └── projections
+      └── st_intersects(geom1:2, geom2:3) [as="?column?":7, outer=(2,3), immutable]
+
+norm expect-not=SimplifyNotDisjoint
+SELECT st_disjoint(geom1, geom2) FROM g;
+----
+project
+ ├── columns: st_disjoint:7
+ ├── immutable
+ ├── scan g
+ │    └── columns: geom1:2 geom2:3
+ └── projections
+      └── st_disjoint(geom1:2, geom2:3) [as=st_disjoint:7, outer=(2,3), immutable]
+
+norm expect-not=SimplifyNotDisjoint
+SELECT NOT st_intersects(geom1, geom2) FROM g;
+----
+project
+ ├── columns: "?column?":7
+ ├── immutable
+ ├── scan g
+ │    └── columns: geom1:2 geom2:3
+ └── projections
+      └── NOT st_intersects(geom1:2, geom2:3) [as="?column?":7, outer=(2,3), immutable]

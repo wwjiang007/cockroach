@@ -19,6 +19,7 @@ go_library(
 
 go_test(
     name = "logcrash_test",
+    size = "small",
     srcs = [
         "crash_reporting_packet_test.go",
         "crash_reporting_test.go",
@@ -37,7 +38,6 @@ go_test(
         "//pkg/util",
         "//pkg/util/leaktest",
         "//pkg/util/log",
-        "//pkg/util/log/logcrash",
         "//pkg/util/randutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",

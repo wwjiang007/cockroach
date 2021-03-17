@@ -39,7 +39,7 @@ import "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 //
 // ATTENTION: When updating these fields, add a brief description of what
 // changed to the version history below.
-const Version execinfrapb.DistSQLVersion = 44
+const Version execinfrapb.DistSQLVersion = 46
 
 // MinAcceptedVersion is the oldest version that the server is compatible with.
 // A server will not accept flows with older versions.
@@ -50,6 +50,14 @@ const MinAcceptedVersion execinfrapb.DistSQLVersion = 44
 **  VERSION HISTORY **
 
 Please add new entries at the top.
+
+- Version: 46 (MinAcceptedVersion: 44)
+  - A new field LookupExpr was added to JoinReaderSpec for supporting
+    lookup joins with multiple spans per input row.
+
+- Version: 45 (MinAcceptedVersion: 44)
+  - A new field PrefixEqualityColumns was added to InvertedJoinerSpec for
+    performing inverted joins on multi-column inverted indexes.
 
 - Version: 44 (MinAcceptedVersion: 44)
   - Changes to the component statistics proto.

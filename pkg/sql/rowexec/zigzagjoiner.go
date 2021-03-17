@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/errors"
 )
 
@@ -253,6 +254,7 @@ type zigzagJoiner struct {
 // matched rows are grouped together, but increasing this too much will result
 // in fetching too many rows and therefore skipping less rows.
 var zigzagJoinerBatchSize = int64(util.ConstantWithMetamorphicTestValue(
+	"zig-zag-joiner-batch-size",
 	5, /* defaultValue */
 	1, /* metamorphicValue */
 ))
@@ -283,12 +285,12 @@ func newZigzagJoiner(
 	z := &zigzagJoiner{}
 
 	// TODO(ajwerner): Utilize a cached copy of these tables.
-	tables := make([]tabledesc.Immutable, len(spec.Tables))
+	tables := make([]catalog.TableDescriptor, len(spec.Tables))
 	for i := range spec.Tables {
-		tables[i] = tabledesc.MakeImmutable(spec.Tables[i])
+		tables[i] = tabledesc.NewBuilder(&spec.Tables[i]).BuildImmutableTable()
 	}
-	leftColumnTypes := tables[0].ColumnTypes()
-	rightColumnTypes := tables[1].ColumnTypes()
+	leftColumnTypes := catalog.ColumnTypes(tables[0].PublicColumns())
+	rightColumnTypes := catalog.ColumnTypes(tables[1].PublicColumns())
 	leftEqCols := make([]uint32, 0, len(spec.EqColumns[0].Columns))
 	rightEqCols := make([]uint32, 0, len(spec.EqColumns[1].Columns))
 	err := z.joinerBase.init(
@@ -305,9 +307,13 @@ func newZigzagJoiner(
 		post,
 		output,
 		execinfra.ProcStateOpts{
-			TrailingMetaCallback: func(ctx context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
+				// We need to generate metadata before closing the processor
+				// because InternalClose() updates z.Ctx to the "original"
+				// context.
+				trailingMeta := z.generateMeta(z.Ctx)
 				z.close()
-				return z.generateMeta(ctx)
+				return trailingMeta
 			},
 		},
 	)
@@ -319,6 +325,12 @@ func newZigzagJoiner(
 	z.infos = make([]*zigzagJoinerInfo, z.numTables)
 	for i := range z.infos {
 		z.infos[i] = &zigzagJoinerInfo{}
+	}
+
+	collectingStats := false
+	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
+		collectingStats = true
+		z.ExecStatsForTrace = z.execStatsForTrace
 	}
 
 	colOffset := 0
@@ -334,10 +346,10 @@ func newZigzagJoiner(
 				return nil, err
 			}
 		}
-		if err := z.setupInfo(flowCtx, spec, i, colOffset, tables); err != nil {
+		if err := z.setupInfo(flowCtx, spec, i, colOffset, tables, collectingStats); err != nil {
 			return nil, err
 		}
-		colOffset += len(z.infos[i].table.Columns)
+		colOffset += len(z.infos[i].table.PublicColumns())
 	}
 	z.side = 0
 	return z, nil
@@ -361,19 +373,20 @@ func valuesSpecToEncDatum(
 }
 
 // Start is part of the RowSource interface.
-func (z *zigzagJoiner) Start(ctx context.Context) context.Context {
+func (z *zigzagJoiner) Start(ctx context.Context) {
 	ctx = z.StartInternal(ctx, zigzagJoinerProcName)
 	z.cancelChecker = cancelchecker.NewCancelChecker(ctx)
 	log.VEventf(ctx, 2, "starting zigzag joiner run")
-	return ctx
 }
 
 // zigzagJoinerInfo contains all the information that needs to be
 // stored for each side of the join.
 type zigzagJoinerInfo struct {
-	fetcher    row.Fetcher
+	fetcher rowFetcher
+	// rowsRead is the total number of rows that this fetcher read from disk.
+	rowsRead   int64
 	alloc      *rowenc.DatumAlloc
-	table      *tabledesc.Immutable
+	table      catalog.TableDescriptor
 	index      *descpb.IndexDescriptor
 	indexTypes []*types.T
 	indexDirs  []descpb.IndexDescriptor_Direction
@@ -410,34 +423,37 @@ func (z *zigzagJoiner) setupInfo(
 	spec *execinfrapb.ZigzagJoinerSpec,
 	side int,
 	colOffset int,
-	tables []tabledesc.Immutable,
+	tables []catalog.TableDescriptor,
+	collectingStats bool,
 ) error {
 	z.side = side
 	info := z.infos[side]
 
 	info.alloc = &rowenc.DatumAlloc{}
-	info.table = &tables[side]
+	info.table = tables[side]
 	info.eqColumns = spec.EqColumns[side].Columns
 	indexOrdinal := spec.IndexOrdinals[side]
-	if indexOrdinal == 0 {
-		info.index = info.table.GetPrimaryIndex()
-	} else {
-		info.index = &info.table.GetPublicNonPrimaryIndexes()[indexOrdinal-1]
-	}
+	info.index = info.table.ActiveIndexes()[indexOrdinal].IndexDesc()
 
 	var columnIDs []descpb.ColumnID
 	columnIDs, info.indexDirs = info.index.FullColumnIDs()
 	info.indexTypes = make([]*types.T, len(columnIDs))
-	columnTypes := info.table.ColumnTypes()
-	colIdxMap := info.table.ColumnIdxMap()
+	columnTypes := catalog.ColumnTypes(info.table.PublicColumns())
+	colIdxMap := catalog.ColumnIDToOrdinalMap(info.table.PublicColumns())
 	for i, columnID := range columnIDs {
-		info.indexTypes[i] = columnTypes[colIdxMap.GetDefault(columnID)]
+		if info.index.Type == descpb.IndexDescriptor_INVERTED &&
+			columnID == info.index.InvertedColumnID() {
+			// Inverted key columns have type Bytes.
+			info.indexTypes[i] = types.Bytes
+		} else {
+			info.indexTypes[i] = columnTypes[colIdxMap.GetDefault(columnID)]
+		}
 	}
 
 	// Add the outputted columns.
 	neededCols := util.MakeFastIntSet()
 	outCols := z.Out.NeededColumns()
-	maxCol := colOffset + len(info.table.Columns)
+	maxCol := colOffset + len(info.table.PublicColumns())
 	for i, ok := outCols.Next(colOffset); ok && i < maxCol; i, ok = outCols.Next(i + 1) {
 		neededCols.Add(i - colOffset)
 	}
@@ -458,12 +474,13 @@ func (z *zigzagJoiner) setupInfo(
 	info.spanBuilder = span.MakeBuilder(flowCtx.EvalCtx, flowCtx.Codec(), info.table, info.index)
 
 	// Setup the Fetcher.
+	var fetcher row.Fetcher
 	_, _, err := initRowFetcher(
 		flowCtx,
-		&info.fetcher,
+		&fetcher,
 		info.table,
 		int(indexOrdinal),
-		info.table.ColumnIdxMap(),
+		catalog.ColumnIDToOrdinalMap(info.table.PublicColumns()),
 		false, /* reverse */
 		neededCols,
 		false, /* check */
@@ -474,10 +491,17 @@ func (z *zigzagJoiner) setupInfo(
 		// supplied, so there is no locking strength on *ZigzagJoinerSpec.
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
-		nil, /* systemColumns */
+		false, /* withSystemColumns */
+		nil,   /* virtualColumn */
 	)
 	if err != nil {
 		return err
+	}
+
+	if collectingStats {
+		info.fetcher = newRowFetcherStatCollector(&fetcher)
+	} else {
+		info.fetcher = &fetcher
 	}
 
 	info.prefix = rowenc.MakeIndexKeyPrefix(flowCtx.Codec(), info.table, info.index.ID)
@@ -533,6 +557,7 @@ func (z *zigzagJoiner) fetchRowFromSide(
 		if fetchedRow == nil || err != nil {
 			return fetchedRow, err
 		}
+		z.infos[side].rowsRead++
 		if !hasNull(fetchedRow) {
 			break
 		}
@@ -581,7 +606,8 @@ func (z *zigzagJoiner) produceInvertedIndexKey(
 		}
 	}
 
-	keys, err := rowenc.EncodeInvertedIndexKeys(
+	// First encode datums for any non-inverted prefix columns.
+	keyPrefix, err := rowenc.EncodeInvertedIndexPrefixKeys(
 		info.index,
 		colMap,
 		decodedDatums,
@@ -590,9 +616,17 @@ func (z *zigzagJoiner) produceInvertedIndexKey(
 	if err != nil {
 		return roachpb.Span{}, err
 	}
-	if len(keys) != 1 {
-		return roachpb.Span{}, errors.Errorf("%d fixed values passed in for inverted index", len(keys))
+
+	// Add the inverted key, which is already encoded as a DBytes.
+	invOrd, ok := colMap.Get(info.index.InvertedColumnID())
+	if !ok {
+		return roachpb.Span{}, errors.AssertionFailedf("inverted column not found in colMap")
 	}
+	invertedKey, ok := decodedDatums[invOrd].(*tree.DBytes)
+	if !ok {
+		return roachpb.Span{}, errors.AssertionFailedf("inverted key must be type DBytes")
+	}
+	keyPrefix = append(keyPrefix, []byte(*invertedKey)...)
 
 	// Append remaining (non-JSON) datums to the key.
 	keyBytes, _, err := rowenc.EncodeColumns(
@@ -600,7 +634,7 @@ func (z *zigzagJoiner) produceInvertedIndexKey(
 		info.indexDirs[1:],
 		colMap,
 		decodedDatums,
-		keys[0],
+		keyPrefix,
 	)
 	key := roachpb.Key(keyBytes)
 	return roachpb.Span{Key: key, EndKey: key.PrefixEnd()}, err
@@ -629,7 +663,7 @@ func (z *zigzagJoiner) produceSpanFromBaseRow() (roachpb.Span, error) {
 // Returns the column types of the equality columns.
 func (zi *zigzagJoinerInfo) eqColTypes() []*types.T {
 	eqColTypes := make([]*types.T, len(zi.eqColumns))
-	colTypes := zi.table.ColumnTypes()
+	colTypes := catalog.ColumnTypes(zi.table.PublicColumns())
 	for i := range eqColTypes {
 		eqColTypes[i] = colTypes[zi.eqColumns[i]]
 	}
@@ -640,7 +674,7 @@ func (zi *zigzagJoinerInfo) eqColTypes() []*types.T {
 func (zi *zigzagJoinerInfo) eqOrdering() (colinfo.ColumnOrdering, error) {
 	ordering := make(colinfo.ColumnOrdering, len(zi.eqColumns))
 	for i := range zi.eqColumns {
-		colID := zi.table.Columns[zi.eqColumns[i]].ID
+		colID := zi.table.PublicColumns()[zi.eqColumns[i]].GetID()
 		// Search the index columns, then the primary keys to find an ordering for
 		// the current column, 'colID'.
 		var direction encoding.Direction
@@ -650,8 +684,8 @@ func (zi *zigzagJoinerInfo) eqOrdering() (colinfo.ColumnOrdering, error) {
 			if err != nil {
 				return nil, err
 			}
-		} else if idx := findColumnID(zi.table.GetPrimaryIndex().ColumnIDs, colID); idx != -1 {
-			direction, err = zi.table.GetPrimaryIndex().ColumnDirections[idx].ToEncodingDirection()
+		} else if idx := findColumnID(zi.table.GetPrimaryIndex().IndexDesc().ColumnIDs, colID); idx != -1 {
+			direction, err = zi.table.GetPrimaryIndex().GetColumnDirection(idx).ToEncodingDirection()
 			if err != nil {
 				return nil, err
 			}
@@ -767,6 +801,7 @@ func (z *zigzagJoiner) nextRow(ctx context.Context, txn *kv.Txn) (rowenc.EncDatu
 			true, /* batch limit */
 			zigzagJoinerBatchSize,
 			z.FlowCtx.TraceKV,
+			z.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 		)
 		if err != nil {
 			return nil, err
@@ -911,6 +946,7 @@ func (z *zigzagJoiner) maybeFetchInitialRow() error {
 			true, /* batch limit */
 			zigzagJoinerBatchSize,
 			z.FlowCtx.TraceKV,
+			z.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 		)
 		if err != nil {
 			log.Errorf(z.Ctx, "scan error: %s", err)
@@ -957,11 +993,52 @@ func (z *zigzagJoiner) ConsumerClosed() {
 	z.close()
 }
 
-func (z *zigzagJoiner) generateMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
-	if tfs := execinfra.GetLeafTxnFinalState(ctx, z.FlowCtx.Txn); tfs != nil {
-		return []execinfrapb.ProducerMetadata{{LeafTxnFinalState: tfs}}
+// execStatsForTrace implements ProcessorBase.ExecStatsForTrace.
+func (z *zigzagJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
+	kvStats := execinfrapb.KVStats{
+		BytesRead:      optional.MakeUint(uint64(z.getBytesRead())),
+		ContentionTime: optional.MakeTimeValue(execinfra.GetCumulativeContentionTime(z.Ctx)),
 	}
-	return nil
+	for i := range z.infos {
+		fis, ok := getFetcherInputStats(z.infos[i].fetcher)
+		if !ok {
+			return nil
+		}
+		kvStats.TuplesRead.MaybeAdd(fis.NumTuples)
+		kvStats.KVTime.MaybeAdd(fis.WaitTime)
+	}
+	return &execinfrapb.ComponentStats{
+		KV:     kvStats,
+		Output: z.Out.Stats(),
+	}
+}
+
+func (z *zigzagJoiner) getBytesRead() int64 {
+	var bytesRead int64
+	for i := range z.infos {
+		bytesRead += z.infos[i].fetcher.GetBytesRead()
+	}
+	return bytesRead
+}
+
+func (z *zigzagJoiner) getRowsRead() int64 {
+	var rowsRead int64
+	for i := range z.infos {
+		rowsRead += z.infos[i].rowsRead
+	}
+	return rowsRead
+}
+
+func (z *zigzagJoiner) generateMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
+	trailingMeta := make([]execinfrapb.ProducerMetadata, 1, 2)
+	meta := &trailingMeta[0]
+	meta.Metrics = execinfrapb.GetMetricsMeta()
+	meta.Metrics.BytesRead = z.getBytesRead()
+	meta.Metrics.RowsRead = z.getRowsRead()
+	if tfs := execinfra.GetLeafTxnFinalState(ctx, z.FlowCtx.Txn); tfs != nil {
+		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
+	}
+	return trailingMeta
 }
 
 // DrainMeta is part of the MetadataSource interface.

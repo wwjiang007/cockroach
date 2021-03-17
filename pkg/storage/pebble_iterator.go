@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 )
@@ -37,9 +38,11 @@ type pebbleIterator struct {
 	// use two slices for each of the bounds since this caller should not change
 	// the slice holding the current bounds, that the callee (pebble.MVCCIterator)
 	// is currently using, until after the caller has made the SetBounds call.
-	lowerBoundBuf [2][]byte
-	upperBoundBuf [2][]byte
-	curBuf        int
+	lowerBoundBuf            [2][]byte
+	upperBoundBuf            [2][]byte
+	curBuf                   int
+	testingSetBoundsListener testingSetBoundsListener
+
 	// Set to true to govern whether to call SeekPrefixGE or SeekGE. Skips
 	// SSTables based on MVCC/Engine key when true.
 	prefix bool
@@ -70,17 +73,30 @@ var pebbleIterPool = sync.Pool{
 	},
 }
 
+type cloneableIter interface {
+	Clone() (*pebble.Iterator, error)
+}
+
+type testingSetBoundsListener interface {
+	postSetBounds(lower, upper []byte)
+}
+
 // Instantiates a new Pebble iterator, or gets one from the pool.
-func newPebbleIterator(handle pebble.Reader, opts IterOptions) *pebbleIterator {
+func newPebbleIterator(
+	handle pebble.Reader, iterToClone cloneableIter, opts IterOptions,
+) *pebbleIterator {
 	iter := pebbleIterPool.Get().(*pebbleIterator)
-	iter.init(handle, opts)
+	iter.reusable = false // defensive
+	iter.init(handle, iterToClone, opts)
 	return iter
 }
 
 // init resets this pebbleIterator for use with the specified arguments. The
-// current instance could either be a cached iterator (eg. in pebbleBatch), or
-// a newly-instantiated one through newPebbleIterator.
-func (p *pebbleIterator) init(handle pebble.Reader, opts IterOptions) {
+// current instance could either be a cached pebbleIterator (eg. in
+// pebbleBatch), or a newly-instantiated one through newPebbleIterator. The
+// underlying *pebble.Iterator is created using iterToClone, if non-nil and
+// there are no timestamp hints, else it is created using handle.
+func (p *pebbleIterator) init(handle pebble.Reader, iterToClone cloneableIter, opts IterOptions) {
 	*p = pebbleIterator{
 		keyBuf:        p.keyBuf,
 		lowerBoundBuf: p.lowerBoundBuf,
@@ -111,7 +127,9 @@ func (p *pebbleIterator) init(handle pebble.Reader, opts IterOptions) {
 		p.options.UpperBound = p.upperBoundBuf[0]
 	}
 
+	doClone := iterToClone != nil
 	if !opts.MaxTimestampHint.IsEmpty() {
+		doClone = false
 		encodedMinTS := string(encodeTimestamp(opts.MinTimestampHint))
 		encodedMaxTS := string(encodeTimestamp(opts.MaxTimestampHint))
 		p.options.TableFilter = func(userProps map[string]string) bool {
@@ -139,7 +157,18 @@ func (p *pebbleIterator) init(handle pebble.Reader, opts IterOptions) {
 		panic("min timestamp hint set without max timestamp hint")
 	}
 
-	p.iter = handle.NewIter(&p.options)
+	if doClone {
+		var err error
+		if p.iter, err = iterToClone.Clone(); err != nil {
+			panic(err)
+		}
+		p.iter.SetBounds(p.options.LowerBound, p.options.UpperBound)
+	} else {
+		if handle == nil {
+			panic("handle is nil for non-cloning path")
+		}
+		p.iter = handle.NewIter(&p.options)
+	}
 	if p.iter == nil {
 		panic("unable to create iterator")
 	}
@@ -147,38 +176,65 @@ func (p *pebbleIterator) init(handle pebble.Reader, opts IterOptions) {
 	p.inuse = true
 }
 
-func (p *pebbleIterator) setOptions(opts IterOptions) {
-	// Overwrite any stale options from last time.
-	p.options = pebble.IterOptions{}
-
-	if !opts.MinTimestampHint.IsEmpty() || !opts.MaxTimestampHint.IsEmpty() {
-		panic("iterator with timestamp hints cannot be reused")
+// setBounds is called to change the bounds on a pebbleIterator. Note that
+// this is not the first time that bounds will be passed to the underlying
+// pebble.Iterator. The existing bounds are in p.options.
+func (p *pebbleIterator) setBounds(lowerBound, upperBound roachpb.Key) {
+	// If the roachpb.Key bound is nil, the corresponding bound for the
+	// pebble.Iterator will also be nil. p.options contains the current bounds
+	// known to the pebble.Iterator.
+	boundsChanged := ((lowerBound == nil) != (p.options.LowerBound == nil)) ||
+		((upperBound == nil) != (p.options.UpperBound == nil))
+	if !boundsChanged {
+		// The nil-ness is the same but the values may be different.
+		if lowerBound != nil {
+			// Both must be non-nil. We know that we've appended 0x00 to
+			// p.options.LowerBound, which must be ignored for this comparison.
+			if !bytes.Equal(p.options.LowerBound[:len(p.options.LowerBound)-1], lowerBound) {
+				boundsChanged = true
+			}
+		}
+		// If the preceding if-block has not already set boundsChanged=true, see
+		// if the upper bound has changed.
+		if !boundsChanged && upperBound != nil {
+			// Both must be non-nil. We know that we've appended 0x00 to
+			// p.options.UpperBound, which must be ignored for this comparison.
+			if !bytes.Equal(p.options.UpperBound[:len(p.options.UpperBound)-1], upperBound) {
+				boundsChanged = true
+			}
+		}
 	}
-	if !opts.Prefix && len(opts.UpperBound) == 0 && len(opts.LowerBound) == 0 {
-		panic("iterator must set prefix or upper bound or lower bound")
+	if !boundsChanged {
+		// This noop optimization helps the underlying pebble.Iterator to optimize
+		// seeks.
+		return
 	}
-
-	p.prefix = opts.Prefix
+	// Set the bounds to nil, before we selectively change them.
+	p.options.LowerBound = nil
+	p.options.UpperBound = nil
 	p.curBuf = (p.curBuf + 1) % 2
 	i := p.curBuf
-	if opts.LowerBound != nil {
+	if lowerBound != nil {
 		// This is the same as
-		// p.options.LowerBound = EncodeKeyToBuf(p.lowerBoundBuf[i][:0], MVCCKey{Key: opts.LowerBound}) .
-		// or EngineKey{Key: opts.LowerBound}.EncodeToBuf(...).
+		// p.options.LowerBound = EncodeKeyToBuf(p.lowerBoundBuf[i][:0], MVCCKey{Key: lowerBound}) .
+		// or EngineKey{Key: lowerBound}.EncodeToBuf(...).
 		// Since we are encoding keys with an empty version anyway, we can just
 		// append the NUL byte instead of calling the above encode functions which
 		// will do the same thing.
-		p.lowerBoundBuf[i] = append(p.lowerBoundBuf[i][:0], opts.LowerBound...)
+		p.lowerBoundBuf[i] = append(p.lowerBoundBuf[i][:0], lowerBound...)
 		p.lowerBoundBuf[i] = append(p.lowerBoundBuf[i], 0x00)
 		p.options.LowerBound = p.lowerBoundBuf[i]
 	}
-	if opts.UpperBound != nil {
+	if upperBound != nil {
 		// Same as above.
-		p.upperBoundBuf[i] = append(p.upperBoundBuf[i][:0], opts.UpperBound...)
+		p.upperBoundBuf[i] = append(p.upperBoundBuf[i][:0], upperBound...)
 		p.upperBoundBuf[i] = append(p.upperBoundBuf[i], 0x00)
 		p.options.UpperBound = p.upperBoundBuf[i]
 	}
 	p.iter.SetBounds(p.options.LowerBound, p.options.UpperBound)
+	if p.testingSetBoundsListener != nil {
+		p.testingSetBoundsListener.postSetBounds(p.options.LowerBound, p.options.UpperBound)
+	}
 }
 
 // Close implements the MVCCIterator interface.
@@ -207,6 +263,11 @@ func (p *pebbleIterator) SeekGE(key MVCCKey) {
 	} else {
 		p.iter.SeekGE(p.keyBuf)
 	}
+}
+
+// SeekIntentGE implements the MVCCIterator interface.
+func (p *pebbleIterator) SeekIntentGE(key roachpb.Key, _ uuid.UUID) {
+	p.SeekGE(MVCCKey{Key: key})
 }
 
 // SeekEngineKeyGE implements the EngineIterator interface.
@@ -597,16 +658,35 @@ func findSplitKeyUsingIterator(
 	return bestSplitKey, nil
 }
 
-// SetUpperBound implements the MVCCIterator interface.
+// SetUpperBound implements the MVCCIterator interface. Note that this is not
+// the first time that bounds will be passed to the underlying
+// pebble.Iterator. The existing bounds are in p.options.
 func (p *pebbleIterator) SetUpperBound(upperBound roachpb.Key) {
+	if upperBound == nil {
+		panic("SetUpperBound must not use a nil key")
+	}
+	if p.options.UpperBound != nil {
+		// We know that we've appended 0x00 to p.options.UpperBound, which must be
+		// ignored for this comparison.
+		if bytes.Equal(p.options.UpperBound[:len(p.options.UpperBound)-1], upperBound) {
+			// Nothing to do. This noop optimization helps the underlying
+			// pebble.Iterator to optimize seeks.
+			return
+		}
+	}
 	p.curBuf = (p.curBuf + 1) % 2
 	i := p.curBuf
-	p.lowerBoundBuf[i] = append(p.lowerBoundBuf[i][:0], p.options.LowerBound...)
-	p.options.LowerBound = p.lowerBoundBuf[i]
+	if p.options.LowerBound != nil {
+		p.lowerBoundBuf[i] = append(p.lowerBoundBuf[i][:0], p.options.LowerBound...)
+		p.options.LowerBound = p.lowerBoundBuf[i]
+	}
 	p.upperBoundBuf[i] = append(p.upperBoundBuf[i][:0], upperBound...)
 	p.upperBoundBuf[i] = append(p.upperBoundBuf[i], 0x00)
 	p.options.UpperBound = p.upperBoundBuf[i]
 	p.iter.SetBounds(p.options.LowerBound, p.options.UpperBound)
+	if p.testingSetBoundsListener != nil {
+		p.testingSetBoundsListener.postSetBounds(p.options.LowerBound, p.options.UpperBound)
+	}
 }
 
 // Stats implements the MVCCIterator interface.
@@ -627,6 +707,11 @@ func (p *pebbleIterator) CheckForKeyCollisions(
 	sstData []byte, start, end roachpb.Key,
 ) (enginepb.MVCCStats, error) {
 	return checkForKeyCollisionsGo(p, sstData, start, end)
+}
+
+// GetRawIter is part of the EngineIterator interface.
+func (p *pebbleIterator) GetRawIter() *pebble.Iterator {
+	return p.iter
 }
 
 func (p *pebbleIterator) destroy() {

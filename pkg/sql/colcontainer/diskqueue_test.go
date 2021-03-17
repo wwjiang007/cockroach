@@ -18,7 +18,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -167,6 +170,34 @@ func TestDiskQueue(t *testing.T) {
 	}
 }
 
+func TestDiskQueueCloseOnErr(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
+	defer cleanup()
+
+	serverCfg := &execinfra.ServerConfig{}
+	serverCfg.TestingKnobs.ForceDiskSpill = true
+	diskMon := execinfra.NewLimitedMonitor(ctx, testDiskMonitor, serverCfg, t.Name())
+	defer diskMon.Stop(ctx)
+	diskAcc := diskMon.MakeBoundAccount()
+	defer diskAcc.Close(ctx)
+
+	typs := []*types.T{types.Int}
+	q, err := colcontainer.NewDiskQueue(ctx, typs, queueCfg, &diskAcc)
+	require.NoError(t, err)
+
+	b := coldata.NewMemBatch(typs, coldata.StandardColumnFactory)
+
+	err = q.Enqueue(ctx, b)
+	require.Error(t, err, "expected Enqueue to produce an error given a disk limit of one byte")
+	require.Equal(t, pgerror.GetPGCode(err), pgcode.DiskFull, "unexpected pg code")
+
+	// Now Close the queue, this should be successful.
+	require.NoError(t, q.Close(ctx))
+}
+
 // Flags for BenchmarkQueue.
 var (
 	bufferSizeBytes = flag.String("bufsize", "128KiB", "number of bytes to buffer in memory before flushing")
@@ -200,7 +231,7 @@ func BenchmarkDiskQueue(b *testing.B) {
 	rng, _ := randutil.NewPseudoRand()
 	typs := []*types.T{types.Int}
 	batch := coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0, 0)
-	op := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
+	op := colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
 	ctx := context.Background()
 	for i := 0; i < b.N; i++ {
 		op.ResetBatchesToReturn(numBatches)

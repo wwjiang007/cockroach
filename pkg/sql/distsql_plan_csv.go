@@ -125,7 +125,7 @@ func makeImportReaderSpecs(
 				Tables: tables,
 				Format: format,
 				Progress: execinfrapb.JobProgress{
-					JobID: *job.ID(),
+					JobID: job.ID(),
 					Slot:  int32(i),
 				},
 				WalltimeNanos: walltime,
@@ -158,7 +158,7 @@ func presplitTableBoundaries(
 	expirationTime := cfg.DB.Clock().Now().Add(time.Hour.Nanoseconds(), 0)
 	for _, tbl := range tables {
 		// TODO(ajwerner): Consider passing in the wrapped descriptors.
-		tblDesc := tabledesc.MakeImmutable(*tbl.Desc)
+		tblDesc := tabledesc.NewBuilder(tbl.Desc).BuildImmutableTable()
 		for _, span := range tblDesc.AllIndexSpans(cfg.Codec) {
 			if err := cfg.DB.AdminSplit(ctx, span.Key, expirationTime); err != nil {
 				return err
@@ -222,7 +222,7 @@ func DistIngest(
 
 	dsp.FinalizePlan(planCtx, p)
 
-	if err := job.FractionProgressed(ctx,
+	if err := job.FractionProgressed(ctx, nil, /* txn */
 		func(ctx context.Context, details jobspb.ProgressDetails) float32 {
 			prog := details.(*jobspb.Progress_Import).Import
 			prog.ReadProgress = make([]float32, len(from))
@@ -244,7 +244,7 @@ func DistIngest(
 	fractionProgress := make([]uint32, len(from))
 
 	updateJobProgress := func() error {
-		return job.FractionProgressed(ctx,
+		return job.FractionProgressed(ctx, nil, /* txn */
 			func(ctx context.Context, details jobspb.ProgressDetails) float32 {
 				var overall float32
 				prog := details.(*jobspb.Progress_Import).Import
@@ -301,6 +301,7 @@ func DistIngest(
 		nil, /* txn - the flow does not read or write the database */
 		nil, /* clockUpdater */
 		evalCtx.Tracing,
+		evalCtx.ExecCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 

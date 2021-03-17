@@ -19,9 +19,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -277,7 +277,13 @@ type hasher struct {
 }
 
 func (h *hasher) Init() {
-	h.hash = offset64
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*h = hasher{
+		bytes:  h.bytes,
+		bytes2: h.bytes2,
+		hash:   offset64,
+	}
 }
 
 // ----------------------------------------------------------------------
@@ -547,6 +553,15 @@ func (h *hasher) HashIndexOrdinals(val cat.IndexOrdinals) {
 	h.hash = hash
 }
 
+func (h *hasher) HashUniqueOrdinals(val cat.UniqueOrdinals) {
+	hash := h.hash
+	for _, ord := range val {
+		hash ^= internHash(ord)
+		hash *= prime64
+	}
+	h.hash = hash
+}
+
 func (h *hasher) HashViewDeps(val opt.ViewDeps) {
 	// Hash the length and address of the first element.
 	h.HashInt(len(val))
@@ -587,7 +602,7 @@ func (h *hasher) HashLockingItem(val *tree.LockingItem) {
 	}
 }
 
-func (h *hasher) HashInvertedSpans(val invertedexpr.InvertedSpans) {
+func (h *hasher) HashInvertedSpans(val inverted.Spans) {
 	for i := range val {
 		span := &val[i]
 		h.HashBytes(span.Start)
@@ -938,6 +953,18 @@ func (h *hasher) IsIndexOrdinalsEqual(l, r cat.IndexOrdinals) bool {
 	return true
 }
 
+func (h *hasher) IsUniqueOrdinalsEqual(l, r cat.UniqueOrdinals) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *hasher) IsViewDepsEqual(l, r opt.ViewDeps) bool {
 	if len(l) != len(r) {
 		return false
@@ -967,7 +994,7 @@ func (h *hasher) IsLockingItemEqual(l, r *tree.LockingItem) bool {
 	return l.Strength == r.Strength && l.WaitPolicy == r.WaitPolicy
 }
 
-func (h *hasher) IsInvertedSpansEqual(l, r invertedexpr.InvertedSpans) bool {
+func (h *hasher) IsInvertedSpansEqual(l, r inverted.Spans) bool {
 	return l.Equals(r)
 }
 

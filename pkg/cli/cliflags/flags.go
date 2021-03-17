@@ -291,6 +291,23 @@ transaction state. Equivalent to --echo-sql, \unset check_syntax and
 \set prompt1 %n@%M>.`,
 	}
 
+	EmbeddedMode = FlagInfo{
+		Name: "embedded",
+		Description: `
+Simplify and reduce the SQL CLI output to make it appropriate for
+embedding in a 'playground'-type environment.
+
+This causes the shell to omit informational message about
+aspects that can only be changed with command-line flags
+or environment variables: in an embedded environment, the user
+has no control over these and the messages would thus be
+confusing.
+
+It also causes the shell to omit informational messages about
+networking details (e.g. server address), as it is assumed
+that the embedding environment will report those instead.`,
+	}
+
 	SafeUpdates = FlagInfo{
 		Name: "safe-updates",
 		Description: `
@@ -661,6 +678,11 @@ Also see: ` + build.MakeIssueURL(53404) + `
 Disable use of implicit credentials when accessing external data.
 Instead, require the user to always specify access keys.`,
 	}
+	ExternalIODisabled = FlagInfo{
+		Name: "external-io-disabled",
+		Description: `
+Disable use of "external" IO, such as to S3, GCS, or the file system (nodelocal), or anything other than userfile.`,
+	}
 
 	// KeySize, CertificateLifetime, AllowKeyReuse, and OverwriteFiles are used for
 	// certificate generation functions.
@@ -692,6 +714,36 @@ Instead, require the user to always specify access keys.`,
 	Password = FlagInfo{
 		Name:        "password",
 		Description: `Prompt for the new user's password.`,
+	}
+
+	InitToken = FlagInfo{
+		Name: "init-token",
+		Description: `Shared token for initialization of node TLS certificates.
+
+This flag is optional for the 'start' command. When omitted, the 'start'
+command expects the operator to prepare TLS certificates beforehand using
+the 'cert' command.
+
+This flag must be combined with --num-expected-initial-nodes.`,
+	}
+
+	NumExpectedInitialNodes = FlagInfo{
+		Name: "num-expected-initial-nodes",
+		Description: `Number of expected nodes during TLS certificate creation,
+including the node where the connect command is run.
+
+This flag must be combined with --init-token.`,
+	}
+
+	SingleNode = FlagInfo{
+		Name: "single-node",
+		Description: `Prepare the certificates for a subsequent 'start-single-node'
+command. The 'connect' command only runs cursory checks on the network
+configuration and does not wait for peers to auto-negotiate a common
+set of credentials.
+
+The --single-node flag is exclusive with the --init-num-peers and --init-token
+flags.`,
 	}
 
 	CertsDir = FlagInfo{
@@ -1262,6 +1314,30 @@ may need to be tweaked if the Postgres dump file has extremely long lines.
 `,
 	}
 
+	ImportIgnoreUnsupportedStatements = FlagInfo{
+		Name: "ignore-unsupported-statements",
+		Description: `
+Ignore statements that are unsupported during an import from a PGDUMP file.
+`,
+	}
+
+	ImportLogIgnoredStatements = FlagInfo{
+		Name: "log-ignored-statements",
+		Description: `
+Log unsupported statements that are ignored during an import from a PGDUMP file to the specified
+destination. This flag should be used in conjunction with the ignore-unsupported-statements flag
+that ignores the unsupported statements during an import.
+`,
+	}
+
+	ImportRowLimit = FlagInfo{
+		Name: "row-limit",
+		Description: `
+Specify the number of rows that will be imported for each table during a PGDUMP or MYSQLDUMP import.
+This can be used to check schema and data correctness without running the entire import.
+`,
+	}
+
 	Log = FlagInfo{
 		Name:        "log",
 		Description: `Logging configuration. See the documentation for details.`,
@@ -1306,6 +1382,29 @@ may need to be tweaked if the Postgres dump file has extremely long lines.
 		Name: "sql-audit-dir",
 		Description: `
 If non-empty, create a SQL audit log in this directory.
+`,
+	}
+
+	BuildTag = FlagInfo{
+		Name: "build-tag",
+		Description: `
+When set, the command prints only the build tag for the executable,
+without any other details.
+`,
+	}
+
+	IdleExitAfter = FlagInfo{
+		Name: "idle-exit-after",
+		Description: `
+If nonzero, will cause the server to run normally for the 
+indicated amount of time, wait for all SQL connections to terminate, 
+start a 30s countdown and exit upon countdown reaching zero if no new 
+connections occur. New connections will be accepted at all times and 
+will effectively delay the exit (indefinitely if there is always at least 
+one connection or there are no connection for less than 30 sec.
+A new 30s countdown will start when no more SQL connections 
+exist. The interval is specified with a suffix of 's' for seconds, 
+'m' for minutes, and 'h' for hours.
 `,
 	}
 )

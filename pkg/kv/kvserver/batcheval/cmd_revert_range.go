@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/errors"
 )
 
 func init() {
@@ -28,16 +27,16 @@ func init() {
 }
 
 func declareKeysRevertRange(
-	desc *roachpb.RangeDescriptor,
+	rs ImmutableRangeState,
 	header roachpb.Header,
 	req roachpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
 ) {
-	DefaultDeclareIsolatedKeys(desc, header, req, latchSpans, lockSpans)
+	DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans)
 	// We look up the range descriptor key to check whether the span
 	// is equal to the entire range for fast stats updating.
-	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(desc.StartKey)})
-	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeLastGCKey(desc.RangeID)})
+	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
+	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeLastGCKey(rs.GetRangeID())})
 }
 
 // isEmptyKeyTimeRange checks if the span has no writes in (since,until].
@@ -58,6 +57,8 @@ func isEmptyKeyTimeRange(
 	return !ok, err
 }
 
+const maxRevertRangeBatchBytes = 32 << 20
+
 // RevertRange wipes all MVCC versions more recent than TargetTime (up to the
 // command timestamp) of the keys covered by the specified span, adjusting the
 // MVCC stats accordingly.
@@ -68,7 +69,7 @@ func RevertRange(
 	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
 ) (result.Result, error) {
 	if cArgs.Header.Txn != nil {
-		return result.Result{}, errors.New("cannot execute RevertRange within a transaction")
+		return result.Result{}, ErrTransactionUnsupported
 	}
 	log.VEventf(ctx, 2, "RevertRange %+v", cArgs.Args)
 
@@ -88,7 +89,9 @@ func RevertRange(
 	log.VEventf(ctx, 2, "clearing keys with timestamp (%v, %v]", args.TargetTime, cArgs.Header.Timestamp)
 
 	resume, err := storage.MVCCClearTimeRange(ctx, readWriter, cArgs.Stats, args.Key, args.EndKey,
-		args.TargetTime, cArgs.Header.Timestamp, cArgs.Header.MaxSpanRequestKeys)
+		args.TargetTime, cArgs.Header.Timestamp, cArgs.Header.MaxSpanRequestKeys,
+		maxRevertRangeBatchBytes,
+		args.EnableTimeBoundIteratorOptimization)
 	if err != nil {
 		return result.Result{}, err
 	}

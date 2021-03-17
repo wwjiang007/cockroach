@@ -14,14 +14,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow/go/arrow/array"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -48,7 +49,7 @@ type flowStreamServer interface {
 // RunWithStream (or more specifically, the RPC handler) will unblock Next by
 // closing the stream.
 type Inbox struct {
-	colexecbase.ZeroInputNode
+	colexecop.ZeroInputNode
 	typs []*types.T
 
 	allocator  *colmem.Allocator
@@ -103,17 +104,21 @@ type Inbox struct {
 	// regardless of whether or not Next is called.
 	flowCtx context.Context
 
-	// rowsRead contains the total number of rows Inbox has read so far.
-	rowsRead int64
-
-	// bytesRead contains the number of bytes sent to the Inbox.
-	bytesRead int64
-
-	// numMessages contains the number of messages received by the Inbox.
-	numMessages int64
+	// statsAtomics are the execution statistics that need to be atomically
+	// accessed. This is necessary since Get*() methods can be called from
+	// different goroutine than Next().
+	statsAtomics struct {
+		// rowsRead contains the total number of rows Inbox has read so far.
+		rowsRead int64
+		// bytesRead contains the number of bytes sent to the Inbox.
+		bytesRead int64
+		// numMessages contains the number of messages received by the Inbox.
+		numMessages int64
+	}
 
 	// deserializationStopWatch records the time Inbox spends deserializing
-	// batches.
+	// batches. Note that the stop watch is safe for concurrent use, so it
+	// doesn't have to have an explicit synchronization like fields above.
 	deserializationStopWatch *timeutil.StopWatch
 
 	scratch struct {
@@ -122,8 +127,7 @@ type Inbox struct {
 	}
 }
 
-var _ colexecbase.Operator = &Inbox{}
-var _ colexec.NetworkReader = &Inbox{}
+var _ colexecop.Operator = &Inbox{}
 
 // NewInbox creates a new Inbox.
 func NewInbox(
@@ -284,7 +288,7 @@ func (i *Inbox) Next(ctx context.Context) coldata.Batch {
 		i.deserializationStopWatch.Stop()
 		m, err := i.stream.Recv()
 		i.deserializationStopWatch.Start()
-		i.numMessages++
+		atomic.AddInt64(&i.statsAtomics.numMessages, 1)
 		if err != nil {
 			if err == io.EOF {
 				// Done.
@@ -321,39 +325,43 @@ func (i *Inbox) Next(ctx context.Context) coldata.Batch {
 			// Protect against Deserialization panics by skipping empty messages.
 			continue
 		}
-		i.bytesRead += int64(len(m.Data.RawBytes))
+		atomic.AddInt64(&i.statsAtomics.bytesRead, int64(len(m.Data.RawBytes)))
 		i.scratch.data = i.scratch.data[:0]
 		batchLength, err := i.serializer.Deserialize(&i.scratch.data, m.Data.RawBytes)
 		if err != nil {
 			colexecerror.InternalError(err)
 		}
-		i.scratch.b, _ = i.allocator.ResetMaybeReallocate(i.typs, i.scratch.b, batchLength)
+		// For now, we don't enforce any footprint-based memory limit.
+		// TODO(yuzefovich): refactor this.
+		const maxBatchMemSize = math.MaxInt64
+		i.scratch.b, _ = i.allocator.ResetMaybeReallocate(i.typs, i.scratch.b, batchLength, maxBatchMemSize)
 		if err := i.converter.ArrowToBatch(i.scratch.data, batchLength, i.scratch.b); err != nil {
 			colexecerror.InternalError(err)
 		}
-		i.rowsRead += int64(i.scratch.b.Length())
+		atomic.AddInt64(&i.statsAtomics.rowsRead, int64(i.scratch.b.Length()))
 		return i.scratch.b
 	}
 }
 
-// GetBytesRead is part of the colexec.NetworkReader interface.
+// GetBytesRead returns the number of bytes received by the Inbox.
 func (i *Inbox) GetBytesRead() int64 {
-	return i.bytesRead
+	return atomic.LoadInt64(&i.statsAtomics.bytesRead)
 }
 
-// GetRowsRead is part of the colexec.NetworkReader interface.
+// GetRowsRead returns the number of rows received by the Inbox.
 func (i *Inbox) GetRowsRead() int64 {
-	return i.rowsRead
+	return atomic.LoadInt64(&i.statsAtomics.rowsRead)
 }
 
-// GetDeserializationTime is part of the colexec.NetworkReader interface.
+// GetDeserializationTime returns the amount of time the Inbox spent
+// deserializing batches.
 func (i *Inbox) GetDeserializationTime() time.Duration {
 	return i.deserializationStopWatch.Elapsed()
 }
 
-// GetNumMessages is part of the colexec.NetworkReader interface.
+// GetNumMessages returns the number of messages received by the Inbox.
 func (i *Inbox) GetNumMessages() int64 {
-	return i.numMessages
+	return atomic.LoadInt64(&i.statsAtomics.numMessages)
 }
 
 func (i *Inbox) sendDrainSignal(ctx context.Context) error {

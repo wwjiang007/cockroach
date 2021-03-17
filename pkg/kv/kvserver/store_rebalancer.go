@@ -177,7 +177,7 @@ func (sr *StoreRebalancer) Start(ctx context.Context, stopper *stop.Stopper) {
 
 	// Start a goroutine that watches and proactively renews certain
 	// expiration-based leases.
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "store-rebalancer", func(ctx context.Context) {
 		timer := timeutil.NewTimer()
 		defer timer.Stop()
 		timer.Reset(jitteredInterval(storeRebalancerTimerDuration))
@@ -292,7 +292,7 @@ func (sr *StoreRebalancer) rebalanceStore(
 	replicasToMaybeRebalance = append(replicasToMaybeRebalance, hottestRanges...)
 
 	for localDesc.Capacity.QueriesPerSecond > qpsMaxThreshold {
-		replWithStats, targets := sr.chooseReplicaToRebalance(
+		replWithStats, voterTargets := sr.chooseReplicaToRebalance(
 			ctx,
 			&replicasToMaybeRebalance,
 			localDesc,
@@ -309,12 +309,13 @@ func (sr *StoreRebalancer) rebalanceStore(
 
 		descBeforeRebalance := replWithStats.repl.Desc()
 		log.VEventf(ctx, 1, "rebalancing r%d (%.2f qps) from %v to %v to better balance load",
-			replWithStats.repl.RangeID, replWithStats.qps, descBeforeRebalance.Replicas(), targets)
+			replWithStats.repl.RangeID, replWithStats.qps, descBeforeRebalance.Replicas(), voterTargets)
 		timeout := sr.rq.processTimeoutFunc(sr.st, replWithStats.repl)
 		if err := contextutil.RunWithTimeout(ctx, "relocate range", timeout, func(ctx context.Context) error {
-			return sr.rq.store.AdminRelocateRange(ctx, *descBeforeRebalance, targets)
+			// TODO(aayush): Fix when we can make decisions about rebalancing non-voting replicas.
+			return sr.rq.store.AdminRelocateRange(ctx, *descBeforeRebalance, voterTargets, []roachpb.ReplicationTarget{})
 		}); err != nil {
-			log.Errorf(ctx, "unable to relocate range to %v: %+v", targets, err)
+			log.Errorf(ctx, "unable to relocate range to %v: %+v", voterTargets, err)
 			continue
 		}
 		sr.metrics.RangeRebalanceCount.Inc(1)
@@ -326,7 +327,7 @@ func (sr *StoreRebalancer) rebalanceStore(
 		// TODO(a-robinson): This just updates the copies used locally by the
 		// storeRebalancer. We may also want to update the copies in the StorePool
 		// itself.
-		replicasBeforeRebalance := descBeforeRebalance.Replicas().All()
+		replicasBeforeRebalance := descBeforeRebalance.Replicas().Descriptors()
 		for i := range replicasBeforeRebalance {
 			if storeDesc := storeMap[replicasBeforeRebalance[i].StoreID]; storeDesc != nil {
 				storeDesc.Capacity.RangeCount--
@@ -334,8 +335,8 @@ func (sr *StoreRebalancer) rebalanceStore(
 		}
 		localDesc.Capacity.LeaseCount--
 		localDesc.Capacity.QueriesPerSecond -= replWithStats.qps
-		for i := range targets {
-			if storeDesc := storeMap[targets[i].StoreID]; storeDesc != nil {
+		for i := range voterTargets {
+			if storeDesc := storeMap[voterTargets[i].StoreID]; storeDesc != nil {
 				storeDesc.Capacity.RangeCount++
 				if i == 0 {
 					storeDesc.Capacity.LeaseCount++
@@ -362,7 +363,7 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 	maxQPS float64,
 ) (replicaWithStats, roachpb.ReplicaDescriptor, []replicaWithStats) {
 	var considerForRebalance []replicaWithStats
-	now := sr.rq.store.Clock().Now()
+	now := sr.rq.store.Clock().NowAsClockTimestamp()
 	for {
 		if len(*hottestRanges) == 0 {
 			return replicaWithStats{}, roachpb.ReplicaDescriptor{}, considerForRebalance
@@ -398,7 +399,7 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 		// Check all the other replicas in order of increasing qps. Learner replicas
 		// aren't allowed to become the leaseholder or raft leader, so only consider
 		// the `Voters` replicas.
-		candidates := desc.Replicas().DeepCopy().Voters()
+		candidates := desc.Replicas().DeepCopy().VoterDescriptors()
 		sort.Slice(candidates, func(i, j int) bool {
 			var iQPS, jQPS float64
 			if desc := storeMap[candidates[i].StoreID]; desc != nil {
@@ -432,7 +433,7 @@ func (sr *StoreRebalancer) chooseLeaseToTransfer(
 				continue
 			}
 
-			if len(preferred) > 0 && !storeHasReplica(candidate.StoreID, preferred) {
+			if len(preferred) > 0 && !storeHasReplica(candidate.StoreID, roachpb.MakeReplicaSet(preferred).ReplicationTargets()) {
 				log.VEventf(ctx, 3, "s%d not a preferred leaseholder for r%d; preferred: %v",
 					candidate.StoreID, desc.RangeID, preferred)
 				continue
@@ -470,7 +471,7 @@ func (sr *StoreRebalancer) chooseReplicaToRebalance(
 	minQPS float64,
 	maxQPS float64,
 ) (replicaWithStats, []roachpb.ReplicationTarget) {
-	now := sr.rq.store.Clock().Now()
+	now := sr.rq.store.Clock().NowAsClockTimestamp()
 	for {
 		if len(*hottestRanges) == 0 {
 			return replicaWithStats{}, nil
@@ -503,40 +504,41 @@ func (sr *StoreRebalancer) chooseReplicaToRebalance(
 			desc.RangeID, replWithStats.qps)
 
 		clusterNodes := sr.rq.allocator.storePool.ClusterNodeCount()
-		desiredReplicas := GetNeededReplicas(*zone.NumReplicas, clusterNodes)
-		targets := make([]roachpb.ReplicationTarget, 0, desiredReplicas)
-		targetReplicas := make([]roachpb.ReplicaDescriptor, 0, desiredReplicas)
-		currentReplicas := desc.Replicas().All()
+		desiredVoters := GetNeededVoters(zone.GetNumVoters(), clusterNodes)
+		targets := make([]roachpb.ReplicationTarget, 0, desiredVoters)
+		targetVoters := make([]roachpb.ReplicaDescriptor, 0, desiredVoters)
+		currentVoters := desc.Replicas().VoterDescriptors()
+		currentNonVoters := desc.Replicas().NonVoterDescriptors()
 
 		// Check the range's existing diversity score, since we want to ensure we
 		// don't hurt locality diversity just to improve QPS.
 		curDiversity := rangeDiversityScore(
-			sr.rq.allocator.storePool.getLocalitiesByStore(currentReplicas))
+			sr.rq.allocator.storePool.getLocalitiesByStore(currentVoters))
 
 		// Check the existing replicas, keeping around those that aren't overloaded.
-		for i := range currentReplicas {
-			if currentReplicas[i].StoreID == localDesc.StoreID {
+		for i := range currentVoters {
+			if currentVoters[i].StoreID == localDesc.StoreID {
 				continue
 			}
 			// Keep the replica in the range if we don't know its QPS or if its QPS
 			// is below the upper threshold. Punishing stores not in our store map
 			// could cause mass evictions if the storePool gets out of sync.
-			storeDesc, ok := storeMap[currentReplicas[i].StoreID]
+			storeDesc, ok := storeMap[currentVoters[i].StoreID]
 			if !ok || storeDesc.Capacity.QueriesPerSecond < maxQPS {
 				if log.V(3) {
 					var reason redact.RedactableString
 					if ok {
 						reason = redact.Sprintf(" (qps %.2f vs max %.2f)", storeDesc.Capacity.QueriesPerSecond, maxQPS)
 					}
-					log.VEventf(ctx, 3, "keeping r%d/%d on s%d%s", desc.RangeID, currentReplicas[i].ReplicaID, currentReplicas[i].StoreID, reason)
+					log.VEventf(ctx, 3, "keeping r%d/%d on s%d%s", desc.RangeID, currentVoters[i].ReplicaID, currentVoters[i].StoreID, reason)
 				}
 				targets = append(targets, roachpb.ReplicationTarget{
-					NodeID:  currentReplicas[i].NodeID,
-					StoreID: currentReplicas[i].StoreID,
+					NodeID:  currentVoters[i].NodeID,
+					StoreID: currentVoters[i].StoreID,
 				})
-				targetReplicas = append(targetReplicas, roachpb.ReplicaDescriptor{
-					NodeID:  currentReplicas[i].NodeID,
-					StoreID: currentReplicas[i].StoreID,
+				targetVoters = append(targetVoters, roachpb.ReplicaDescriptor{
+					NodeID:  currentVoters[i].NodeID,
+					StoreID: currentVoters[i].StoreID,
 				})
 			}
 		}
@@ -544,16 +546,20 @@ func (sr *StoreRebalancer) chooseReplicaToRebalance(
 		// Then pick out which new stores to add the remaining replicas to.
 		options := sr.rq.allocator.scorerOptions()
 		options.qpsRebalanceThreshold = qpsRebalanceThreshold.Get(&sr.st.SV)
-		for len(targets) < desiredReplicas {
-			// Use the preexisting AllocateTarget logic to ensure that considerations
+		for len(targets) < desiredVoters {
+			// Use the preexisting AllocateVoter logic to ensure that considerations
 			// such as zone constraints, locality diversity, and full disk come
 			// into play.
 			target, _ := sr.rq.allocator.allocateTargetFromList(
 				ctx,
 				storeList,
 				zone,
-				targetReplicas,
+				targetVoters,
+				currentNonVoters,
 				options,
+				// TODO(aayush): For now, we're not going to let the StoreRebalancer
+				// rebalance non-voting replicas. Fix this.
+				voterTarget,
 			)
 			if target == nil {
 				log.VEventf(ctx, 3, "no rebalance targets found to replace the current store for r%d",
@@ -570,7 +576,7 @@ func (sr *StoreRebalancer) chooseReplicaToRebalance(
 				NodeID:  target.Node.NodeID,
 				StoreID: target.StoreID,
 			})
-			targetReplicas = append(targetReplicas, roachpb.ReplicaDescriptor{
+			targetVoters = append(targetVoters, roachpb.ReplicaDescriptor{
 				NodeID:  target.Node.NodeID,
 				StoreID: target.StoreID,
 			})
@@ -583,12 +589,12 @@ func (sr *StoreRebalancer) chooseReplicaToRebalance(
 		// moving one of the other existing replicas that's on a store with less
 		// qps than the max threshold but above the mean would help in certain
 		// locality configurations.
-		if len(targets) < desiredReplicas {
+		if len(targets) < desiredVoters {
 			log.VEventf(ctx, 3, "couldn't find enough rebalance targets for r%d (%d/%d)",
-				desc.RangeID, len(targets), desiredReplicas)
+				desc.RangeID, len(targets), desiredVoters)
 			continue
 		}
-		newDiversity := rangeDiversityScore(sr.rq.allocator.storePool.getLocalitiesByStore(targetReplicas))
+		newDiversity := rangeDiversityScore(sr.rq.allocator.storePool.getLocalitiesByStore(targetVoters))
 		if newDiversity < curDiversity {
 			log.VEventf(ctx, 3,
 				"new diversity %.2f for r%d worse than current diversity %.2f; not rebalancing",
@@ -628,7 +634,7 @@ func shouldNotMoveAway(
 	ctx context.Context,
 	replWithStats replicaWithStats,
 	localDesc *roachpb.StoreDescriptor,
-	now hlc.Timestamp,
+	now hlc.ClockTimestamp,
 	minQPS float64,
 ) bool {
 	if !replWithStats.repl.OwnsValidLease(ctx, now) {

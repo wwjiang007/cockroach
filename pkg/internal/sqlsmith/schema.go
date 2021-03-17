@@ -117,8 +117,8 @@ func (s *Smither) getRandTableIndex(
 	for _, col := range idx.Columns {
 		ref := s.columns[table][col.Column]
 		if ref == nil {
-			// TODO (rohany): There are some cases here where colRef is nil, but we
-			//  aren't yet sure why. Rather than panicking, just return.
+			// TODO(yuzefovich): there are some cases here where colRef is nil,
+			// but we aren't yet sure why. Rather than panicking, just return.
 			return nil, nil, nil, false
 		}
 		refs = append(refs, &colRef{
@@ -433,6 +433,12 @@ var functions = func() map[tree.FunctionClass]map[oid.Oid][]function {
 	for _, def := range tree.FunDefs {
 		switch def.Name {
 		case "pg_sleep":
+			continue
+		}
+		if strings.Contains(def.Name, "stream_ingestion") {
+			// crdb_internal.complete_stream_ingestion_job is a stateful function that
+			// requires a running stream ingestion job. Invoking this against random
+			// parameters is likely to fail and so we skip it.
 			continue
 		}
 		if strings.Contains(def.Name, "crdb_internal.force_") ||

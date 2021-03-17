@@ -17,6 +17,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -25,7 +26,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -39,8 +42,8 @@ var payloadTableNameSuffix = "_upload_payload"
 // FileToTableExecutorRows encompasses the two formats in which the
 // InternalFileToTableExecutor and SQLConnFileToTableExecutor output their rows.
 type FileToTableExecutorRows struct {
-	internalExecResults []tree.Datums
-	sqlConnExecResults  driver.Rows
+	internalExecResultsIterator sqlutil.InternalRows
+	sqlConnExecResults          driver.Rows
 }
 
 // FileToTableSystemExecutor is the interface which defines the methods for the
@@ -77,7 +80,7 @@ func (i *InternalFileToTableExecutor) Query(
 ) (*FileToTableExecutorRows, error) {
 	result := FileToTableExecutorRows{}
 	var err error
-	result.internalExecResults, err = i.ie.QueryEx(ctx, opName, nil,
+	result.internalExecResultsIterator, err = i.ie.QueryIteratorEx(ctx, opName, nil,
 		sessiondata.InternalExecutorOverride{User: username}, query, qargs...)
 	if err != nil {
 		return nil, err
@@ -164,16 +167,16 @@ type FileToTableSystem struct {
 }
 
 // FileTable which contains records for every uploaded file.
-const fileTableSchema = `CREATE TABLE %s (filename STRING PRIMARY KEY, 
+const fileTableSchema = `CREATE TABLE %s (filename STRING PRIMARY KEY,
 file_id UUID UNIQUE NOT NULL DEFAULT gen_random_uuid(),
-file_size INT NOT NULL, 
-username STRING NOT NULL, 
+file_size INT NOT NULL,
+username STRING NOT NULL,
 upload_time TIMESTAMP DEFAULT now())`
 
 // PayloadTable contains the chunked payloads of each file.
-const payloadTableSchema = `CREATE TABLE %s (file_id UUID, 
-byte_offset INT, 
-payload BYTES, 
+const payloadTableSchema = `CREATE TABLE %s (file_id UUID,
+byte_offset INT,
+payload BYTES,
 PRIMARY KEY(file_id, byte_offset))`
 
 // GetFQFileTableName returns the qualified File table name.
@@ -223,7 +226,7 @@ func resolveInternalFileToTableExecutor(
 	var e *InternalFileToTableExecutor
 	var ok bool
 	if e, ok = executor.(*InternalFileToTableExecutor); !ok {
-		return nil, errors.New("unable to resolve to a supported executor type")
+		return nil, errors.Newf("unable to resolve %T to a supported executor type", executor)
 	}
 
 	return e, nil
@@ -331,8 +334,13 @@ filename`, f.GetFQFileTableName())
 	switch f.executor.(type) {
 	case *InternalFileToTableExecutor:
 		// Verify that all the filenames are strings and aggregate them.
-		for _, row := range rows.internalExecResults {
-			files = append(files, string(tree.MustBeDString(row[0])))
+		it := rows.internalExecResultsIterator
+		var ok bool
+		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+			files = append(files, string(tree.MustBeDString(it.Cur()[0])))
+		}
+		if err != nil {
+			return nil, err
 		}
 	case *SQLConnFileToTableExecutor:
 		vals := make([]driver.Value, 1)
@@ -368,7 +376,7 @@ func DestroyUserFileSystem(ctx context.Context, f *FileToTableSystem) error {
 	if err := e.db.Txn(ctx,
 		func(ctx context.Context, txn *kv.Txn) error {
 			dropPayloadTableQuery := fmt.Sprintf(`DROP TABLE %s`, f.GetFQPayloadTableName())
-			_, err := e.ie.QueryEx(ctx, "drop-payload-table", txn,
+			_, err := e.ie.ExecEx(ctx, "drop-payload-table", txn,
 				sessiondata.InternalExecutorOverride{User: f.username},
 				dropPayloadTableQuery)
 			if err != nil {
@@ -376,7 +384,7 @@ func DestroyUserFileSystem(ctx context.Context, f *FileToTableSystem) error {
 			}
 
 			dropFileTableQuery := fmt.Sprintf(`DROP TABLE %s CASCADE`, f.GetFQFileTableName())
-			_, err = e.ie.QueryEx(ctx, "drop-file-table", txn,
+			_, err = e.ie.ExecEx(ctx, "drop-file-table", txn,
 				sessiondata.InternalExecutorOverride{User: f.username},
 				dropFileTableQuery)
 			if err != nil {
@@ -471,7 +479,7 @@ type payloadWriter struct {
 // transaction txn.
 func (p *payloadWriter) WriteChunk(buf []byte, txn *kv.Txn) (int, error) {
 	insertChunkQuery := fmt.Sprintf(`INSERT INTO %s VALUES ($1, $2, $3)`, p.payloadTableName)
-	_, err := p.ie.QueryEx(p.ctx, "insert-file-chunk", txn, p.execSessionDataOverride,
+	_, err := p.ie.ExecEx(p.ctx, "insert-file-chunk", txn, p.execSessionDataOverride,
 		insertChunkQuery, p.fileID, p.byteOffset, buf)
 	if err != nil {
 		return 0, err
@@ -618,37 +626,21 @@ func (w *chunkWriter) Close() error {
 	// were actually written to the payload table.
 	updateFileSizeQuery := fmt.Sprintf(`UPDATE %s SET file_size=$1 WHERE filename=$2`,
 		w.fileTableName)
-	_, err := w.pw.ie.QueryEx(w.pw.ctx, "update-file-size",
+	_, err := w.pw.ie.ExecEx(w.pw.ctx, "update-file-size",
 		nil /* txn */, w.execSessionDataOverride, updateFileSizeQuery, w.pw.byteOffset, w.filename)
 
 	return err
 }
 
-// fileReader reads the file payload from the underlying Payload table.
-type fileReader struct {
-	io.Reader
+type reader struct {
+	pos int64
+	fn  func([]byte, int64) (int, error)
 }
 
-var _ io.ReadCloser = &fileReader{}
-
-// Close implements the io.Closer interface.
-func (f *fileReader) Close() error {
-	return nil
-}
-
-func newFileReader(
-	ctx context.Context,
-	filename string,
-	username security.SQLUsername,
-	fileTableName, payloadTableName string,
-	ie *sql.InternalExecutor,
-) (io.ReadCloser, error) {
-	fileTableReader, err := newFileTableReader(ctx, filename, username, fileTableName,
-		payloadTableName, ie)
-	if err != nil {
-		return nil, err
-	}
-	return &fileReader{fileTableReader}, nil
+func (r *reader) Read(p []byte) (int, error) {
+	n, err := r.fn(p, r.pos)
+	r.pos += int64(n)
+	return n, err
 }
 
 func newFileTableReader(
@@ -656,54 +648,134 @@ func newFileTableReader(
 	filename string,
 	username security.SQLUsername,
 	fileTableName, payloadTableName string,
-	ie *sql.InternalExecutor,
-) (io.Reader, error) {
+	ie FileToTableSystemExecutor,
+	offset int64,
+) (io.ReadCloser, int64, error) {
 	// Get file_id from metadata entry in File table.
-	fileIDQuery := fmt.Sprintf(`SELECT file_id FROM %s WHERE filename=$1`, fileTableName)
-	fileIDRow, err := ie.QueryRowEx(
-		ctx, "get-filename-payload",
-		nil /* txn */, sessiondata.InternalExecutorOverride{User: username}, fileIDQuery, filename,
-	)
+	var fileID []byte
+	var sz int64
+	metadataQuery := fmt.Sprintf(
+		`SELECT f.file_id, sum_int(length(p.payload))
+		FROM %s f LEFT OUTER JOIN %s p ON p.file_id = f.file_id
+		WHERE f.filename = $1 GROUP BY f.file_id`,
+		fileTableName, payloadTableName)
+	metaRows, err := ie.Query(ctx, "userfile-reader-info", metadataQuery, username, filename)
 	if err != nil {
-		return nil, err
+		return nil, 0, errors.Wrap(err, "failed to read file info")
+	}
+	// Based on the executor type we must process the outputted rows differently.
+	switch ie.(type) {
+	case *InternalFileToTableExecutor:
+		it := metaRows.internalExecResultsIterator
+		defer func() {
+			if err := it.Close(); err != nil {
+				log.Warningf(ctx, "failed to close %+v", err)
+			}
+		}()
+		ok, err := it.Next(ctx)
+		if err != nil {
+			return nil, 0, errors.Wrap(err, "failed to read file info")
+		}
+		if !ok {
+			return nil, 0, os.ErrNotExist
+		}
+		fileID = it.Cur()[0].(*tree.DUuid).UUID.GetBytes()
+		if it.Cur()[1] != tree.DNull {
+			sz = int64(tree.MustBeDInt(it.Cur()[1]))
+		}
+	case *SQLConnFileToTableExecutor:
+		defer func() {
+			if err := metaRows.sqlConnExecResults.Close(); err != nil {
+				log.Warningf(ctx, "failed to close %+v", err)
+			}
+		}()
+		vals := make([]driver.Value, 2)
+		err := metaRows.sqlConnExecResults.Next(vals)
+		if err == io.EOF {
+			return nil, 0, os.ErrNotExist
+		} else if err != nil {
+			return nil, 0, errors.Wrap(err, "failed to read returned file metadata")
+		}
+		fileID = vals[0].([]byte)
+		sz = vals[1].(int64)
+	default:
+		panic("unknown executor")
 	}
 
-	// If no metadata entry was found return a does not exist error.
-	if fileIDRow == nil {
-		return nil, os.ErrNotExist
+	if sz == 0 {
+		return ioutil.NopCloser(bytes.NewReader(nil)), 0, nil
 	}
 
-	query := fmt.Sprintf(`SELECT payload FROM %s WHERE file_id=$1`, payloadTableName)
-	rows, err := ie.QueryEx(
-		ctx, "get-filename-payload",
-		nil /* txn */, sessiondata.InternalExecutorOverride{User: username}, query, fileIDRow[0],
-	)
-	if err != nil {
-		return nil, err
+	const bufSize = 256 << 10
+
+	fn := func(p []byte, pos int64) (int, error) {
+		if pos >= sz {
+			return 0, io.EOF
+		}
+		query := fmt.Sprintf(
+			`SELECT substr(payload, $2+1-byte_offset, $3)
+			FROM %s WHERE file_id=$1 AND byte_offset <= $2
+			ORDER BY byte_offset DESC
+			LIMIT 1`, payloadTableName)
+		rows, err := ie.Query(
+			ctx, "userfile-reader-payload", query, username, fileID, pos, int64(bufSize),
+		)
+		if err != nil {
+			return 0, errors.Wrap(err, "reading file content")
+		}
+		var block []byte
+		switch ie.(type) {
+		case *InternalFileToTableExecutor:
+			it := rows.internalExecResultsIterator
+			defer func() {
+				if err := it.Close(); err != nil {
+					log.Warningf(ctx, "failed to close %+v", err)
+				}
+			}()
+			ok, err := it.Next(ctx)
+			if err != nil {
+				return 0, errors.Wrap(err, "reading file content")
+			}
+			if !ok || it.Cur()[0] == tree.DNull {
+				return 0, io.EOF
+			}
+			block = []byte(tree.MustBeDBytes(it.Cur()[0]))
+		case *SQLConnFileToTableExecutor:
+			defer func() {
+				if err := rows.sqlConnExecResults.Close(); err != nil {
+					log.Warningf(ctx, "failed to close %+v", err)
+				}
+			}()
+			vals := make([]driver.Value, 1)
+			if err := rows.sqlConnExecResults.Next(vals); err == io.EOF {
+				return 0, io.EOF
+			} else if err != nil {
+				return 0, errors.Wrap(err, "failed to read returned file content")
+			}
+			block = vals[0].([]byte)
+		default:
+			panic("unknown executor")
+		}
+		n := copy(p, block)
+		if pos+int64(n) >= sz {
+			return n, io.EOF
+		}
+		return n, nil
 	}
 
-	// Verify that all the payloads are bytes and assemble bytes of filename.
-	var fileBytes []byte
-	for _, row := range rows {
-		fileBytes = append(fileBytes, []byte(tree.MustBeDBytes(row[0]))...)
-	}
-
-	return bufio.NewReader(bytes.NewBuffer(fileBytes)), nil
+	return ioutil.NopCloser(bufio.NewReaderSize(&reader{fn: fn, pos: offset}, bufSize)), sz, nil
 }
 
 // ReadFile returns the blob for filename using a FileTableReader.
 // TODO(adityamaru): Reading currently involves aggregating all chunks of a
 // file from the Payload table. In the future we might want to implement a pull
 // x rows system, or a scan based interface.
-func (f *FileToTableSystem) ReadFile(ctx context.Context, filename string) (io.ReadCloser, error) {
-	e, err := resolveInternalFileToTableExecutor(f.executor)
-	if err != nil {
-		return nil, err
-	}
-
-	var reader, readerErr = newFileReader(ctx, filename, f.username, f.GetFQFileTableName(),
-		f.GetFQPayloadTableName(), e.ie)
-	return reader, readerErr
+func (f *FileToTableSystem) ReadFile(
+	ctx context.Context, filename string, offset int64,
+) (io.ReadCloser, int64, error) {
+	return newFileTableReader(
+		ctx, filename, f.username, f.GetFQFileTableName(), f.GetFQPayloadTableName(), f.executor, offset,
+	)
 }
 
 func (f *FileToTableSystem) checkIfFileAndPayloadTableExist(
@@ -736,18 +808,18 @@ func (f *FileToTableSystem) checkIfFileAndPayloadTableExist(
 	tableExistenceQuery := fmt.Sprintf(
 		`SELECT table_name FROM [SHOW TABLES FROM %s] WHERE table_name=$1 OR table_name=$2`,
 		databaseSchema)
-	rows, err := ie.QueryEx(ctx, "tables-exist", nil,
+	numRows, err := ie.ExecEx(ctx, "tables-exist", nil,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		tableExistenceQuery, fileTableName, payloadTableName)
 	if err != nil {
 		return false, err
 	}
 
-	if len(rows) == 1 {
+	if numRows == 1 {
 		return false, errors.New("expected both File and Payload tables to exist, " +
 			"but one of them has been dropped")
 	}
-	return len(rows) == 2, nil
+	return numRows == 2, nil
 }
 
 func (f *FileToTableSystem) createFileAndPayloadTables(
@@ -755,7 +827,7 @@ func (f *FileToTableSystem) createFileAndPayloadTables(
 ) error {
 	// Create the File and Payload tables to hold the file chunks.
 	fileTableCreateQuery := fmt.Sprintf(fileTableSchema, f.GetFQFileTableName())
-	_, err := ie.QueryEx(ctx, "create-file-table", txn,
+	_, err := ie.ExecEx(ctx, "create-file-table", txn,
 		sessiondata.InternalExecutorOverride{User: f.username},
 		fileTableCreateQuery)
 	if err != nil {
@@ -763,7 +835,7 @@ func (f *FileToTableSystem) createFileAndPayloadTables(
 	}
 
 	payloadTableCreateQuery := fmt.Sprintf(payloadTableSchema, f.GetFQPayloadTableName())
-	_, err = ie.QueryEx(ctx, "create-payload-table", txn,
+	_, err = ie.ExecEx(ctx, "create-payload-table", txn,
 		sessiondata.InternalExecutorOverride{User: f.username},
 		payloadTableCreateQuery)
 	if err != nil {
@@ -789,7 +861,7 @@ func (f *FileToTableSystem) grantCurrentUserTablePrivileges(
 ) error {
 	grantQuery := fmt.Sprintf(`GRANT SELECT, INSERT, DROP, DELETE ON TABLE %s, %s TO %s`,
 		f.GetFQFileTableName(), f.GetFQPayloadTableName(), f.username.SQLIdentifier())
-	_, err := ie.QueryEx(ctx, "grant-user-file-payload-table-access", txn,
+	_, err := ie.ExecEx(ctx, "grant-user-file-payload-table-access", txn,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		grantQuery)
 	if err != nil {
@@ -806,7 +878,7 @@ func (f *FileToTableSystem) revokeOtherUserTablePrivileges(
 ) error {
 	getUsersQuery := `SELECT username FROM system.
 users WHERE NOT "username" = 'root' AND NOT "username" = 'admin' AND NOT "username" = $1`
-	rows, err := ie.QueryEx(
+	it, err := ie.QueryIteratorEx(
 		ctx, "get-users", txn,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		getUsersQuery, f.username,
@@ -816,15 +888,20 @@ users WHERE NOT "username" = 'root' AND NOT "username" = 'admin' AND NOT "userna
 	}
 
 	var users []security.SQLUsername
-	for _, row := range rows {
+	var ok bool
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+		row := it.Cur()
 		username := security.MakeSQLUsernameFromPreNormalizedString(string(tree.MustBeDString(row[0])))
 		users = append(users, username)
+	}
+	if err != nil {
+		return errors.Wrap(err, "failed to get all the users of the cluster")
 	}
 
 	for _, user := range users {
 		revokeQuery := fmt.Sprintf(`REVOKE ALL ON TABLE %s, %s FROM %s`,
 			f.GetFQFileTableName(), f.GetFQPayloadTableName(), user.SQLIdentifier())
-		_, err = ie.QueryEx(ctx, "revoke-user-privileges", txn,
+		_, err = ie.ExecEx(ctx, "revoke-user-privileges", txn,
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			revokeQuery)
 		if err != nil {

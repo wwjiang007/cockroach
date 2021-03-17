@@ -11,6 +11,8 @@
 package testcat
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"reflect"
 	"sort"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -118,8 +121,8 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 			"rowid",
 			cat.Ordinary,
 			types.Int,
-			false,              /* nullable */
-			true,               /* hidden */
+			false, /* nullable */
+			cat.Hidden,
 			&uniqueRowIDString, /* defaultExpr */
 			nil,                /* computedExpr */
 		)
@@ -146,11 +149,16 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		cat.System,
 		colinfo.MVCCTimestampColumnType,
 		true, /* nullable */
-		true, /* hidden */
-		nil,  /* defaultExpr */
-		nil,  /* computedExpr */
+		cat.Hidden,
+		nil, /* defaultExpr */
+		nil, /* computedExpr */
 	)
 	tab.Columns = append(tab.Columns, mvcc)
+
+	// Cache the partitioning statement for the primary index.
+	if stmt.PartitionByTable != nil {
+		tab.partitionBy = stmt.PartitionByTable.PartitionBy
+	}
 
 	// Add the primary index.
 	if hasPrimaryIndex {
@@ -171,9 +179,6 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	} else {
 		tab.addPrimaryColumnIndex("rowid")
 	}
-	if stmt.PartitionBy != nil {
-		tab.Indexes[0].partitionBy = stmt.PartitionBy
-	}
 
 	// Add check constraints.
 	for _, def := range stmt.Defs {
@@ -191,7 +196,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 		switch def := def.(type) {
 		case *tree.UniqueConstraintTableDef:
 			if def.WithoutIndex {
-				tab.addUniqueConstraint(def.Name, def.Columns, def.WithoutIndex)
+				tab.addUniqueConstraint(def.Name, def.Columns, def.Predicate, def.WithoutIndex)
 			} else if !def.PrimaryKey {
 				tab.addIndex(&def.IndexTableDef, uniqueIndex)
 			}
@@ -208,6 +213,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 					tab.addUniqueConstraint(
 						def.Unique.ConstraintName,
 						tree.IndexElemList{{Column: def.Name}},
+						nil, /* predicate */
 						def.Unique.WithoutIndex,
 					)
 				} else {
@@ -275,9 +281,9 @@ func (tc *Catalog) createVirtualTable(stmt *tree.CreateTable) *Table {
 		cat.Ordinary,
 		types.Int,
 		false, /* nullable */
-		true,  /* hidden */
-		nil,   /* defaultExpr */
-		nil,   /* computedExpr */
+		cat.Hidden,
+		nil, /* defaultExpr */
+		nil, /* computedExpr */
 	)
 
 	tab.Columns = []cat.Column{pk}
@@ -330,8 +336,8 @@ func (tc *Catalog) CreateTableAs(name tree.TableName, columns []cat.Column) *Tab
 		"rowid",
 		cat.Ordinary,
 		types.Int,
-		false,              /* nullable */
-		true,               /* hidden */
+		false, /* nullable */
+		cat.Hidden,
 		&uniqueRowIDString, /* defaultExpr */
 		nil,                /* computedExpr */
 	)
@@ -384,10 +390,10 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 	//     fact, if an existing index has the relevant columns as a prefix, that
 	//     is good enough.
 
-	// matches returns true if the key columns in the given index match the given
-	// columns. If strict is false, it is acceptable if the given columns are a
-	// prefix of the index key columns.
-	matches := func(idx *Index, cols []int, strict bool) bool {
+	// indexMatches returns true if the key columns in the given index match the
+	// given columns. If strict is false, it is acceptable if the given columns
+	// are a prefix of the index key columns.
+	indexMatches := func(idx *Index, cols []int, strict bool) bool {
 		if idx.LaxKeyColumnCount() < len(cols) {
 			return false
 		}
@@ -405,15 +411,39 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 		return true
 	}
 
-	// 1. Verify that the target table has a unique index.
+	// uniqueConstraintMatches returns true if the key columns in the given unique
+	// constraint match the given columns.
+	uniqueConstraintMatches := func(uc *UniqueConstraint, cols []int) bool {
+		if colCount := uc.ColumnCount(); colCount < len(cols) || colCount > len(cols) {
+			return false
+		}
+		for i := range cols {
+			if uc.columnOrdinals[i] != cols[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	// 1. Verify that the target table has a unique index or unique constraint.
 	var targetIndex *Index
+	var targetUniqueConstraint *UniqueConstraint
 	for _, idx := range targetTable.Indexes {
-		if matches(idx, toCols, true /* strict */) {
+		if indexMatches(idx, toCols, true /* strict */) {
 			targetIndex = idx
 			break
 		}
 	}
 	if targetIndex == nil {
+		for i := range targetTable.uniqueConstraints {
+			uc := &targetTable.uniqueConstraints[i]
+			if uniqueConstraintMatches(uc, toCols) {
+				targetUniqueConstraint = uc
+				break
+			}
+		}
+	}
+	if targetIndex == nil && targetUniqueConstraint == nil {
 		panic(fmt.Errorf(
 			"there is no unique constraint matching given keys for referenced table %s",
 			targetTable.Name(),
@@ -424,7 +454,7 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 		// 2. Search for an existing index in the source table; add it if necessary.
 		found := false
 		for _, idx := range tab.Indexes {
-			if matches(idx, fromCols, false /* strict */) {
+			if indexMatches(idx, fromCols, false /* strict */) {
 				found = true
 				break
 			}
@@ -459,8 +489,14 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 }
 
 func (tt *Table) addUniqueConstraint(
-	name tree.Name, columns tree.IndexElemList, withoutIndex bool,
+	name tree.Name, columns tree.IndexElemList, predicate tree.Expr, withoutIndex bool,
 ) {
+	// We don't currently use unique constraints with an index (those are already
+	// tracked with unique indexes), so don't bother adding them.
+	// NB: This should stay consistent with opt_catalog.go.
+	if !withoutIndex {
+		return
+	}
 	cols := make([]int, len(columns))
 	for i, c := range columns {
 		cols[i] = tt.FindOrdinal(string(c.Column))
@@ -476,11 +512,15 @@ func (tt *Table) addUniqueConstraint(
 
 	// We didn't find an existing constraint, so add a new one.
 	u := UniqueConstraint{
-		name:           string(name),
+		name:           tt.makeUniqueConstraintName(name, columns),
 		tabID:          tt.TabID,
 		columnOrdinals: cols,
 		withoutIndex:   withoutIndex,
 		validated:      true,
+	}
+	// Add partial unique constraint predicate.
+	if predicate != nil {
+		u.predicate = tree.Serialize(predicate)
 	}
 	tt.uniqueConstraints = append(tt.uniqueConstraints, u)
 }
@@ -492,14 +532,20 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 
 	name := def.Name
 	kind := cat.Ordinary
+	visibility := cat.Visible
 
-	// Look for name suffixes indicating this is a mutation column.
-	if n, ok := extractWriteOnlyColumn(def); ok {
+	// Look for name suffixes indicating this is a special column.
+	if n, ok := extractInaccessibleColumn(def); ok {
+		name = n
+		visibility = cat.Inaccessible
+	} else if n, ok := extractWriteOnlyColumn(def); ok {
 		name = n
 		kind = cat.WriteOnly
+		visibility = cat.Inaccessible
 	} else if n, ok := extractDeleteOnlyColumn(def); ok {
 		name = n
 		kind = cat.DeleteOnly
+		visibility = cat.Inaccessible
 	}
 
 	var defaultExpr, computedExpr *string
@@ -521,7 +567,7 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 			name,
 			typ,
 			nullable,
-			false, /* hidden */
+			visibility,
 			*computedExpr,
 		)
 	} else {
@@ -532,7 +578,7 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 			kind,
 			typ,
 			nullable,
-			false, /* hidden */
+			visibility,
 			defaultExpr,
 			computedExpr,
 		)
@@ -549,17 +595,16 @@ func (tt *Table) addIndexWithVersion(
 ) *Index {
 	// Add a unique constraint if this is a primary or unique index.
 	if typ != nonUniqueIndex {
-		tt.addUniqueConstraint(def.Name, def.Columns, false /* withoutIndex */)
+		tt.addUniqueConstraint(def.Name, def.Columns, def.Predicate, false /* withoutIndex */)
 	}
 
 	idx := &Index{
-		IdxName:     tt.makeIndexName(def.Name, typ),
-		Unique:      typ != nonUniqueIndex,
-		Inverted:    def.Inverted,
-		IdxZone:     &zonepb.ZoneConfig{},
-		table:       tt,
-		partitionBy: def.PartitionBy,
-		version:     version,
+		IdxName:  tt.makeIndexName(def.Name, typ),
+		Unique:   typ != nonUniqueIndex,
+		Inverted: def.Inverted,
+		IdxZone:  &zonepb.ZoneConfig{},
+		table:    tt,
+		version:  version,
 	}
 
 	// Look for name suffixes indicating this is a mutation index.
@@ -613,6 +658,44 @@ func (tt *Table) addIndexWithVersion(
 						LevelMod: 1,
 						MaxCells: 3,
 					}},
+				}
+			}
+		}
+	}
+
+	// Add partitions.
+	var partitionBy *tree.PartitionBy
+	if def.PartitionByIndex != nil {
+		partitionBy = def.PartitionByIndex.PartitionBy
+	} else if typ == primaryIndex {
+		partitionBy = tt.partitionBy
+	}
+	if partitionBy != nil {
+		ctx := context.Background()
+		semaCtx := tree.MakeSemaContext()
+		evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+
+		if len(partitionBy.List) > 0 {
+			idx.partitions = make([]Partition, len(partitionBy.List))
+			for i := range partitionBy.Fields {
+				if i >= len(idx.Columns) || partitionBy.Fields[i] != idx.Columns[i].ColName() {
+					panic("partition by columns must be a prefix of the index columns")
+				}
+			}
+			for i := range partitionBy.List {
+				p := &partitionBy.List[i]
+				idx.partitions[i] = Partition{
+					name:   string(p.Name),
+					zone:   &zonepb.ZoneConfig{},
+					datums: make([]tree.Datums, 0, len(p.Exprs)),
+				}
+
+				// Get the partition values.
+				for _, e := range p.Exprs {
+					d := idx.partitionByListExprToDatums(ctx, &evalCtx, &semaCtx, e)
+					if d != nil {
+						idx.partitions[i].datums = append(idx.partitions[i].datums, d)
+					}
 				}
 			}
 		}
@@ -738,6 +821,20 @@ func (tt *Table) makeIndexName(defName tree.Name, typ indexType) string {
 	return name
 }
 
+func (tt *Table) makeUniqueConstraintName(defName tree.Name, columns tree.IndexElemList) string {
+	name := string(defName)
+	if name == "" {
+		var buf bytes.Buffer
+		buf.WriteString("unique")
+		for i := range columns {
+			buf.WriteRune('_')
+			buf.WriteString(string(columns[i].Column))
+		}
+		name = buf.String()
+	}
+	return name
+}
+
 func (tt *Table) addFamily(def *tree.FamilyTableDef) {
 	// Synthesize name if one was not provided.
 	name := string(def.Name)
@@ -835,7 +932,7 @@ func columnForIndexElemExpr(tt *Table, expr tree.Expr) cat.Column {
 		name,
 		typ,
 		true, /* nullable */
-		true, /* hidden */
+		cat.Hidden,
 		exprStr,
 	)
 	tt.Columns = append(tt.Columns, col)
@@ -885,6 +982,54 @@ func (tt *Table) addPrimaryColumnIndex(colName string) {
 		Columns: tree.IndexElemList{{Column: tree.Name(colName), Direction: tree.Ascending}},
 	}
 	tt.addIndex(&def, primaryIndex)
+}
+
+// partitionByListExprToDatums converts an expression from a PARTITION BY LIST
+// clause to a list of datums.
+func (ti *Index) partitionByListExprToDatums(
+	ctx context.Context, evalCtx *tree.EvalContext, semaCtx *tree.SemaContext, e tree.Expr,
+) tree.Datums {
+	var vals []tree.Expr
+	switch t := e.(type) {
+	case *tree.Tuple:
+		vals = t.Exprs
+	default:
+		vals = []tree.Expr{e}
+	}
+
+	// Cut off at DEFAULT, if present.
+	for i := range vals {
+		if _, ok := vals[i].(tree.DefaultVal); ok {
+			vals = vals[:i]
+		}
+	}
+	if len(vals) == 0 {
+		return nil
+	}
+	d := make(tree.Datums, len(vals))
+	for i := range vals {
+		c := tree.CastExpr{Expr: vals[i], Type: ti.Columns[i].DatumType()}
+		cTyped, err := c.TypeCheck(ctx, semaCtx, types.Any)
+		if err != nil {
+			panic(err)
+		}
+		d[i], err = cTyped.Eval(evalCtx)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// TODO(radu): split into multiple prefixes if Subpartition is also by list.
+	// Note that this functionality should be kept in sync with the real catalog
+	// implementation (opt_catalog.go).
+	return d
+}
+
+func extractInaccessibleColumn(def *tree.ColumnTableDef) (name tree.Name, ok bool) {
+	if !strings.HasSuffix(string(def.Name), ":inaccessible") {
+		return "", false
+	}
+	return tree.Name(strings.TrimSuffix(string(def.Name), ":inaccessible")), true
 }
 
 func extractWriteOnlyColumn(def *tree.ColumnTableDef) (name tree.Name, ok bool) {

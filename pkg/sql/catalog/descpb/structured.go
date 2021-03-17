@@ -257,6 +257,16 @@ func (desc *TableDescriptor) MaterializedView() bool {
 	return desc.IsMaterializedView
 }
 
+// IsPhysicalTable returns true if the TableDescriptor actually describes a
+// physical Table that needs to be stored in the kv layer, as opposed to a
+// different resource like a view or a virtual table. Physical tables have
+// primary keys, column families, and indexes (unlike virtual tables).
+// Sequences count as physical tables because their values are stored in
+// the KV layer.
+func (desc *TableDescriptor) IsPhysicalTable() bool {
+	return desc.IsSequence() || (desc.IsTable() && !desc.IsVirtualTable()) || desc.MaterializedView()
+}
+
 // IsAs returns true if the TableDescriptor actually describes
 // a Table resource with an As source.
 func (desc *TableDescriptor) IsAs() bool {
@@ -310,6 +320,22 @@ func (opts *TableDescriptor_SequenceOpts) HasOwner() bool {
 	return !opts.SequenceOwner.Equal(TableDescriptor_SequenceOpts_SequenceOwner{})
 }
 
+// EffectiveCacheSize returns the CacheSize field of a sequence option with
+// the exception that it will return 1 if the CacheSize field is 0.
+// A cache size of 1 indicates that there is no caching. The returned value
+// will always be greater than or equal to 1.
+//
+// Prior to #51259, sequence caching was unimplemented and cache sizes were
+// left uninitialized (ie. to have a value of 0). If a sequence has a cache
+// size of 0, it should be treated in the same was as sequences with cache
+// sizes of 1.
+func (opts *TableDescriptor_SequenceOpts) EffectiveCacheSize() int64 {
+	if opts.CacheSize == 0 {
+		return 1
+	}
+	return opts.CacheSize
+}
+
 // SafeValue implements the redact.SafeValue interface.
 func (ConstraintValidity) SafeValue() {}
 
@@ -324,3 +350,36 @@ func (DescriptorState) SafeValue() {}
 
 // SafeValue implements the redact.SafeValue interface.
 func (ConstraintType) SafeValue() {}
+
+// UniqueConstraint is an interface for a unique constraint. It allows
+// both UNIQUE indexes and UNIQUE WITHOUT INDEX constraints to serve as
+// the referenced side of a foreign key constraint.
+type UniqueConstraint interface {
+	// IsValidReferencedUniqueConstraint returns whether the unique constraint can
+	// serve as a referenced unique constraint for a foreign key constraint with the
+	// provided set of referencedColumnIDs.
+	IsValidReferencedUniqueConstraint(referencedColIDs ColumnIDs) bool
+
+	// GetName returns the constraint name.
+	GetName() string
+}
+
+var _ UniqueConstraint = &UniqueWithoutIndexConstraint{}
+var _ UniqueConstraint = &IndexDescriptor{}
+
+// IsValidReferencedUniqueConstraint is part of the UniqueConstraint interface.
+func (u *UniqueWithoutIndexConstraint) IsValidReferencedUniqueConstraint(
+	referencedColIDs ColumnIDs,
+) bool {
+	return ColumnIDs(u.ColumnIDs).Equals(referencedColIDs)
+}
+
+// GetName is part of the UniqueConstraint interface.
+func (u *UniqueWithoutIndexConstraint) GetName() string {
+	return u.Name
+}
+
+// IsPartial returns true if the constraint is a partial unique constraint.
+func (u *UniqueWithoutIndexConstraint) IsPartial() bool {
+	return u.Predicate != ""
+}

@@ -10,7 +10,7 @@
 
 package catalog
 
-// chart_catalog.go represents a catalog of pre-defined Admin UI charts
+// chart_catalog.go represents a catalog of pre-defined DB Console charts
 // to aid users in debugging CockroachDB clusters. This file represents
 // a simplified structure of the catalog, meant to make it easier for
 // developers to add charts to the catalog. You can find more detail at
@@ -305,6 +305,7 @@ var charts = []sectionDescription{
 					"distsender.rpc.initput.sent",
 					"distsender.rpc.leaseinfo.sent",
 					"distsender.rpc.merge.sent",
+					"distsender.rpc.migrate.sent",
 					"distsender.rpc.pushtxn.sent",
 					"distsender.rpc.put.sent",
 					"distsender.rpc.queryintent.sent",
@@ -347,6 +348,7 @@ var charts = []sectionDescription{
 					"distsender.rpc.err.integeroverflowerrtype",
 					"distsender.rpc.err.intentmissingerrtype",
 					"distsender.rpc.err.internalerrtype",
+					"distsender.rpc.err.invalidleaseerrtype",
 					"distsender.rpc.err.leaserejectederrtype",
 					"distsender.rpc.err.mergeinprogresserrtype",
 					"distsender.rpc.err.nodeunavailableerrtype",
@@ -570,6 +572,26 @@ var charts = []sectionDescription{
 			{
 				Title:   "Roundtrip Latency",
 				Metrics: []string{"round-trip-latency"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{KVTransactionLayer, "Prober"}}, Charts: []chartDescription{
+			{
+				Title: "Availability",
+				Metrics: []string{
+					"kv.prober.planning_attempts",
+					"kv.prober.planning_failures",
+					"kv.prober.read.attempts",
+					"kv.prober.read.failures",
+				},
+				AxisLabel: "Probes",
+			},
+			{
+				Title: "Latency",
+				Metrics: []string{
+					"kv.prober.read.latency",
+				},
 			},
 		},
 	},
@@ -944,6 +966,7 @@ var charts = []sectionDescription{
 					"txn.commits",
 					"txn.commits1PC",
 					"txn.parallelcommits",
+					"txn.commit_waits",
 				},
 			},
 			{
@@ -1463,8 +1486,16 @@ var charts = []sectionDescription{
 				Metrics: []string{"queue.replicate.purgatory"},
 			},
 			{
-				Title:   "Reblance Count",
+				Title:   "Rebalance Count",
 				Metrics: []string{"queue.replicate.rebalancereplica"},
+			},
+			{
+				Title:   "Demotions of Voters to Non Voters",
+				Metrics: []string{"queue.replicate.voterdemotions"},
+			},
+			{
+				Title:   "Promotions of Non Voters to Voters",
+				Metrics: []string{"queue.replicate.nonvoterpromotions"},
 			},
 			{
 				Title: "Remove Replica Count",
@@ -1525,6 +1556,17 @@ var charts = []sectionDescription{
 			{
 				Title:   "Total",
 				Metrics: []string{"sql.distsql.flows.total"},
+			},
+		},
+	},
+	{
+		Organization: [][]string{{SQLLayer, "SQL Catalog", "SQL Leases"}},
+		Charts: []chartDescription{
+			{
+				Title: "Outstanding SQL Leases",
+				Metrics: []string{
+					"sql.leases.active",
+				},
 			},
 		},
 	},
@@ -1849,6 +1891,22 @@ var charts = []sectionDescription{
 				Metrics: []string{
 					"sql.new_conns",
 				},
+			},
+			{
+				Title: "Open Transactions",
+				Metrics: []string{
+					"sql.txns.open",
+					"sql.txns.open.internal",
+				},
+				AxisLabel: "Transactions",
+			},
+			{
+				Title: "Full Table Index Scans",
+				Metrics: []string{
+					"sql.full.scan.count",
+					"sql.full.scan.count.internal",
+				},
+				AxisLabel: "SQL Statements",
 			},
 			{
 				Title: "Byte I/O",
@@ -2288,8 +2346,11 @@ var charts = []sectionDescription{
 					"jobs.import.currently_running",
 					"jobs.restore.currently_running",
 					"jobs.schema_change.currently_running",
+					"jobs.new_schema_change.currently_running",
 					"jobs.schema_change_gc.currently_running",
 					"jobs.typedesc_schema_change.currently_running",
+					"jobs.stream_ingestion.currently_running",
+					"jobs.migration.currently_running",
 				},
 			},
 			{
@@ -2377,6 +2438,18 @@ var charts = []sectionDescription{
 				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
 			},
 			{
+				Title: "Schema Change (New Implementation)",
+				Metrics: []string{
+					"jobs.new_schema_change.fail_or_cancel_completed",
+					"jobs.new_schema_change.fail_or_cancel_failed",
+					"jobs.new_schema_change.fail_or_cancel_retry_error",
+					"jobs.new_schema_change.resume_completed",
+					"jobs.new_schema_change.resume_failed",
+					"jobs.new_schema_change.resume_retry_error",
+				},
+				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
 				Title: "Schema Change GC",
 				Metrics: []string{
 					"jobs.schema_change_gc.fail_or_cancel_completed",
@@ -2399,6 +2472,28 @@ var charts = []sectionDescription{
 					"jobs.typedesc_schema_change.resume_retry_error",
 				},
 				Rate: DescribeDerivative_NON_NEGATIVE_DERIVATIVE,
+			},
+			{
+				Title: "Stream Ingestion",
+				Metrics: []string{
+					"jobs.stream_ingestion.fail_or_cancel_completed",
+					"jobs.stream_ingestion.fail_or_cancel_failed",
+					"jobs.stream_ingestion.fail_or_cancel_retry_error",
+					"jobs.stream_ingestion.resume_completed",
+					"jobs.stream_ingestion.resume_failed",
+					"jobs.stream_ingestion.resume_retry_error",
+				},
+			},
+			{
+				Title: "Long Running Migrations",
+				Metrics: []string{
+					"jobs.migration.fail_or_cancel_completed",
+					"jobs.migration.fail_or_cancel_failed",
+					"jobs.migration.fail_or_cancel_retry_error",
+					"jobs.migration.resume_completed",
+					"jobs.migration.resume_failed",
+					"jobs.migration.resume_retry_error",
+				},
 			},
 		},
 	},

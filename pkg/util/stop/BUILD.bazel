@@ -8,7 +8,6 @@ go_library(
     deps = [
         "//pkg/roachpb",
         "//pkg/settings",
-        "//pkg/util/caller",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/log/logcrash",
@@ -21,17 +20,18 @@ go_library(
 
 go_test(
     name = "stop_test",
+    size = "small",
     srcs = [
         "main_test.go",
         "stopper_test.go",
     ],
     deps = [
+        ":stop",
         "//pkg/roachpb",
         "//pkg/testutils",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/quotapool",
-        "//pkg/util/stop",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",

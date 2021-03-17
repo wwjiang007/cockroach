@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -232,7 +233,7 @@ func bootstrapCluster(
 		if i == 0 {
 			bootstrapVersion = cv
 		} else if bootstrapVersion != cv {
-			return nil, errors.Wrapf(err, "found cluster versions %s and %s", bootstrapVersion, cv)
+			return nil, errors.Errorf("found cluster versions %s and %s", bootstrapVersion, cv)
 		}
 
 		sIdent := roachpb.StoreIdent{
@@ -258,10 +259,14 @@ func bootstrapCluster(
 				return splits[i].Less(splits[j])
 			})
 
+			var storeKnobs kvserver.StoreTestingKnobs
+			if kn, ok := initCfg.testingKnobs.Store.(*kvserver.StoreTestingKnobs); ok {
+				storeKnobs = *kn
+			}
 			if err := kvserver.WriteInitialClusterData(
 				ctx, eng, initialValues,
 				bootstrapVersion.Version, len(engines), splits,
-				hlc.UnixNano(),
+				hlc.UnixNano(), storeKnobs,
 			); err != nil {
 				return nil, err
 			}
@@ -282,6 +287,7 @@ func NewNode(
 	reg *metric.Registry,
 	stopper *stop.Stopper,
 	txnMetrics kvcoord.TxnMetrics,
+	stores *kvserver.Stores,
 	execCfg *sql.ExecutorConfig,
 	clusterID *base.ClusterIDContainer,
 ) *Node {
@@ -294,7 +300,7 @@ func NewNode(
 		stopper:    stopper,
 		recorder:   recorder,
 		metrics:    makeNodeMetrics(reg, cfg.HistogramWindowInterval),
-		stores:     kvserver.NewStores(cfg.AmbientCtx, cfg.Clock),
+		stores:     stores,
 		txnMetrics: txnMetrics,
 		sqlExec:    sqlExec,
 		clusterID:  clusterID,
@@ -594,7 +600,7 @@ func (n *Node) initializeAdditionalStores(
 // information. Starts a goroutine to loop until the node is closed.
 func (n *Node) startGossiping(ctx context.Context, stopper *stop.Stopper) {
 	ctx = n.AnnotateCtx(ctx)
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "start-gossip", func(ctx context.Context) {
 		// Verify we've already gossiped our node descriptor.
 		//
 		// TODO(tbg): see if we really needed to do this earlier already. We
@@ -625,7 +631,7 @@ func (n *Node) startGossiping(ctx context.Context, stopper *stop.Stopper) {
 				if err := n.storeCfg.Gossip.SetNodeDescriptor(&n.Descriptor); err != nil {
 					log.Warningf(ctx, "couldn't gossip descriptor for node %d: %s", n.Descriptor.NodeID, err)
 				}
-			case <-stopper.ShouldStop():
+			case <-stopper.ShouldQuiesce():
 				return
 			}
 		}
@@ -646,7 +652,7 @@ func (n *Node) gossipStores(ctx context.Context) {
 // maintained.
 func (n *Node) startComputePeriodicMetrics(stopper *stop.Stopper, interval time.Duration) {
 	ctx := n.AnnotateCtx(context.Background())
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "compute-metrics", func(ctx context.Context) {
 		// Compute periodic stats at the same frequency as metrics are sampled.
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -656,7 +662,7 @@ func (n *Node) startComputePeriodicMetrics(stopper *stop.Stopper, interval time.
 				if err := n.computePeriodicMetrics(ctx, tick); err != nil {
 					log.Errorf(ctx, "failed computing periodic metrics: %s", err)
 				}
-			case <-stopper.ShouldStop():
+			case <-stopper.ShouldQuiesce():
 				return
 			}
 		}
@@ -678,13 +684,13 @@ func (n *Node) startGraphiteStatsExporter(st *cluster.Settings) {
 	ctx := logtags.AddTag(n.AnnotateCtx(context.Background()), "graphite stats exporter", nil)
 	pm := metric.MakePrometheusExporter()
 
-	n.stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = n.stopper.RunAsyncTask(ctx, "graphite-exporter", func(ctx context.Context) {
 		var timer timeutil.Timer
 		defer timer.Stop()
 		for {
 			timer.Reset(graphiteInterval.Get(&st.SV))
 			select {
-			case <-n.stopper.ShouldStop():
+			case <-n.stopper.ShouldQuiesce():
 				return
 			case <-timer.C:
 				timer.Read = true
@@ -709,7 +715,7 @@ func (n *Node) startWriteNodeStatus(frequency time.Duration) error {
 	if err := n.writeNodeStatus(ctx, 0 /* alertTTL */, false /* mustExist */); err != nil {
 		return errors.Wrap(err, "error recording initial status summaries")
 	}
-	n.stopper.RunWorker(ctx, func(ctx context.Context) {
+	return n.stopper.RunAsyncTask(ctx, "write-node-status", func(ctx context.Context) {
 		// Write a status summary immediately; this helps the UI remain
 		// responsive when new nodes are added.
 		ticker := time.NewTicker(frequency)
@@ -730,12 +736,11 @@ func (n *Node) startWriteNodeStatus(frequency time.Duration) error {
 				if err := n.writeNodeStatus(ctx, 2*frequency, true /* mustExist */); err != nil {
 					log.Warningf(ctx, "error recording status summaries: %s", err)
 				}
-			case <-n.stopper.ShouldStop():
+			case <-n.stopper.ShouldQuiesce():
 				return
 			}
 		}
 	})
-	return nil
 }
 
 // writeNodeStatus retrieves status summaries from the supplied
@@ -809,11 +814,11 @@ func (n *Node) recordJoinEvent(ctx context.Context) {
 		return
 	}
 
-	n.stopper.RunWorker(ctx, func(bgCtx context.Context) {
+	_ = n.stopper.RunAsyncTask(ctx, "record-join", func(bgCtx context.Context) {
 		ctx, span := n.AnnotateCtxWithSpan(bgCtx, "record-join-event")
 		defer span.Finish()
 		retryOpts := base.DefaultRetryOptions()
-		retryOpts.Closer = n.stopper.ShouldStop()
+		retryOpts.Closer = n.stopper.ShouldQuiesce()
 		for r := retry.Start(retryOpts); r.Next(); {
 			if err := n.storeCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 				return sql.InsertEventRecord(ctx, n.sqlExec,
@@ -821,7 +826,9 @@ func (n *Node) recordJoinEvent(ctx context.Context) {
 					int32(n.Descriptor.NodeID),
 					int32(n.Descriptor.NodeID),
 					true, /* skipExternalLog - we already call log.StructuredEvent above */
-					event)
+					event,
+					false, /* onlyLog */
+				)
 			}); err != nil {
 				log.Warningf(ctx, "%s: unable to log event %v: %v", n, event, err)
 			} else {
@@ -1025,7 +1032,7 @@ func (n *Node) ResetQuorum(
 		if txnTries > 1 {
 			log.Infof(ctx, "failed to retrieve range descriptor for r%d, retrying...", req.RangeID)
 		}
-		kvs, err := sql.ScanMetaKVs(ctx, txn, roachpb.Span{
+		kvs, err := kvclient.ScanMetaKVs(ctx, txn, roachpb.Span{
 			Key:    roachpb.KeyMin,
 			EndKey: roachpb.KeyMax,
 		})
@@ -1063,7 +1070,7 @@ func (n *Node) ResetQuorum(
 	}
 
 	// Update the range descriptor and update meta ranges for the descriptor, removing all replicas.
-	deadReplicas := append([]roachpb.ReplicaDescriptor(nil), desc.Replicas().All()...)
+	deadReplicas := append([]roachpb.ReplicaDescriptor(nil), desc.Replicas().Descriptors()...)
 	for _, rd := range deadReplicas {
 		desc.RemoveReplica(rd.NodeID, rd.StoreID)
 	}

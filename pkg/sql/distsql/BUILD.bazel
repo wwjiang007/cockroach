@@ -10,9 +10,9 @@ go_library(
         "//pkg/kv",
         "//pkg/roachpb",
         "//pkg/server/telemetry",
-        "//pkg/settings",
         "//pkg/sql/catalog/descs",
         "//pkg/sql/catalog/lease",
+        "//pkg/sql/colexec",
         "//pkg/sql/colflow",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",
@@ -37,6 +37,7 @@ go_library(
 
 go_test(
     name = "distsql_test",
+    size = "small",
     srcs = [
         "columnar_operators_test.go",
         "columnar_utils_test.go",
@@ -62,7 +63,9 @@ go_test(
         "//pkg/sql/colcontainer",
         "//pkg/sql/colexec",
         "//pkg/sql/colexec/colbuilder",
-        "//pkg/sql/colexecbase",
+        "//pkg/sql/colexec/colexecargs",
+        "//pkg/sql/colexec/colexecwindow",
+        "//pkg/sql/colexecop",
         "//pkg/sql/colflow",
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra",

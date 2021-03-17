@@ -39,6 +39,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func makeTopic(name string) tableDescriptorTopic {
+	desc := tabledesc.NewBuilder(&descpb.TableDescriptor{Name: name}).BuildImmutableTable()
+	return tableDescriptorTopic{desc}
+}
+
 func TestCloudStorageSink(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -111,7 +116,7 @@ func TestCloudStorageSink(t *testing.T) {
 	user := security.RootUserName()
 
 	t.Run(`golden`, func(t *testing.T) {
-		t1 := tabledesc.NewImmutable(descpb.TableDescriptor{Name: `t1`})
+		t1 := makeTopic(`t1`)
 		testSpan := roachpb.Span{Key: []byte("a"), EndKey: []byte("b")}
 		sf := span.MakeFrontier(testSpan)
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
@@ -146,8 +151,8 @@ func TestCloudStorageSink(t *testing.T) {
 		for _, compression := range []string{"", "gzip"} {
 			opts[changefeedbase.OptCompression] = compression
 			t.Run("compress="+compression, func(t *testing.T) {
-				t1 := tabledesc.NewImmutable(descpb.TableDescriptor{Name: `t1`})
-				t2 := tabledesc.NewImmutable(descpb.TableDescriptor{Name: `t2`})
+				t1 := makeTopic(`t1`)
+				t2 := makeTopic(`t2`)
 
 				testSpan := roachpb.Span{Key: []byte("a"), EndKey: []byte("b")}
 				sf := span.MakeFrontier(testSpan)
@@ -206,7 +211,7 @@ func TestCloudStorageSink(t *testing.T) {
 				require.True(t, sf.Forward(testSpan, ts(4)))
 				require.NoError(t, s.Flush(ctx))
 				require.NoError(t, s.EmitRow(ctx, t1, noKey, []byte(`v4`), ts(4)))
-				t1.Version = 2
+				t1.TableDesc().Version = 2
 				require.NoError(t, s.EmitRow(ctx, t1, noKey, []byte(`v5`), ts(5)))
 				require.NoError(t, s.Flush(ctx))
 				expected = []string{
@@ -222,7 +227,7 @@ func TestCloudStorageSink(t *testing.T) {
 	})
 
 	t.Run(`multi-node`, func(t *testing.T) {
-		t1 := tabledesc.NewImmutable(descpb.TableDescriptor{Name: `t1`})
+		t1 := makeTopic(`t1`)
 
 		testSpan := roachpb.Span{Key: []byte("a"), EndKey: []byte("b")}
 		sf := span.MakeFrontier(testSpan)
@@ -303,7 +308,7 @@ func TestCloudStorageSink(t *testing.T) {
 	// This test is also sufficient for verifying the behavior of a multi-node
 	// changefeed using this sink. Ditto job restarts.
 	t.Run(`zombie`, func(t *testing.T) {
-		t1 := tabledesc.NewImmutable(descpb.TableDescriptor{Name: `t1`})
+		t1 := makeTopic(`t1`)
 		testSpan := roachpb.Span{Key: []byte("a"), EndKey: []byte("b")}
 		sf := span.MakeFrontier(testSpan)
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
@@ -344,7 +349,7 @@ func TestCloudStorageSink(t *testing.T) {
 	})
 
 	t.Run(`bucketing`, func(t *testing.T) {
-		t1 := tabledesc.NewImmutable(descpb.TableDescriptor{Name: `t1`})
+		t1 := makeTopic(`t1`)
 		testSpan := roachpb.Span{Key: []byte("a"), EndKey: []byte("b")}
 		sf := span.MakeFrontier(testSpan)
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
@@ -432,7 +437,7 @@ func TestCloudStorageSink(t *testing.T) {
 	})
 
 	t.Run(`file-ordering`, func(t *testing.T) {
-		t1 := tabledesc.NewImmutable(descpb.TableDescriptor{Name: `t1`})
+		t1 := makeTopic(`t1`)
 		testSpan := roachpb.Span{Key: []byte("a"), EndKey: []byte("b")}
 		sf := span.MakeFrontier(testSpan)
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
@@ -491,7 +496,7 @@ func TestCloudStorageSink(t *testing.T) {
 	})
 
 	t.Run(`ordering-among-schema-versions`, func(t *testing.T) {
-		t1 := tabledesc.NewImmutable(descpb.TableDescriptor{Name: `t1`})
+		t1 := makeTopic(`t1`)
 		testSpan := roachpb.Span{Key: []byte("a"), EndKey: []byte("b")}
 		sf := span.MakeFrontier(testSpan)
 		timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
@@ -502,11 +507,11 @@ func TestCloudStorageSink(t *testing.T) {
 		require.NoError(t, err)
 
 		require.NoError(t, s.EmitRow(ctx, t1, noKey, []byte(`v1`), ts(1)))
-		t1.Version = 1
+		t1.TableDesc().Version = 1
 		require.NoError(t, s.EmitRow(ctx, t1, noKey, []byte(`v3`), ts(1)))
 		// Make the first file exceed its file size threshold. This should trigger a flush
 		// for the first file but not the second one.
-		t1.Version = 0
+		t1.TableDesc().Version = 0
 		require.NoError(t, s.EmitRow(ctx, t1, noKey, []byte(`trigger-flush-v1`), ts(1)))
 		require.Equal(t, []string{
 			"v1\ntrigger-flush-v1\n",
@@ -515,7 +520,7 @@ func TestCloudStorageSink(t *testing.T) {
 		// Now make the file with the newer schema exceed its file size threshold and ensure
 		// that the file with the older schema is flushed (and ordered) before.
 		require.NoError(t, s.EmitRow(ctx, t1, noKey, []byte(`v2`), ts(1)))
-		t1.Version = 1
+		t1.TableDesc().Version = 1
 		require.NoError(t, s.EmitRow(ctx, t1, noKey, []byte(`trigger-flush-v3`), ts(1)))
 		require.Equal(t, []string{
 			"v1\ntrigger-flush-v1\n",
@@ -525,7 +530,7 @@ func TestCloudStorageSink(t *testing.T) {
 
 		// Calling `Flush()` on the sink should emit files in the order of their schema IDs.
 		require.NoError(t, s.EmitRow(ctx, t1, noKey, []byte(`w1`), ts(1)))
-		t1.Version = 0
+		t1.TableDesc().Version = 0
 		require.NoError(t, s.EmitRow(ctx, t1, noKey, []byte(`x1`), ts(1)))
 		require.NoError(t, s.Flush(ctx))
 		require.Equal(t, []string{

@@ -83,7 +83,10 @@ func avroUnionKey(t avroSchemaType) string {
 	case avroLogicalType:
 		return avroUnionKey(s.SchemaType) + `.` + s.LogicalType
 	case *avroRecord:
-		return s.Name
+		if s.Namespace == "" {
+			return s.Name
+		}
+		return s.Namespace + `.` + s.Name
 	default:
 		panic(errors.AssertionFailedf(`unsupported type %T %v`, t, t))
 	}
@@ -96,6 +99,7 @@ type avroSchemaField struct {
 	Name       string         `json:"name"`
 	Default    *string        `json:"default"`
 	Metadata   string         `json:"__crdb__,omitempty"`
+	Namespace  string         `json:"namespace,omitempty"`
 
 	typ *types.T
 
@@ -109,6 +113,7 @@ type avroRecord struct {
 	SchemaType string             `json:"type"`
 	Name       string             `json:"name"`
 	Fields     []*avroSchemaField `json:"fields"`
+	Namespace  string             `json:"namespace,omitempty"`
 	codec      *goavro.Codec
 }
 
@@ -299,27 +304,41 @@ func columnDescToAvroSchema(colDesc *descpb.ColumnDescriptor) (*avroSchemaField,
 			return nil, errors.Errorf(
 				`column %s: decimal with no precision not yet supported with avro`, colDesc.Name)
 		}
+		width := int(colDesc.Type.Width())
+		prec := int(colDesc.Type.Precision())
 		avroType = avroLogicalType{
 			SchemaType:  avroSchemaBytes,
 			LogicalType: `decimal`,
-			Precision:   int(colDesc.Type.Precision()),
-			Scale:       int(colDesc.Type.Width()),
+			Precision:   prec,
+			Scale:       width,
 		}
 		schema.encodeFn = func(d tree.Datum) (interface{}, error) {
 			dec := d.(*tree.DDecimal).Decimal
+
+			// If the decimal happens to fit a smaller width than the
+			// column allows, add trailing zeroes so the scale is constant
+			if colDesc.Type.Width() > -dec.Exponent {
+				_, err := tree.DecimalCtx.WithPrecision(uint32(prec)).Quantize(&dec, &dec, -int32(width))
+				if err != nil {
+					// This should always be possible without rounding since we're using the column def,
+					// but if it's not, WithPrecision will force it to error.
+					return nil, err
+				}
+			}
+
 			// TODO(dan): For the cases that the avro defined decimal format
 			// would not roundtrip, serialize the decimal as a string. Also
 			// support the unspecified precision/scale case in this branch. We
 			// can't currently do this without surgery to the avro library we're
 			// using and that's too scary leading up to 2.1.0.
-			rat, err := decimalToRat(dec, colDesc.Type.Width())
+			rat, err := decimalToRat(dec, int32(width))
 			if err != nil {
 				return nil, err
 			}
 			return &rat, nil
 		}
 		schema.decodeFn = func(x interface{}) (tree.Datum, error) {
-			return &tree.DDecimal{Decimal: ratToDecimal(*x.(*big.Rat), colDesc.Type.Width())}, nil
+			return &tree.DDecimal{Decimal: ratToDecimal(*x.(*big.Rat), int32(width))}, nil
 		}
 	case types.UuidFamily:
 		// Should be logical type of "uuid", but the avro library doesn't support
@@ -388,25 +407,30 @@ func columnDescToAvroSchema(colDesc *descpb.ColumnDescriptor) (*avroSchemaField,
 
 // indexToAvroSchema converts a column descriptor into its corresponding avro
 // record schema. The fields are kept in the same order as columns in the index.
+// sqlName can be any string but should uniquely identify a schema.
 func indexToAvroSchema(
-	tableDesc catalog.TableDescriptor, indexDesc *descpb.IndexDescriptor,
+	tableDesc catalog.TableDescriptor,
+	indexDesc *descpb.IndexDescriptor,
+	sqlName string,
+	namespace string,
 ) (*avroDataRecord, error) {
 	schema := &avroDataRecord{
 		avroRecord: avroRecord{
-			Name:       SQLNameToAvroName(tableDesc.GetName()),
+			Name:       SQLNameToAvroName(sqlName),
 			SchemaType: `record`,
+			Namespace:  namespace,
 		},
 		fieldIdxByName:   make(map[string]int),
 		colIdxByFieldIdx: make(map[int]int),
 	}
-	colIdxByID := tableDesc.ColumnIdxMap()
+	colIdxByID := catalog.ColumnIDToOrdinalMap(tableDesc.PublicColumns())
 	for _, colID := range indexDesc.ColumnIDs {
 		colIdx, ok := colIdxByID.Get(colID)
 		if !ok {
 			return nil, errors.Errorf(`unknown column id: %d`, colID)
 		}
-		col := tableDesc.GetColumnAtIdx(colIdx)
-		field, err := columnDescToAvroSchema(col)
+		col := tableDesc.PublicColumns()[colIdx]
+		field, err := columnDescToAvroSchema(col.ColumnDesc())
 		if err != nil {
 			return nil, err
 		}
@@ -436,7 +460,7 @@ const (
 // If a name suffix is provided (as opposed to avroSchemaNoSuffix), it will be
 // appended to the end of the avro record's name.
 func tableToAvroSchema(
-	tableDesc catalog.TableDescriptor, nameSuffix string,
+	tableDesc catalog.TableDescriptor, nameSuffix string, namespace string,
 ) (*avroDataRecord, error) {
 	name := SQLNameToAvroName(tableDesc.GetName())
 	if nameSuffix != avroSchemaNoSuffix {
@@ -446,17 +470,17 @@ func tableToAvroSchema(
 		avroRecord: avroRecord{
 			Name:       name,
 			SchemaType: `record`,
+			Namespace:  namespace,
 		},
 		fieldIdxByName:   make(map[string]int),
 		colIdxByFieldIdx: make(map[int]int),
 	}
-	for colIdx := range tableDesc.GetPublicColumns() {
-		col := tableDesc.GetColumnAtIdx(colIdx)
-		field, err := columnDescToAvroSchema(col)
+	for _, col := range tableDesc.PublicColumns() {
+		field, err := columnDescToAvroSchema(col.ColumnDesc())
 		if err != nil {
 			return nil, err
 		}
-		schema.colIdxByFieldIdx[len(schema.Fields)] = colIdx
+		schema.colIdxByFieldIdx[len(schema.Fields)] = col.Ordinal()
 		schema.fieldIdxByName[field.Name] = len(schema.Fields)
 		schema.Fields = append(schema.Fields, field)
 	}
@@ -553,12 +577,13 @@ func (r *avroDataRecord) rowFromNative(native interface{}) (rowenc.EncDatumRow, 
 // envelopeToAvroSchema creates an avro record schema for an envelope containing
 // before and after versions of a row change and metadata about that row change.
 func envelopeToAvroSchema(
-	topic string, opts avroEnvelopeOpts, before, after *avroDataRecord,
+	topic string, opts avroEnvelopeOpts, before, after *avroDataRecord, namespace string,
 ) (*avroEnvelopeRecord, error) {
 	schema := &avroEnvelopeRecord{
 		avroRecord: avroRecord{
 			Name:       SQLNameToAvroName(topic) + `_envelope`,
 			SchemaType: `record`,
+			Namespace:  namespace,
 		},
 		opts: opts,
 	}

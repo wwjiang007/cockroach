@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "geomfn",
     srcs = [
+        "add_measure.go",
         "affine_transforms.go",
         "angle.go",
         "azimuth.go",
@@ -15,6 +16,7 @@ go_library(
         "envelope.go",
         "flip_coordinates.go",
         "force_layout.go",
+        "generate_points.go",
         "geomfn.go",
         "linear_reference.go",
         "linestring.go",
@@ -24,6 +26,8 @@ go_library(
         "remove_repeated_points.go",
         "reverse.go",
         "segmentize.go",
+        "shift_longitude.go",
+        "snap.go",
         "snap_to_grid.go",
         "subdivide.go",
         "swap_ordinates.go",
@@ -54,7 +58,9 @@ go_library(
 
 go_test(
     name = "geomfn_test",
+    size = "small",
     srcs = [
+        "add_measure_test.go",
         "affine_transforms_test.go",
         "angle_test.go",
         "azimuth_test.go",
@@ -66,6 +72,7 @@ go_test(
         "envelope_test.go",
         "flip_coordinates_test.go",
         "force_layout_test.go",
+        "generate_points_test.go",
         "geomfn_test.go",
         "linear_reference_test.go",
         "linestring_test.go",
@@ -75,6 +82,8 @@ go_test(
         "remove_repeated_points_test.go",
         "reverse_test.go",
         "segmentize_test.go",
+        "shift_longitude_test.go",
+        "snap_test.go",
         "snap_to_grid_test.go",
         "subdivide_test.go",
         "swap_ordinates_test.go",
@@ -85,6 +94,7 @@ go_test(
         "voronoi_test.go",
     ],
     embed = [":geomfn"],
+    tags = ["broken_in_bazel"],
     deps = [
         "//pkg/geo",
         "//pkg/geo/geopb",

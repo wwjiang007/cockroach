@@ -39,6 +39,7 @@ go_library(
 
 go_test(
     name = "opt_test",
+    size = "small",
     srcs = [
         "colset_test.go",
         "metadata_test.go",
@@ -47,7 +48,6 @@ go_test(
     ],
     embed = [":opt"],
     deps = [
-        "//pkg/sql/opt",
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/memo",
         "//pkg/sql/opt/testutils/testcat",
@@ -104,9 +104,15 @@ genrule(
         ":gen-rulenames",
     ],
     outs = ["rule_name_string.go"],
+    # golang.org/x/tools executes commands via
+    # golang.org/x/sys/execabs which requires all PATH lookups to
+    # result in absolute paths. To account for this, we resolve the
+    # relative path returned by location to an absolute path.
     cmd = """
       cp $(location rule_name.go) `dirname $(location :gen-rulenames)`/rule_name.go
-      env PATH=`dirname $(location @go_sdk//:bin/go)` HOME=$(GENDIR) \
+      GO_REL_PATH=`dirname $(location @go_sdk//:bin/go)`
+      GO_ABS_PATH=`cd $$GO_REL_PATH && pwd`
+      env PATH=$$GO_ABS_PATH HOME=$(GENDIR) \
       $(location @org_golang_x_tools//cmd/stringer:stringer) -output=$@ \
       -type=RuleName `dirname $(location :gen-rulenames)`/rule_name.go $(location :gen-rulenames)
     """,

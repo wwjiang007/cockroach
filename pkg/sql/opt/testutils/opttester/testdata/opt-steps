@@ -55,7 +55,7 @@ SELECT * FROM ab WHERE b=1
 ----
 ================================================================================
 Initial expression
-  Cost: 1064.15
+  Cost: 1074.64
 ================================================================================
   project
    ├── columns: a:1(int!null) b:2(int!null)
@@ -75,7 +75,7 @@ Initial expression
                   └── const: 1 [type=int]
 ================================================================================
 PruneSelectCols
-  Cost: 1054.15
+  Cost: 1064.54
 ================================================================================
    project
     ├── columns: a:1(int!null) b:2(int!null)
@@ -99,7 +99,7 @@ PruneSelectCols
                    └── const: 1 [type=int]
 ================================================================================
 EliminateProject
-  Cost: 1054.04
+  Cost: 1064.43
 ================================================================================
   -project
   +select
@@ -208,7 +208,7 @@ SELECT * FROM orders LEFT JOIN customers ON customer_id = customers.id
 ----
 ================================================================================
 Initial expression
-  Cost: 2198.07
+  Cost: 2219.45
 ================================================================================
   project
    ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:5(int) name:6(string) address:7(string)
@@ -240,7 +240,7 @@ Initial expression
                   └── variable: customers.id:5 [type=int]
 ================================================================================
 NormalizeInConst
-  Cost: 2198.07
+  Cost: 2219.45
 ================================================================================
    project
     ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:5(int) name:6(string) address:7(string)
@@ -274,7 +274,7 @@ NormalizeInConst
                    └── variable: customers.id:5 [type=int]
 ================================================================================
 PruneJoinLeftCols
-  Cost: 2188.07
+  Cost: 2209.35
 ================================================================================
    project
     ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:5(int) name:6(string) address:7(string)
@@ -310,7 +310,7 @@ PruneJoinLeftCols
                    └── variable: customers.id:5 [type=int]
 ================================================================================
 PruneJoinRightCols
-  Cost: 2178.07
+  Cost: 2199.25
 ================================================================================
    project
     ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:5(int) name:6(string) address:7(string)
@@ -346,7 +346,7 @@ PruneJoinRightCols
                    └── variable: customers.id:5 [type=int]
 ================================================================================
 EliminateProject
-  Cost: 2168.06
+  Cost: 2189.24
 ================================================================================
   -project
   +left-join (hash)
@@ -473,6 +473,127 @@ GenerateLookupJoins (higher cost)
   -           └── variable: customers.id:5 [type=int]
   + └── filters (true)
 --------------------------------------------------------------------------------
+CommuteLeftJoin (higher cost)
+--------------------------------------------------------------------------------
+  -left-join (lookup customers)
+  +right-join (hash)
+    ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:5(int) name:6(string) address:7(string)
+  - ├── key columns: [2] = [5]
+  - ├── lookup columns are key
+    ├── key: (1)
+    ├── fd: (1)-->(2,3,5-7), (5)-->(6,7)
+  + ├── scan customers
+  + │    ├── columns: customers.id:5(int!null) name:6(string!null) address:7(string)
+  + │    ├── key: (5)
+  + │    └── fd: (5)-->(6,7)
+    ├── scan orders
+    │    ├── columns: orders.id:1(int!null) customer_id:2(int) status:3(string!null)
+    │    ├── check constraint expressions
+    │    │    └── in [type=bool, outer=(3), constraints=(/3: [/'cancelled' - /'cancelled'] [/'complete' - /'complete'] [/'open' - /'open']; tight)]
+    │    │         ├── variable: status:3 [type=string]
+    │    │         └── tuple [type=tuple{string, string, string}]
+    │    │              ├── const: 'cancelled' [type=string]
+    │    │              ├── const: 'complete' [type=string]
+    │    │              └── const: 'open' [type=string]
+    │    ├── key: (1)
+    │    └── fd: (1)-->(2,3)
+  - └── filters (true)
+  + └── filters
+  +      └── eq [type=bool, outer=(2,5), constraints=(/2: (/NULL - ]; /5: (/NULL - ]), fd=(2)==(5), (5)==(2)]
+  +           ├── variable: customer_id:2 [type=int]
+  +           └── variable: customers.id:5 [type=int]
+--------------------------------------------------------------------------------
+GenerateMergeJoins (higher cost)
+--------------------------------------------------------------------------------
+  -right-join (hash)
+  +left-join (merge)
+    ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:5(int) name:6(string) address:7(string)
+  + ├── left ordering: +2
+  + ├── right ordering: +5
+    ├── key: (1)
+    ├── fd: (1)-->(2,3,5-7), (5)-->(6,7)
+  + ├── sort
+  + │    ├── columns: orders.id:1(int!null) customer_id:2(int) status:3(string!null)
+  + │    ├── key: (1)
+  + │    ├── fd: (1)-->(2,3)
+  + │    ├── ordering: +2
+  + │    └── scan orders
+  + │         ├── columns: orders.id:1(int!null) customer_id:2(int) status:3(string!null)
+  + │         ├── check constraint expressions
+  + │         │    └── in [type=bool, outer=(3), constraints=(/3: [/'cancelled' - /'cancelled'] [/'complete' - /'complete'] [/'open' - /'open']; tight)]
+  + │         │         ├── variable: status:3 [type=string]
+  + │         │         └── tuple [type=tuple{string, string, string}]
+  + │         │              ├── const: 'cancelled' [type=string]
+  + │         │              ├── const: 'complete' [type=string]
+  + │         │              └── const: 'open' [type=string]
+  + │         ├── key: (1)
+  + │         └── fd: (1)-->(2,3)
+    ├── scan customers
+    │    ├── columns: customers.id:5(int!null) name:6(string!null) address:7(string)
+    │    ├── key: (5)
+  - │    └── fd: (5)-->(6,7)
+  - ├── scan orders
+  - │    ├── columns: orders.id:1(int!null) customer_id:2(int) status:3(string!null)
+  - │    ├── check constraint expressions
+  - │    │    └── in [type=bool, outer=(3), constraints=(/3: [/'cancelled' - /'cancelled'] [/'complete' - /'complete'] [/'open' - /'open']; tight)]
+  - │    │         ├── variable: status:3 [type=string]
+  - │    │         └── tuple [type=tuple{string, string, string}]
+  - │    │              ├── const: 'cancelled' [type=string]
+  - │    │              ├── const: 'complete' [type=string]
+  - │    │              └── const: 'open' [type=string]
+  - │    ├── key: (1)
+  - │    └── fd: (1)-->(2,3)
+  - └── filters
+  -      └── eq [type=bool, outer=(2,5), constraints=(/2: (/NULL - ]; /5: (/NULL - ]), fd=(2)==(5), (5)==(2)]
+  -           ├── variable: customer_id:2 [type=int]
+  -           └── variable: customers.id:5 [type=int]
+  + │    ├── fd: (5)-->(6,7)
+  + │    └── ordering: +5
+  + └── filters (true)
+--------------------------------------------------------------------------------
+GenerateLookupJoins (higher cost)
+--------------------------------------------------------------------------------
+  -left-join (merge)
+  +left-join (lookup customers)
+    ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:5(int) name:6(string) address:7(string)
+  - ├── left ordering: +2
+  - ├── right ordering: +5
+  + ├── key columns: [2] = [5]
+  + ├── lookup columns are key
+    ├── key: (1)
+    ├── fd: (1)-->(2,3,5-7), (5)-->(6,7)
+  - ├── sort
+  + ├── scan orders
+    │    ├── columns: orders.id:1(int!null) customer_id:2(int) status:3(string!null)
+  + │    ├── check constraint expressions
+  + │    │    └── in [type=bool, outer=(3), constraints=(/3: [/'cancelled' - /'cancelled'] [/'complete' - /'complete'] [/'open' - /'open']; tight)]
+  + │    │         ├── variable: status:3 [type=string]
+  + │    │         └── tuple [type=tuple{string, string, string}]
+  + │    │              ├── const: 'cancelled' [type=string]
+  + │    │              ├── const: 'complete' [type=string]
+  + │    │              └── const: 'open' [type=string]
+    │    ├── key: (1)
+  - │    ├── fd: (1)-->(2,3)
+  - │    ├── ordering: +2
+  - │    └── scan orders
+  - │         ├── columns: orders.id:1(int!null) customer_id:2(int) status:3(string!null)
+  - │         ├── check constraint expressions
+  - │         │    └── in [type=bool, outer=(3), constraints=(/3: [/'cancelled' - /'cancelled'] [/'complete' - /'complete'] [/'open' - /'open']; tight)]
+  - │         │         ├── variable: status:3 [type=string]
+  - │         │         └── tuple [type=tuple{string, string, string}]
+  - │         │              ├── const: 'cancelled' [type=string]
+  - │         │              ├── const: 'complete' [type=string]
+  - │         │              └── const: 'open' [type=string]
+  - │         ├── key: (1)
+  - │         └── fd: (1)-->(2,3)
+  - ├── scan customers
+  - │    ├── columns: customers.id:5(int!null) name:6(string!null) address:7(string)
+  - │    ├── key: (5)
+  - │    ├── fd: (5)-->(6,7)
+  - │    └── ordering: +5
+  + │    └── fd: (1)-->(2,3)
+    └── filters (true)
+--------------------------------------------------------------------------------
 GenerateMergeJoins (higher cost)
 --------------------------------------------------------------------------------
   -left-join (lookup customers)
@@ -515,9 +636,12 @@ GenerateMergeJoins (higher cost)
   + │         ├── key: (1)
   + │         └── fd: (1)-->(2,3)
     └── filters (true)
+--------------------------------------------------------------------------------
+GenerateMergeJoins (no changes)
+--------------------------------------------------------------------------------
 ================================================================================
 Final best expression
-  Cost: 2168.06
+  Cost: 2189.24
 ================================================================================
   left-join (hash)
    ├── columns: id:1(int!null) customer_id:2(int) status:3(string!null) id:5(int) name:6(string) address:7(string)
@@ -560,15 +684,15 @@ SELECT * FROM comp WHERE k=1
 ----
 ================================================================================
 Initial expression
-  Cost: 1084.15
+  Cost: 1094.84
 ================================================================================
   project
    ├── columns: k:1(int!null) c:2(bool)
-   ├── fd: ()-->(1)
+   ├── fd: ()-->(1,2)
    └── select
         ├── columns: k:1(int!null) c:2(bool) rowid:3(int!null) crdb_internal_mvcc_timestamp:4(decimal)
         ├── key: (3)
-        ├── fd: ()-->(1), (3)-->(2,4)
+        ├── fd: ()-->(1,2), (3)-->(4)
         ├── scan comp
         │    ├── columns: k:1(int) c:2(bool) rowid:3(int!null) crdb_internal_mvcc_timestamp:4(decimal)
         │    ├── computed column expressions
@@ -580,22 +704,22 @@ Initial expression
         │    │                   ├── const: 3 [type=int]
         │    │                   └── const: 2 [type=int]
         │    ├── key: (3)
-        │    └── fd: (3)-->(1,2,4)
+        │    └── fd: (3)-->(1,2,4), (1)-->(2)
         └── filters
              └── eq [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
                   ├── variable: k:1 [type=int]
                   └── const: 1 [type=int]
 ================================================================================
 NormalizeInConst
-  Cost: 1084.15
+  Cost: 1094.84
 ================================================================================
    project
     ├── columns: k:1(int!null) c:2(bool)
-    ├── fd: ()-->(1)
+    ├── fd: ()-->(1,2)
     └── select
          ├── columns: k:1(int!null) c:2(bool) rowid:3(int!null) crdb_internal_mvcc_timestamp:4(decimal)
          ├── key: (3)
-         ├── fd: ()-->(1), (3)-->(2,4)
+         ├── fd: ()-->(1,2), (3)-->(4)
          ├── scan comp
          │    ├── columns: k:1(int) c:2(bool) rowid:3(int!null) crdb_internal_mvcc_timestamp:4(decimal)
          │    ├── computed column expressions
@@ -609,26 +733,55 @@ NormalizeInConst
   +      │    │                   ├── const: 2 [type=int]
   +      │    │                   └── const: 3 [type=int]
          │    ├── key: (3)
-         │    └── fd: (3)-->(1,2,4)
+         │    └── fd: (3)-->(1,2,4), (1)-->(2)
          └── filters
               └── eq [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
                    ├── variable: k:1 [type=int]
                    └── const: 1 [type=int]
 ================================================================================
 PruneSelectCols
-  Cost: 1064.15
+  Cost: 1074.64
 ================================================================================
    project
     ├── columns: k:1(int!null) c:2(bool)
-    ├── fd: ()-->(1)
+    ├── fd: ()-->(1,2)
     └── select
   -      ├── columns: k:1(int!null) c:2(bool) rowid:3(int!null) crdb_internal_mvcc_timestamp:4(decimal)
   -      ├── key: (3)
-  -      ├── fd: ()-->(1), (3)-->(2,4)
+  -      ├── fd: ()-->(1,2), (3)-->(4)
   +      ├── columns: k:1(int!null) c:2(bool)
-  +      ├── fd: ()-->(1)
+  +      ├── fd: ()-->(1,2)
          ├── scan comp
   -      │    ├── columns: k:1(int) c:2(bool) rowid:3(int!null) crdb_internal_mvcc_timestamp:4(decimal)
+  +      │    ├── columns: k:1(int) c:2(bool)
+         │    ├── computed column expressions
+         │    │    └── c:2
+         │    │         └── in [type=bool]
+         │    │              ├── variable: k:1 [type=int]
+         │    │              └── tuple [type=tuple{int, int, int}]
+         │    │                   ├── const: 1 [type=int]
+         │    │                   ├── const: 2 [type=int]
+         │    │                   └── const: 3 [type=int]
+  -      │    ├── key: (3)
+  -      │    └── fd: (3)-->(1,2,4), (1)-->(2)
+  +      │    └── fd: (1)-->(2)
+         └── filters
+              └── eq [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
+                   ├── variable: k:1 [type=int]
+                   └── const: 1 [type=int]
+================================================================================
+EliminateProject
+  Cost: 1074.53
+================================================================================
+  -project
+  +select
+    ├── columns: k:1(int!null) c:2(bool)
+    ├── fd: ()-->(1,2)
+  - └── select
+  -      ├── columns: k:1(int!null) c:2(bool)
+  -      ├── fd: ()-->(1,2)
+  -      ├── scan comp
+  -      │    ├── columns: k:1(int) c:2(bool)
   -      │    ├── computed column expressions
   -      │    │    └── c:2
   -      │    │         └── in [type=bool]
@@ -637,56 +790,22 @@ PruneSelectCols
   -      │    │                   ├── const: 1 [type=int]
   -      │    │                   ├── const: 2 [type=int]
   -      │    │                   └── const: 3 [type=int]
-  -      │    ├── key: (3)
-  -      │    └── fd: (3)-->(1,2,4)
-  +      │    ├── columns: k:1(int) c:2(bool)
-  +      │    └── computed column expressions
-  +      │         └── c:2
-  +      │              └── in [type=bool]
-  +      │                   ├── variable: k:1 [type=int]
-  +      │                   └── tuple [type=tuple{int, int, int}]
-  +      │                        ├── const: 1 [type=int]
-  +      │                        ├── const: 2 [type=int]
-  +      │                        └── const: 3 [type=int]
-         └── filters
-              └── eq [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
-                   ├── variable: k:1 [type=int]
-                   └── const: 1 [type=int]
-================================================================================
-EliminateProject
-  Cost: 1064.04
-================================================================================
-  -project
-  +select
-    ├── columns: k:1(int!null) c:2(bool)
-    ├── fd: ()-->(1)
-  - └── select
-  -      ├── columns: k:1(int!null) c:2(bool)
-  -      ├── fd: ()-->(1)
-  -      ├── scan comp
-  -      │    ├── columns: k:1(int) c:2(bool)
-  -      │    └── computed column expressions
-  -      │         └── c:2
-  -      │              └── in [type=bool]
-  -      │                   ├── variable: k:1 [type=int]
-  -      │                   └── tuple [type=tuple{int, int, int}]
-  -      │                        ├── const: 1 [type=int]
-  -      │                        ├── const: 2 [type=int]
-  -      │                        └── const: 3 [type=int]
+  -      │    └── fd: (1)-->(2)
   -      └── filters
   -           └── eq [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
   -                ├── variable: k:1 [type=int]
   -                └── const: 1 [type=int]
   + ├── scan comp
   + │    ├── columns: k:1(int) c:2(bool)
-  + │    └── computed column expressions
-  + │         └── c:2
-  + │              └── in [type=bool]
-  + │                   ├── variable: k:1 [type=int]
-  + │                   └── tuple [type=tuple{int, int, int}]
-  + │                        ├── const: 1 [type=int]
-  + │                        ├── const: 2 [type=int]
-  + │                        └── const: 3 [type=int]
+  + │    ├── computed column expressions
+  + │    │    └── c:2
+  + │    │         └── in [type=bool]
+  + │    │              ├── variable: k:1 [type=int]
+  + │    │              └── tuple [type=tuple{int, int, int}]
+  + │    │                   ├── const: 1 [type=int]
+  + │    │                   ├── const: 2 [type=int]
+  + │    │                   └── const: 3 [type=int]
+  + │    └── fd: (1)-->(2)
   + └── filters
   +      └── eq [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
   +           ├── variable: k:1 [type=int]
@@ -696,19 +815,19 @@ GenerateIndexScans (higher cost)
 --------------------------------------------------------------------------------
    select
     ├── columns: k:1(int!null) c:2(bool)
-    ├── fd: ()-->(1)
+    ├── fd: ()-->(1,2)
   - ├── scan comp
-  - │    ├── columns: k:1(int) c:2(bool)
-  - │    └── computed column expressions
-  - │         └── c:2
-  - │              └── in [type=bool]
-  - │                   ├── variable: k:1 [type=int]
-  - │                   └── tuple [type=tuple{int, int, int}]
-  - │                        ├── const: 1 [type=int]
-  - │                        ├── const: 2 [type=int]
-  - │                        └── const: 3 [type=int]
   + ├── scan comp@secondary
-  + │    └── columns: k:1(int) c:2(bool)
+    │    ├── columns: k:1(int) c:2(bool)
+  - │    ├── computed column expressions
+  - │    │    └── c:2
+  - │    │         └── in [type=bool]
+  - │    │              ├── variable: k:1 [type=int]
+  - │    │              └── tuple [type=tuple{int, int, int}]
+  - │    │                   ├── const: 1 [type=int]
+  - │    │                   ├── const: 2 [type=int]
+  - │    │                   └── const: 3 [type=int]
+    │    └── fd: (1)-->(2)
     └── filters
          └── eq [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
               ├── variable: k:1 [type=int]
@@ -726,23 +845,24 @@ FoldComparison
   -select
   +scan comp@secondary
     ├── columns: k:1(int!null) c:2(bool)
-  - ├── fd: ()-->(1)
+  - ├── fd: ()-->(1,2)
   - ├── scan comp
   - │    ├── columns: k:1(int) c:2(bool)
-  - │    └── computed column expressions
-  - │         └── c:2
-  - │              └── in [type=bool]
-  - │                   ├── variable: k:1 [type=int]
-  - │                   └── tuple [type=tuple{int, int, int}]
-  - │                        ├── const: 1 [type=int]
-  - │                        ├── const: 2 [type=int]
-  - │                        └── const: 3 [type=int]
+  - │    ├── computed column expressions
+  - │    │    └── c:2
+  - │    │         └── in [type=bool]
+  - │    │              ├── variable: k:1 [type=int]
+  - │    │              └── tuple [type=tuple{int, int, int}]
+  - │    │                   ├── const: 1 [type=int]
+  - │    │                   ├── const: 2 [type=int]
+  - │    │                   └── const: 3 [type=int]
+  - │    └── fd: (1)-->(2)
   - └── filters
   -      └── eq [type=bool, outer=(1), constraints=(/1: [/1 - /1]; tight), fd=()-->(1)]
   -           ├── variable: k:1 [type=int]
   -           └── const: 1 [type=int]
   + ├── constraint: /2/1/3: [/true/1 - /true/1]
-  + └── fd: ()-->(1)
+  + └── fd: ()-->(1,2)
 --------------------------------------------------------------------------------
 GenerateZigzagJoins (no changes)
 --------------------------------------------------------------------------------
@@ -753,6 +873,368 @@ Final best expression
   scan comp@secondary
    ├── columns: k:1(int!null) c:2(bool)
    ├── constraint: /2/1/3: [/true/1 - /true/1]
+   └── fd: ()-->(1,2)
+
+exec-ddl
+CREATE TABLE t (i INT)
+----
+
+# Verify that CheckExpr is not run during optsteps in order to prevent crashing
+# on a partially normalized expressions. CheckExpr would cause a crash in this
+# test because the RangeExpr in the InlineConstVar step does not have tight
+# constraints.
+optsteps
+SELECT i FROM (SELECT i FROM t WHERE i > 10 AND i < 20) AS t2 WHERE i = 5
+----
+================================================================================
+Initial expression
+  Cost: 1076.36
+================================================================================
+  select
+   ├── columns: i:1(int!null)
+   ├── fd: ()-->(1)
+   ├── project
+   │    ├── columns: i:1(int!null)
+   │    └── select
+   │         ├── columns: i:1(int!null) rowid:2(int!null) crdb_internal_mvcc_timestamp:3(decimal)
+   │         ├── key: (2)
+   │         ├── fd: (2)-->(1,3)
+   │         ├── scan t
+   │         │    ├── columns: i:1(int) rowid:2(int!null) crdb_internal_mvcc_timestamp:3(decimal)
+   │         │    ├── key: (2)
+   │         │    └── fd: (2)-->(1,3)
+   │         └── filters
+   │              └── and [type=bool, outer=(1), constraints=(/1: [/11 - /19]; tight)]
+   │                   ├── gt [type=bool]
+   │                   │    ├── variable: i:1 [type=int]
+   │                   │    └── const: 10 [type=int]
+   │                   └── lt [type=bool]
+   │                        ├── variable: i:1 [type=int]
+   │                        └── const: 20 [type=int]
+   └── filters
+        └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+             ├── variable: i:1 [type=int]
+             └── const: 5 [type=int]
+================================================================================
+SimplifySelectFilters
+  Cost: 1081.24
+================================================================================
+   select
+    ├── columns: i:1(int!null)
+    ├── fd: ()-->(1)
+    ├── project
+    │    ├── columns: i:1(int!null)
+    │    └── select
+    │         ├── columns: i:1(int!null) rowid:2(int!null) crdb_internal_mvcc_timestamp:3(decimal)
+    │         ├── key: (2)
+    │         ├── fd: (2)-->(1,3)
+    │         ├── scan t
+    │         │    ├── columns: i:1(int) rowid:2(int!null) crdb_internal_mvcc_timestamp:3(decimal)
+    │         │    ├── key: (2)
+    │         │    └── fd: (2)-->(1,3)
+    │         └── filters
+  - │              └── and [type=bool, outer=(1), constraints=(/1: [/11 - /19]; tight)]
+  - │                   ├── gt [type=bool]
+  - │                   │    ├── variable: i:1 [type=int]
+  - │                   │    └── const: 10 [type=int]
+  - │                   └── lt [type=bool]
+  - │                        ├── variable: i:1 [type=int]
+  - │                        └── const: 20 [type=int]
+  + │              ├── gt [type=bool, outer=(1), constraints=(/1: [/11 - ]; tight)]
+  + │              │    ├── variable: i:1 [type=int]
+  + │              │    └── const: 10 [type=int]
+  + │              └── lt [type=bool, outer=(1), constraints=(/1: (/NULL - /19]; tight)]
+  + │                   ├── variable: i:1 [type=int]
+  + │                   └── const: 20 [type=int]
+    └── filters
+         └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+              ├── variable: i:1 [type=int]
+              └── const: 5 [type=int]
+================================================================================
+ConsolidateSelectFilters
+  Cost: 1076.36
+================================================================================
+   select
+    ├── columns: i:1(int!null)
+    ├── fd: ()-->(1)
+    ├── project
+    │    ├── columns: i:1(int!null)
+    │    └── select
+    │         ├── columns: i:1(int!null) rowid:2(int!null) crdb_internal_mvcc_timestamp:3(decimal)
+    │         ├── key: (2)
+    │         ├── fd: (2)-->(1,3)
+    │         ├── scan t
+    │         │    ├── columns: i:1(int) rowid:2(int!null) crdb_internal_mvcc_timestamp:3(decimal)
+    │         │    ├── key: (2)
+    │         │    └── fd: (2)-->(1,3)
+    │         └── filters
+  - │              ├── gt [type=bool, outer=(1), constraints=(/1: [/11 - ]; tight)]
+  - │              │    ├── variable: i:1 [type=int]
+  - │              │    └── const: 10 [type=int]
+  - │              └── lt [type=bool, outer=(1), constraints=(/1: (/NULL - /19]; tight)]
+  - │                   ├── variable: i:1 [type=int]
+  - │                   └── const: 20 [type=int]
+  + │              └── range [type=bool, outer=(1), constraints=(/1: [/11 - /19]; tight)]
+  + │                   └── and [type=bool]
+  + │                        ├── gt [type=bool]
+  + │                        │    ├── variable: i:1 [type=int]
+  + │                        │    └── const: 10 [type=int]
+  + │                        └── lt [type=bool]
+  + │                             ├── variable: i:1 [type=int]
+  + │                             └── const: 20 [type=int]
+    └── filters
+         └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+              ├── variable: i:1 [type=int]
+              └── const: 5 [type=int]
+================================================================================
+PruneSelectCols
+  Cost: 1056.16
+================================================================================
+   select
+    ├── columns: i:1(int!null)
+    ├── fd: ()-->(1)
+    ├── project
+    │    ├── columns: i:1(int!null)
+    │    └── select
+  - │         ├── columns: i:1(int!null) rowid:2(int!null) crdb_internal_mvcc_timestamp:3(decimal)
+  - │         ├── key: (2)
+  - │         ├── fd: (2)-->(1,3)
+  + │         ├── columns: i:1(int!null)
+    │         ├── scan t
+  - │         │    ├── columns: i:1(int) rowid:2(int!null) crdb_internal_mvcc_timestamp:3(decimal)
+  - │         │    ├── key: (2)
+  - │         │    └── fd: (2)-->(1,3)
+  + │         │    └── columns: i:1(int)
+    │         └── filters
+    │              └── range [type=bool, outer=(1), constraints=(/1: [/11 - /19]; tight)]
+    │                   └── and [type=bool]
+    │                        ├── gt [type=bool]
+    │                        │    ├── variable: i:1 [type=int]
+    │                        │    └── const: 10 [type=int]
+    │                        └── lt [type=bool]
+    │                             ├── variable: i:1 [type=int]
+    │                             └── const: 20 [type=int]
+    └── filters
+         └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+              ├── variable: i:1 [type=int]
+              └── const: 5 [type=int]
+================================================================================
+EliminateProject
+  Cost: 1055.25
+================================================================================
+   select
+    ├── columns: i:1(int!null)
+    ├── fd: ()-->(1)
+  - ├── project
+  + ├── select
+    │    ├── columns: i:1(int!null)
+  - │    └── select
+  - │         ├── columns: i:1(int!null)
+  - │         ├── scan t
+  - │         │    └── columns: i:1(int)
+  - │         └── filters
+  - │              └── range [type=bool, outer=(1), constraints=(/1: [/11 - /19]; tight)]
+  - │                   └── and [type=bool]
+  - │                        ├── gt [type=bool]
+  - │                        │    ├── variable: i:1 [type=int]
+  - │                        │    └── const: 10 [type=int]
+  - │                        └── lt [type=bool]
+  - │                             ├── variable: i:1 [type=int]
+  - │                             └── const: 20 [type=int]
+  + │    ├── scan t
+  + │    │    └── columns: i:1(int)
+  + │    └── filters
+  + │         └── range [type=bool, outer=(1), constraints=(/1: [/11 - /19]; tight)]
+  + │              └── and [type=bool]
+  + │                   ├── gt [type=bool]
+  + │                   │    ├── variable: i:1 [type=int]
+  + │                   │    └── const: 10 [type=int]
+  + │                   └── lt [type=bool]
+  + │                        ├── variable: i:1 [type=int]
+  + │                        └── const: 20 [type=int]
+    └── filters
+         └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+              ├── variable: i:1 [type=int]
+              └── const: 5 [type=int]
+================================================================================
+MergeSelects
+  Cost: 1054.34
+================================================================================
+   select
+    ├── columns: i:1(int!null)
+    ├── fd: ()-->(1)
+  - ├── select
+  - │    ├── columns: i:1(int!null)
+  - │    ├── scan t
+  - │    │    └── columns: i:1(int)
+  - │    └── filters
+  - │         └── range [type=bool, outer=(1), constraints=(/1: [/11 - /19]; tight)]
+  - │              └── and [type=bool]
+  - │                   ├── gt [type=bool]
+  - │                   │    ├── variable: i:1 [type=int]
+  - │                   │    └── const: 10 [type=int]
+  - │                   └── lt [type=bool]
+  - │                        ├── variable: i:1 [type=int]
+  - │                        └── const: 20 [type=int]
+  + ├── scan t
+  + │    └── columns: i:1(int)
+    └── filters
+  +      ├── range [type=bool, outer=(1), constraints=(/1: [/11 - /19]; tight)]
+  +      │    └── and [type=bool]
+  +      │         ├── gt [type=bool]
+  +      │         │    ├── variable: i:1 [type=int]
+  +      │         │    └── const: 10 [type=int]
+  +      │         └── lt [type=bool]
+  +      │              ├── variable: i:1 [type=int]
+  +      │              └── const: 20 [type=int]
+         └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+              ├── variable: i:1 [type=int]
+              └── const: 5 [type=int]
+================================================================================
+InlineConstVar
+  Cost: 1054.34
+================================================================================
+   select
+    ├── columns: i:1(int!null)
+    ├── fd: ()-->(1)
+    ├── scan t
+    │    └── columns: i:1(int)
+    └── filters
+  -      ├── range [type=bool, outer=(1), constraints=(/1: [/11 - /19]; tight)]
+  +      ├── range [type=bool]
+         │    └── and [type=bool]
+         │         ├── gt [type=bool]
+  -      │         │    ├── variable: i:1 [type=int]
+  +      │         │    ├── const: 5 [type=int]
+         │         │    └── const: 10 [type=int]
+         │         └── lt [type=bool]
+  -      │              ├── variable: i:1 [type=int]
+  +      │              ├── const: 5 [type=int]
+         │              └── const: 20 [type=int]
+         └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+              ├── variable: i:1 [type=int]
+              └── const: 5 [type=int]
+================================================================================
+FoldComparison
+  Cost: 1054.34
+================================================================================
+   select
+    ├── columns: i:1(int!null)
+  + ├── cardinality: [0 - 0]
+    ├── fd: ()-->(1)
+    ├── scan t
+    │    └── columns: i:1(int)
+    └── filters
+  -      ├── range [type=bool]
+  +      ├── range [type=bool, constraints=(contradiction; tight)]
+         │    └── and [type=bool]
+  -      │         ├── gt [type=bool]
+  -      │         │    ├── const: 5 [type=int]
+  -      │         │    └── const: 10 [type=int]
+  +      │         ├── false [type=bool]
+         │         └── lt [type=bool]
+         │              ├── const: 5 [type=int]
+         │              └── const: 20 [type=int]
+         └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+              ├── variable: i:1 [type=int]
+              └── const: 5 [type=int]
+================================================================================
+FoldComparison
+  Cost: 1054.34
+================================================================================
+   select
+    ├── columns: i:1(int!null)
+    ├── cardinality: [0 - 0]
+    ├── fd: ()-->(1)
+    ├── scan t
+    │    └── columns: i:1(int)
+    └── filters
+         ├── range [type=bool, constraints=(contradiction; tight)]
+         │    └── and [type=bool]
+         │         ├── false [type=bool]
+  -      │         └── lt [type=bool]
+  -      │              ├── const: 5 [type=int]
+  -      │              └── const: 20 [type=int]
+  +      │         └── true [type=bool]
+         └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+              ├── variable: i:1 [type=int]
+              └── const: 5 [type=int]
+================================================================================
+SimplifyAndTrue
+  Cost: 1054.34
+================================================================================
+   select
+    ├── columns: i:1(int!null)
+    ├── cardinality: [0 - 0]
+    ├── fd: ()-->(1)
+    ├── scan t
+    │    └── columns: i:1(int)
+    └── filters
+         ├── range [type=bool, constraints=(contradiction; tight)]
+  -      │    └── and [type=bool]
+  -      │         ├── false [type=bool]
+  -      │         └── true [type=bool]
+  +      │    └── false [type=bool]
+         └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+              ├── variable: i:1 [type=int]
+              └── const: 5 [type=int]
+================================================================================
+SimplifyRange
+  Cost: 1054.34
+================================================================================
+   select
+    ├── columns: i:1(int!null)
+    ├── cardinality: [0 - 0]
+    ├── fd: ()-->(1)
+    ├── scan t
+    │    └── columns: i:1(int)
+    └── filters
+  -      ├── range [type=bool, constraints=(contradiction; tight)]
+  -      │    └── false [type=bool]
+  +      ├── false [type=bool, constraints=(contradiction; tight)]
+         └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+              ├── variable: i:1 [type=int]
+              └── const: 5 [type=int]
+================================================================================
+SimplifySelectFilters
+  Cost: 1054.33
+================================================================================
+   select
+  - ├── columns: i:1(int!null)
+  + ├── columns: i:1(int)
+    ├── cardinality: [0 - 0]
+  - ├── fd: ()-->(1)
+    ├── scan t
+    │    └── columns: i:1(int)
+    └── filters
+  -      ├── false [type=bool, constraints=(contradiction; tight)]
+  -      └── eq [type=bool, outer=(1), constraints=(/1: [/5 - /5]; tight), fd=()-->(1)]
+  -           ├── variable: i:1 [type=int]
+  -           └── const: 5 [type=int]
+  +      └── false [type=bool, constraints=(contradiction; tight)]
+================================================================================
+SimplifyZeroCardinalityGroup
+  Cost: 0.01
+================================================================================
+  -select
+  - ├── columns: i:1(int)
+  +values
+  + ├── columns: i:1(int!null)
+    ├── cardinality: [0 - 0]
+  - ├── scan t
+  - │    └── columns: i:1(int)
+  - └── filters
+  -      └── false [type=bool, constraints=(contradiction; tight)]
+  + ├── key: ()
+  + └── fd: ()-->(1)
+================================================================================
+Final best expression
+  Cost: 0.01
+================================================================================
+  values
+   ├── columns: i:1(int!null)
+   ├── cardinality: [0 - 0]
+   ├── key: ()
    └── fd: ()-->(1)
 
 optsteps split-diff

@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -37,12 +38,12 @@ func createAndIncrementSeqDescriptor(
 	incrementBy int64,
 	seqOpts descpb.TableDescriptor_SequenceOpts,
 	db *kv.DB,
-) tabledesc.Immutable {
-	desc := tabledesc.MakeImmutable(descpb.TableDescriptor{
+) catalog.TableDescriptor {
+	desc := tabledesc.NewBuilder(&descpb.TableDescriptor{
 		ID:           descpb.ID(id),
 		SequenceOpts: &seqOpts,
-	})
-	seqValueKey := codec.SequenceKey(uint32(desc.ID))
+	}).BuildImmutableTable()
+	seqValueKey := codec.SequenceKey(uint32(desc.GetID()))
 	_, err := kv.IncrementValRetryable(
 		ctx, db, seqValueKey, incrementBy)
 	require.NoError(t, err)
@@ -64,7 +65,7 @@ func createMockImportJob(
 			ResumePos:       []int64{resumePos},
 		},
 	}
-	mockImportJob, err := registry.CreateJobWithTxn(ctx, mockImportRecord, nil /* txn */)
+	mockImportJob, err := registry.CreateJobWithTxn(ctx, mockImportRecord, registry.MakeJobID(), nil)
 	require.NoError(t, err)
 	return mockImportJob
 }
@@ -189,7 +190,7 @@ func TestJobBackedSeqChunkProvider(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
 			job := createMockImportJob(ctx, t, registry, test.allocatedChunks, test.resumePos)
-			j := &SeqChunkProvider{Registry: registry, JobID: *job.ID()}
+			j := &SeqChunkProvider{Registry: registry, JobID: job.ID()}
 			annot := &CellInfoAnnotation{
 				sourceID: 0,
 				rowID:    test.rowID,
@@ -200,7 +201,7 @@ func TestJobBackedSeqChunkProvider(t *testing.T) {
 					test.incrementBy, test.seqIDToOpts[id], db)
 				seqMetadata := &SequenceMetadata{
 					id:              descpb.ID(id),
-					seqDesc:         &seqDesc,
+					seqDesc:         seqDesc,
 					instancesPerRow: test.instancesPerRow,
 					curChunk:        nil,
 					curVal:          0,
@@ -209,7 +210,7 @@ func TestJobBackedSeqChunkProvider(t *testing.T) {
 				getJobProgressQuery := `SELECT progress FROM system.jobs J WHERE J.id = $1`
 
 				var progressBytes []byte
-				require.NoError(t, sqlDB.QueryRow(getJobProgressQuery, *job.ID()).Scan(&progressBytes))
+				require.NoError(t, sqlDB.QueryRow(getJobProgressQuery, job.ID()).Scan(&progressBytes))
 				var progress jobspb.Progress
 				require.NoError(t, protoutil.Unmarshal(progressBytes, &progress))
 				chunks := progress.GetImport().SequenceDetails[0].SeqIdToChunks[int32(id)].Chunks

@@ -18,13 +18,14 @@ go_library(
 
 go_test(
     name = "physical_test",
+    size = "small",
     srcs = [
         "ordering_choice_test.go",
         "required_test.go",
     ],
     deps = [
+        ":physical",
         "//pkg/sql/opt",
         "//pkg/sql/opt/props",
-        "//pkg/sql/opt/props/physical",
     ],
 )

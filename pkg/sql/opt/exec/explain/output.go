@@ -105,6 +105,15 @@ func (ob *OutputBuilder) AddField(key, value string) {
 	ob.entries = append(ob.entries, entry{field: key, fieldVal: value})
 }
 
+// AddRedactableField adds an information field under the current node, hiding
+// the value depending depending on the given redact flag.
+func (ob *OutputBuilder) AddRedactableField(flag RedactFlags, key, value string) {
+	if ob.flags.Redact.Has(flag) {
+		value = "<hidden>"
+	}
+	ob.AddField(key, value)
+}
+
 // Attr adds an information field under the current node.
 func (ob *OutputBuilder) Attr(key string, value interface{}) {
 	ob.AddField(key, fmt.Sprint(value))
@@ -312,29 +321,31 @@ func (ob *OutputBuilder) AddTopLevelField(key, value string) {
 	ob.AddField(key, value)
 }
 
+// AddRedactableTopLevelField adds a top-level field, hiding the value depending
+// depending on the given redact flag.
+func (ob *OutputBuilder) AddRedactableTopLevelField(redactFlag RedactFlags, key, value string) {
+	if ob.flags.Redact.Has(redactFlag) {
+		value = "<hidden>"
+	}
+	ob.AddTopLevelField(key, value)
+}
+
 // AddDistribution adds a top-level distribution field. Cannot be called
 // while inside a node.
 func (ob *OutputBuilder) AddDistribution(value string) {
-	if ob.flags.MakeDeterministic {
-		value = "<hidden>"
-	}
-	ob.AddTopLevelField("distribution", value)
+	ob.AddRedactableTopLevelField(RedactDistribution, "distribution", value)
 }
 
 // AddVectorized adds a top-level vectorized field. Cannot be called
 // while inside a node.
 func (ob *OutputBuilder) AddVectorized(value bool) {
-	valueStr := fmt.Sprintf("%t", value)
-	if ob.flags.MakeDeterministic {
-		valueStr = "<hidden>"
-	}
-	ob.AddTopLevelField("vectorized", valueStr)
+	ob.AddRedactableTopLevelField(RedactVectorized, "vectorized", fmt.Sprintf("%t", value))
 }
 
 // AddPlanningTime adds a top-level planning time field. Cannot be called
 // while inside a node.
 func (ob *OutputBuilder) AddPlanningTime(delta time.Duration) {
-	if ob.flags.MakeDeterministic {
+	if ob.flags.Redact.Has(RedactVolatile) {
 		delta = 10 * time.Microsecond
 	}
 	ob.AddTopLevelField("planning time", humanizeutil.Duration(delta))
@@ -343,8 +354,45 @@ func (ob *OutputBuilder) AddPlanningTime(delta time.Duration) {
 // AddExecutionTime adds a top-level execution time field. Cannot be called
 // while inside a node.
 func (ob *OutputBuilder) AddExecutionTime(delta time.Duration) {
-	if ob.flags.MakeDeterministic {
+	if ob.flags.Redact.Has(RedactVolatile) {
 		delta = 100 * time.Microsecond
 	}
 	ob.AddTopLevelField("execution time", humanizeutil.Duration(delta))
+}
+
+// AddKVReadStats adds a top-level field for the bytes/rows read from KV.
+func (ob *OutputBuilder) AddKVReadStats(rows, bytes int64) {
+	ob.AddTopLevelField("rows read from KV", fmt.Sprintf(
+		"%s (%s)", humanizeutil.Count(uint64(rows)), humanizeutil.IBytes(bytes),
+	))
+}
+
+// AddKVTime adds a top-level field for the cumulative time spent in KV.
+func (ob *OutputBuilder) AddKVTime(kvTime time.Duration) {
+	ob.AddRedactableTopLevelField(RedactVolatile, "cumulative time spent in KV", humanizeutil.Duration(kvTime))
+}
+
+// AddContentionTime adds a top-level field for the cumulative contention time.
+func (ob *OutputBuilder) AddContentionTime(contentionTime time.Duration) {
+	ob.AddRedactableTopLevelField(
+		RedactVolatile,
+		"cumulative time spent due to contention",
+		humanizeutil.Duration(contentionTime),
+	)
+}
+
+// AddMaxMemUsage adds a top-level field for the memory used by the query.
+func (ob *OutputBuilder) AddMaxMemUsage(bytes int64) {
+	ob.AddRedactableTopLevelField(
+		RedactVolatile, "maximum memory usage", humanizeutil.IBytes(bytes),
+	)
+}
+
+// AddNetworkStats adds a top-level field for network statistics.
+func (ob *OutputBuilder) AddNetworkStats(messages, bytes int64) {
+	ob.AddRedactableTopLevelField(
+		RedactVolatile,
+		"network usage",
+		fmt.Sprintf("%s (%s messages)", humanizeutil.IBytes(bytes), humanizeutil.Count(uint64(messages))),
+	)
 }

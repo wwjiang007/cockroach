@@ -21,6 +21,7 @@ go_library(
 
 go_test(
     name = "slinstance_test",
+    size = "small",
     srcs = [
         "helpers_test.go",
         "slinstance_test.go",
@@ -30,7 +31,6 @@ go_test(
         "//pkg/clusterversion",
         "//pkg/settings/cluster",
         "//pkg/sql/sqlliveness",
-        "//pkg/sql/sqlliveness/slinstance",
         "//pkg/sql/sqlliveness/slstorage",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",

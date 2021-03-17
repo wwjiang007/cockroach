@@ -30,8 +30,8 @@ import (
 // trivial change that just touches lots of lines.
 func TestingGetTableDescriptorFromSchema(
 	kvDB *kv.DB, codec keys.SQLCodec, database string, schema string, table string,
-) *tabledesc.Immutable {
-	return testingGetObjectDescriptor(kvDB, codec, database, schema, table).(*tabledesc.Immutable)
+) catalog.TableDescriptor {
+	return testingGetObjectDescriptor(kvDB, codec, database, schema, table).(catalog.TableDescriptor)
 }
 
 // TestingGetTableDescriptor retrieves a table descriptor directly from the KV
@@ -42,7 +42,7 @@ func TestingGetTableDescriptorFromSchema(
 // removing it altogether.
 func TestingGetTableDescriptor(
 	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
-) *tabledesc.Immutable {
+) catalog.TableDescriptor {
 	return TestingGetImmutableTableDescriptor(kvDB, codec, database, table)
 }
 
@@ -50,8 +50,8 @@ func TestingGetTableDescriptor(
 // directly from the KV layer.
 func TestingGetImmutableTableDescriptor(
 	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
-) *tabledesc.Immutable {
-	return testingGetObjectDescriptor(kvDB, codec, database, "public", table).(*tabledesc.Immutable)
+) catalog.TableDescriptor {
+	return testingGetObjectDescriptor(kvDB, codec, database, "public", table).(catalog.TableDescriptor)
 }
 
 // TestingGetMutableExistingTableDescriptor retrieves a Mutable
@@ -59,8 +59,8 @@ func TestingGetImmutableTableDescriptor(
 func TestingGetMutableExistingTableDescriptor(
 	kvDB *kv.DB, codec keys.SQLCodec, database string, table string,
 ) *tabledesc.Mutable {
-	return tabledesc.NewExistingMutable(
-		*TestingGetImmutableTableDescriptor(kvDB, codec, database, table).TableDesc())
+	return tabledesc.NewBuilder(
+		TestingGetImmutableTableDescriptor(kvDB, codec, database, table).TableDesc()).BuildExistingMutableTable()
 }
 
 // TestingGetTypeDescriptorFromSchema retrieves a type descriptor directly from
@@ -152,8 +152,8 @@ func testingGetObjectDescriptor(
 		} else if !found {
 			panic(fmt.Sprintf("object %s not found", object))
 		}
-		desc, err = GetDescriptorByID(
-			ctx, txn, codec, objectID, Immutable, AnyDescriptorKind, true /* required */)
+		desc, err = getDescriptorByID(
+			ctx, txn, codec, objectID, immutable, catalog.Any, true /* required */)
 		if err != nil {
 			panic(err)
 		}

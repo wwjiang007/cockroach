@@ -255,7 +255,9 @@ func init() {
 
 	// Add a pre-run command for `start` and `start-single-node`, as well as the
 	// multi-tenancy related commands that start long-running servers.
-	for _, cmd := range serverCmds {
+	// Also for `connect` which does not really start a server but uses
+	// all the networking flags.
+	for _, cmd := range append(serverCmds, connectCmd) {
 		AddPersistentPreRunE(cmd, func(cmd *cobra.Command, _ []string) error {
 			// Finalize the configuration of network settings.
 			return extraServerFlagInit(cmd)
@@ -334,21 +336,44 @@ func init() {
 	// avoid printing some messages to standard output in that case.
 	_, startCtx.inBackground = envutil.EnvString(backgroundEnvVar, 1)
 
-	for _, cmd := range StartCmds {
+	// Flags common to the start commands and the connect command.
+	for _, cmd := range append(StartCmds, connectCmd) {
 		f := cmd.Flags()
 
-		// Server flags.
 		varFlag(f, addrSetter{&startCtx.serverListenAddr, &serverListenPort}, cliflags.ListenAddr)
 		varFlag(f, addrSetter{&serverAdvertiseAddr, &serverAdvertisePort}, cliflags.AdvertiseAddr)
 		varFlag(f, addrSetter{&serverSQLAddr, &serverSQLPort}, cliflags.ListenSQLAddr)
 		varFlag(f, addrSetter{&serverSQLAdvertiseAddr, &serverSQLAdvertisePort}, cliflags.SQLAdvertiseAddr)
 		varFlag(f, addrSetter{&serverHTTPAddr, &serverHTTPPort}, cliflags.ListenHTTPAddr)
-		stringFlag(f, &serverSocketDir, cliflags.SocketDir)
-		boolFlag(f, &startCtx.unencryptedLocalhostHTTP, cliflags.UnencryptedLocalhostHTTP)
 
-		// The following flag is planned to become non-experimental in 21.1.
-		boolFlag(f, &serverCfg.AcceptSQLWithoutTLS, cliflags.AcceptSQLWithoutTLS)
-		_ = f.MarkHidden(cliflags.AcceptSQLWithoutTLS.Name)
+		// Certificates directory. Use a server-specific flag and value to ignore environment
+		// variables, but share the same default.
+		stringFlag(f, &startCtx.serverSSLCertsDir, cliflags.ServerCertsDir)
+
+		// Cluster joining flags. We need to enable this both for 'start'
+		// and 'start-single-node' although the latter does not support
+		// --join, because it delegates its logic to that of 'start', and
+		// 'start' will check that the flag is properly defined.
+		varFlag(f, &serverCfg.JoinList, cliflags.Join)
+		boolFlag(f, &serverCfg.JoinPreferSRVRecords, cliflags.JoinPreferSRVRecords)
+
+		// The initialization token and expected peers. For 'start' commands this is optional.
+		stringFlag(f, &startCtx.initToken, cliflags.InitToken)
+		intFlag(f, &startCtx.numExpectedNodes, cliflags.NumExpectedInitialNodes)
+		boolFlag(f, &startCtx.genCertsForSingleNode, cliflags.SingleNode)
+
+		if cmd == startSingleNodeCmd {
+			// Even though all server flags are supported for
+			// 'start-single-node', we intend that command to be used by
+			// beginners / developers running on a single machine. To
+			// enhance the UX, we hide the flags since they are not directly
+			// relevant when running a single node.
+			_ = f.MarkHidden(cliflags.Join.Name)
+			_ = f.MarkHidden(cliflags.JoinPreferSRVRecords.Name)
+			_ = f.MarkHidden(cliflags.AdvertiseAddr.Name)
+			_ = f.MarkHidden(cliflags.SQLAdvertiseAddr.Name)
+			_ = f.MarkHidden(cliflags.InitToken.Name)
+		}
 
 		// Backward-compatibility flags.
 
@@ -371,6 +396,20 @@ func init() {
 		_ = f.MarkHidden(cliflags.ListenHTTPAddrAlias.Name)
 		varFlag(f, aliasStrVar{&serverHTTPPort}, cliflags.ListenHTTPPort)
 		_ = f.MarkHidden(cliflags.ListenHTTPPort.Name)
+
+	}
+
+	// Flags common to the start commands only.
+	for _, cmd := range StartCmds {
+		f := cmd.Flags()
+
+		// Server flags.
+		stringFlag(f, &serverSocketDir, cliflags.SocketDir)
+		boolFlag(f, &startCtx.unencryptedLocalhostHTTP, cliflags.UnencryptedLocalhostHTTP)
+
+		// The following flag is planned to become non-experimental in 21.1.
+		boolFlag(f, &serverCfg.AcceptSQLWithoutTLS, cliflags.AcceptSQLWithoutTLS)
+		_ = f.MarkHidden(cliflags.AcceptSQLWithoutTLS.Name)
 
 		// More server flags.
 
@@ -397,21 +436,13 @@ func init() {
 
 		// Enable/disable various external storage endpoints.
 		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableHTTP, cliflags.ExternalIODisableHTTP)
+		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableOutbound, cliflags.ExternalIODisabled)
 		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableImplicitCredentials, cliflags.ExternalIODisableImplicitCredentials)
-
-		// Certificates directory. Use a server-specific flag and value to ignore environment
-		// variables, but share the same default.
-		stringFlag(f, &startCtx.serverSSLCertsDir, cliflags.ServerCertsDir)
 
 		// Certificate principal map.
 		stringSliceFlag(f, &startCtx.serverCertPrincipalMap, cliflags.CertPrincipalMap)
 
-		// Cluster joining flags. We need to enable this both for 'start'
-		// and 'start-single-node' although the latter does not support
-		// --join, because it delegates its logic to that of 'start', and
-		// 'start' will check that the flag is properly defined.
-		varFlag(f, &serverCfg.JoinList, cliflags.Join)
-		boolFlag(f, &serverCfg.JoinPreferSRVRecords, cliflags.JoinPreferSRVRecords)
+		// Cluster name verification.
 		varFlag(f, clusterNameSetter{&baseCfg.ClusterName}, cliflags.ClusterName)
 		boolFlag(f, &baseCfg.DisableClusterNameVerification, cliflags.DisableClusterNameVerification)
 		if cmd == startSingleNodeCmd {
@@ -420,13 +451,10 @@ func init() {
 			// beginners / developers running on a single machine. To
 			// enhance the UX, we hide the flags since they are not directly
 			// relevant when running a single node.
-			_ = f.MarkHidden(cliflags.Join.Name)
 			_ = f.MarkHidden(cliflags.ClusterName.Name)
 			_ = f.MarkHidden(cliflags.DisableClusterNameVerification.Name)
 			_ = f.MarkHidden(cliflags.MaxOffset.Name)
 			_ = f.MarkHidden(cliflags.LocalityAdvertiseAddr.Name)
-			_ = f.MarkHidden(cliflags.AdvertiseAddr.Name)
-			_ = f.MarkHidden(cliflags.SQLAdvertiseAddr.Name)
 		}
 
 		// Engine flags.
@@ -643,6 +671,7 @@ func init() {
 		durationFlag(f, &sqlCtx.repeatDelay, cliflags.Watch)
 		boolFlag(f, &sqlCtx.safeUpdates, cliflags.SafeUpdates)
 		boolFlag(f, &sqlCtx.debugMode, cliflags.CliDebugMode)
+		boolFlag(f, &sqlCtx.embeddedMode, cliflags.EmbeddedMode)
 	}
 
 	// Commands that establish a SQL connection.
@@ -766,10 +795,16 @@ func init() {
 		d := importDumpFileCmd.Flags()
 		boolFlag(d, &importCtx.skipForeignKeys, cliflags.ImportSkipForeignKeys)
 		intFlag(d, &importCtx.maxRowSize, cliflags.ImportMaxRowSize)
+		intFlag(d, &importCtx.rowLimit, cliflags.ImportRowLimit)
+		boolFlag(d, &importCtx.ignoreUnsupported, cliflags.ImportIgnoreUnsupportedStatements)
+		stringFlag(d, &importCtx.ignoreUnsupportedLog, cliflags.ImportLogIgnoredStatements)
 
 		t := importDumpTableCmd.Flags()
 		boolFlag(t, &importCtx.skipForeignKeys, cliflags.ImportSkipForeignKeys)
 		intFlag(t, &importCtx.maxRowSize, cliflags.ImportMaxRowSize)
+		intFlag(t, &importCtx.rowLimit, cliflags.ImportRowLimit)
+		boolFlag(t, &importCtx.ignoreUnsupported, cliflags.ImportIgnoreUnsupportedStatements)
+		stringFlag(t, &importCtx.ignoreUnsupportedLog, cliflags.ImportLogIgnoredStatements)
 	}
 
 	// sqlfmt command.
@@ -781,6 +816,12 @@ func init() {
 		intFlag(f, &sqlfmtCtx.tabWidth, cliflags.SQLFmtTabWidth)
 		boolFlag(f, &sqlfmtCtx.noSimplify, cliflags.SQLFmtNoSimplify)
 		boolFlag(f, &sqlfmtCtx.align, cliflags.SQLFmtAlign)
+	}
+
+	// version command.
+	{
+		f := versionCmd.Flags()
+		boolFlag(f, &cliCtx.showVersionUsingOnlyBuildTag, cliflags.BuildTag)
 	}
 
 	// Debug commands.
@@ -827,7 +868,16 @@ func init() {
 		varFlag(f, addrSetter{&serverSQLAddr, &serverSQLPort}, cliflags.ListenSQLAddr)
 		varFlag(f, addrSetter{&serverHTTPAddr, &serverHTTPPort}, cliflags.ListenHTTPAddr)
 
+		stringFlag(f, &startCtx.geoLibsDir, cliflags.GeoLibsDir)
+
 		stringSliceFlag(f, &serverCfg.SQLConfig.TenantKVAddrs, cliflags.KVAddrs)
+
+		durationFlag(f, &serverCfg.IdleExitAfter, cliflags.IdleExitAfter)
+
+		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableHTTP, cliflags.ExternalIODisableHTTP)
+		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableOutbound, cliflags.ExternalIODisabled)
+		boolFlag(f, &serverCfg.ExternalIODirConfig.DisableImplicitCredentials, cliflags.ExternalIODisableImplicitCredentials)
+
 	}
 }
 

@@ -13,7 +13,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/ccl/baseccl",
-        "//pkg/ccl/storageccl/engineccl/enginepbccl",
+        "//pkg/ccl/storageccl/engineccl/enginepbccl:enginepbccl_go_proto",
         "//pkg/roachpb",
         "//pkg/storage",
         "//pkg/storage/enginepb",
@@ -29,6 +29,7 @@ go_library(
 
 go_test(
     name = "engineccl_test",
+    size = "small",
     srcs = [
         "batch_repr_test.go",
         "bench_test.go",
@@ -42,7 +43,8 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/ccl/baseccl",
-        "//pkg/ccl/storageccl/engineccl/enginepbccl",
+        "//pkg/ccl/storageccl/engineccl/enginepbccl:enginepbccl_go_proto",
+        "//pkg/keys",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/storage",

@@ -115,7 +115,7 @@ func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
 		stats.frequencyMu.changeCh = make(chan struct{})
 		stats.frequencyMu.interval = ReporterInterval.Get(&stats.settings.SV)
 	})
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "stats-reporter", func(ctx context.Context) {
 		var timer timeutil.Timer
 		defer timer.Stop()
 		ctx = logtags.AddTag(ctx, "replication-reporter", nil /* value */)
@@ -182,13 +182,13 @@ func (stats *Reporter) update(
 	var getStoresFromGossip StoreResolver = func(
 		r *roachpb.RangeDescriptor,
 	) []roachpb.StoreDescriptor {
-		storeDescs := make([]roachpb.StoreDescriptor, len(r.Replicas().Voters()))
+		storeDescs := make([]roachpb.StoreDescriptor, len(r.Replicas().VoterDescriptors()))
 		// We'll return empty descriptors for stores that gossip doesn't have a
 		// descriptor for. These stores will be considered to satisfy all
 		// constraints.
 		// TODO(andrei): note down that some descriptors were missing from gossip
 		// somewhere in the report.
-		for i, repl := range r.Replicas().Voters() {
+		for i, repl := range r.Replicas().VoterDescriptors() {
 			storeDescs[i] = allStores[repl.StoreID]
 		}
 		return storeDescs
@@ -258,14 +258,14 @@ func (stats *Reporter) update(
 // range or nil if none of the node's stores are holding the Meta1 lease.
 func (stats *Reporter) meta1LeaseHolderStore(ctx context.Context) *kvserver.Store {
 	const meta1RangeID = roachpb.RangeID(1)
-	repl, store, err := stats.localStores.GetReplicaForRangeID(meta1RangeID)
+	repl, store, err := stats.localStores.GetReplicaForRangeID(ctx, meta1RangeID)
 	if roachpb.IsRangeNotFoundError(err) {
 		return nil
 	}
 	if err != nil {
 		log.Fatalf(ctx, "unexpected error when visiting stores: %s", err)
 	}
-	if repl.OwnsValidLease(ctx, store.Clock().Now()) {
+	if repl.OwnsValidLease(ctx, store.Clock().NowAsClockTimestamp()) {
 		return store
 	}
 	return nil
@@ -450,7 +450,7 @@ func visitAncestors(
 	if err := descVal.GetProto(&desc); err != nil {
 		return false, err
 	}
-	tableDesc := descpb.TableFromDescriptor(&desc, descVal.Timestamp)
+	tableDesc, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, descVal.Timestamp)
 	// If it's a database, the parent is the default zone.
 	if tableDesc == nil {
 		return visitDefaultZone(ctx, cfg, visitor), nil

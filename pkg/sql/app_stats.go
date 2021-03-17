@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -90,8 +91,25 @@ type stmtStats struct {
 		// vectorization.
 		vectorized bool
 
+		// fullScan records whether the last instance of this statement used a
+		// full table index scan.
+		fullScan bool
+
 		data roachpb.StatementStatistics
 	}
+}
+
+func (s *stmtStats) recordExecStats(stats execstats.QueryLevelStats) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.mu.data.ExecStats.Count++
+	count := s.mu.data.ExecStats.Count
+	s.mu.data.ExecStats.NetworkBytes.Record(count, float64(stats.NetworkBytesSent))
+	s.mu.data.ExecStats.MaxMemUsage.Record(count, float64(stats.MaxMemUsage))
+	s.mu.data.ExecStats.ContentionTime.Record(count, stats.ContentionTime.Seconds())
+	s.mu.data.ExecStats.NetworkMessages.Record(count, float64(stats.NetworkMessages))
+	s.mu.data.ExecStats.MaxDiskUsage.Record(count, float64(stats.MaxDiskUsage))
 }
 
 type transactionCounts struct {
@@ -171,6 +189,7 @@ func (a *appStats) recordStatement(
 	distSQLUsed bool,
 	vectorized bool,
 	implicitTxn bool,
+	fullScan bool,
 	automaticRetryCount int,
 	numRows int,
 	err error,
@@ -231,6 +250,7 @@ func (a *appStats) recordStatement(
 	//  tracing is a thing.
 	s.mu.vectorized = vectorized
 	s.mu.distSQLUsed = distSQLUsed
+	s.mu.fullScan = fullScan
 	s.mu.Unlock()
 
 	return s.ID
@@ -415,6 +435,10 @@ func (a *appStats) recordTransaction(
 	retryLat time.Duration,
 	commitLat time.Duration,
 	numRows int,
+	collectedExecStats bool,
+	execStats execstats.QueryLevelStats,
+	rowsRead int64,
+	bytesRead int64,
 ) {
 	if !txnStatsEnable.Get(&a.st.SV) {
 		return
@@ -442,6 +466,17 @@ func (a *appStats) recordTransaction(
 	s.mu.data.CommitLat.Record(s.mu.data.Count, commitLat.Seconds())
 	if retryCount > s.mu.data.MaxRetries {
 		s.mu.data.MaxRetries = retryCount
+	}
+	s.mu.data.RowsRead.Record(s.mu.data.Count, float64(rowsRead))
+	s.mu.data.BytesRead.Record(s.mu.data.Count, float64(bytesRead))
+
+	if collectedExecStats {
+		s.mu.data.ExecStats.Count++
+		s.mu.data.ExecStats.NetworkBytes.Record(s.mu.data.ExecStats.Count, float64(execStats.NetworkBytesSent))
+		s.mu.data.ExecStats.MaxMemUsage.Record(s.mu.data.ExecStats.Count, float64(execStats.MaxMemUsage))
+		s.mu.data.ExecStats.ContentionTime.Record(s.mu.data.ExecStats.Count, execStats.ContentionTime.Seconds())
+		s.mu.data.ExecStats.NetworkMessages.Record(s.mu.data.ExecStats.Count, float64(execStats.NetworkMessages))
+		s.mu.data.ExecStats.MaxDiskUsage.Record(s.mu.data.ExecStats.Count, float64(execStats.MaxDiskUsage))
 	}
 }
 
@@ -601,25 +636,7 @@ func scrubStmtStatKey(vt VirtualTabler, key string) (string, bool) {
 
 	// Re-format to remove most names.
 	f := tree.NewFmtCtx(tree.FmtAnonymize)
-
-	reformatFn := func(ctx *tree.FmtCtx, tn *tree.TableName) {
-		virtual, err := vt.getVirtualTableEntry(tn)
-		if err != nil || virtual == nil {
-			ctx.WriteByte('_')
-			return
-		}
-		// Virtual table: we want to keep the name; however
-		// we need to scrub the database name prefix.
-		newTn := *tn
-		newTn.CatalogName = "_"
-
-		ctx.WithFlags(tree.FmtParsable, func() {
-			ctx.WithReformatTableNames(nil, func() {
-				ctx.FormatNode(&newTn)
-			})
-		})
-	}
-	f.SetReformatTableNames(reformatFn)
+	f.SetReformatTableNames(hideNonVirtualTableNameFunc(vt))
 	f.FormatNode(stmt.AST)
 	return f.CloseAndGetString(), true
 }
@@ -691,6 +708,7 @@ func (s *sqlStats) getStmtStats(
 				data := stats.mu.data
 				distSQLUsed := stats.mu.distSQLUsed
 				vectorized := stats.mu.vectorized
+				fullScan := stats.mu.fullScan
 				stats.mu.Unlock()
 
 				k := roachpb.StatementStatisticsKey{
@@ -699,6 +717,7 @@ func (s *sqlStats) getStmtStats(
 					Opt:         true,
 					Vec:         vectorized,
 					ImplicitTxn: q.implicitTxn,
+					FullScan:    fullScan,
 					Failed:      q.failed,
 					App:         maybeHashedAppName,
 				}

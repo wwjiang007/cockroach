@@ -13,10 +13,13 @@ package cloudimpltests
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"math/rand"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -27,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -35,6 +39,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 	"github.com/cockroachdb/errors"
@@ -42,6 +48,57 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2/google"
 )
+
+var econnrefused = &net.OpError{Err: &os.SyscallError{
+	Syscall: "test",
+	Err:     sysutil.ECONNREFUSED,
+}}
+
+var econnreset = &net.OpError{Err: &os.SyscallError{
+	Syscall: "test",
+	Err:     sysutil.ECONNRESET,
+}}
+
+type antagonisticDialer struct {
+	net.Dialer
+	rnd               *rand.Rand
+	numRepeatFailures *int
+}
+
+type antagonisticConn struct {
+	net.Conn
+	rnd               *rand.Rand
+	numRepeatFailures *int
+}
+
+func (d *antagonisticDialer) DialContext(
+	ctx context.Context, network, addr string,
+) (net.Conn, error) {
+	if network == "tcp" {
+		// The maximum number of injected errors should always be less than the maximum retry attempts in delayedRetry.
+		if *d.numRepeatFailures < cloudimpl.MaxDelayedRetryAttempts-1 && d.rnd.Int()%2 == 0 {
+			*(d.numRepeatFailures)++
+			return nil, econnrefused
+		}
+		c, err := d.Dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		return &antagonisticConn{Conn: c, rnd: d.rnd, numRepeatFailures: d.numRepeatFailures}, nil
+	}
+	return d.Dialer.DialContext(ctx, network, addr)
+}
+
+func (c *antagonisticConn) Read(b []byte) (int, error) {
+	// The maximum number of injected errors should always be less
+	// than the maximum retry attempts in delayedRetry.
+	if *c.numRepeatFailures < cloudimpl.MaxDelayedRetryAttempts-1 && c.rnd.Int()%2 == 0 {
+		*(c.numRepeatFailures)++
+		return 0, econnreset
+	}
+	return c.Conn.Read(b[:64])
+}
 
 func appendPath(t *testing.T, s, add string) string {
 	u, err := url.Parse(s)
@@ -124,6 +181,8 @@ func testExportStoreWithExternalIOConfig(
 		t.Fatalf("conf does not roundtrip: started with %+v, got back %+v", conf, readConf)
 	}
 
+	rng, _ := randutil.NewPseudoRand()
+
 	t.Run("simple round trip", func(t *testing.T) {
 		sampleName := "somebytes"
 		sampleBytes := "hello world"
@@ -161,12 +220,9 @@ func testExportStoreWithExternalIOConfig(
 
 	// The azure driver makes us chunk files that are greater than 4mb, so make
 	// sure that files larger than that work on all the providers.
-	t.Run("8mb-tempfile", func(t *testing.T) {
-		const size = 1024 * 1024 * 8 // 8MiB
-		testingContent := make([]byte, size)
-		if _, err := rand.Read(testingContent); err != nil {
-			t.Fatal(err)
-		}
+	t.Run("exceeds-4mb-chunk", func(t *testing.T) {
+		const size = 1024 * 1024 * 5
+		testingContent := randutil.RandBytes(rng, size)
 		testingFilename := "testing-123"
 
 		// Write some random data (random so it doesn't compress).
@@ -188,6 +244,30 @@ func testExportStoreWithExternalIOConfig(
 		if !bytes.Equal(content, testingContent) {
 			t.Fatalf("wrong content")
 		}
+
+		t.Run("rand-readats", func(t *testing.T) {
+			for i := 0; i < 10; i++ {
+				t.Run("", func(t *testing.T) {
+					byteReader := bytes.NewReader(testingContent)
+					offset, length := rng.Int63n(size), rng.Intn(32*1024)
+					t.Logf("read %d of file at %d", length, offset)
+					reader, size, err := s.ReadFileAt(ctx, testingFilename, offset)
+					require.NoError(t, err)
+					defer reader.Close()
+					require.Equal(t, int64(len(testingContent)), size)
+					expected, got := make([]byte, length), make([]byte, length)
+					_, err = byteReader.Seek(offset, io.SeekStart)
+					require.NoError(t, err)
+
+					expectedN, expectedErr := io.ReadFull(byteReader, expected)
+					gotN, gotErr := io.ReadFull(reader, got)
+					require.Equal(t, expectedErr != nil, gotErr != nil, "%+v vs %+v", expectedErr, gotErr)
+					require.Equal(t, expectedN, gotN)
+					require.Equal(t, expected, got)
+				})
+			}
+		})
+
 		require.NoError(t, s.Delete(ctx, testingFilename))
 	})
 	if skipSingleFile {
@@ -318,6 +398,7 @@ func testListFiles(
 	}
 
 	t.Run("ListFiles", func(t *testing.T) {
+		var noResults []string = nil
 
 		for _, tc := range []struct {
 			name       string
@@ -365,7 +446,7 @@ func testListFiles(
 				"list-letter-csv-dotdot-suffix",
 				appendPath(t, storeURI, "file/abc/xzy"),
 				"../../?.csv",
-				nil,
+				noResults,
 			},
 			{
 				"list-data-num-csv",
@@ -391,54 +472,44 @@ func testListFiles(
 				// So this pattern would not actually match anything.
 				appendPath(t, storeURI, "file/*.csv"),
 				"",
-				[]string{},
+				noResults,
 			},
 			{
 				"list-no-matches",
 				appendPath(t, storeURI, "file/letters/dataD.csv"),
 				"",
-				[]string{},
+				noResults,
 			},
 			{
 				"list-escaped-star",
 				appendPath(t, storeURI, "file/*/\\*.csv"),
 				"",
-				[]string{},
+				noResults,
 			},
 			{
 				"list-escaped-star-suffix",
 				appendPath(t, storeURI, "file"),
 				"*/\\*.csv",
-				[]string{},
+				noResults,
 			},
 			{
 				"list-escaped-range",
 				appendPath(t, storeURI, "file/*/data\\[0-9\\].csv"),
 				"",
-				[]string{},
+				noResults,
 			},
 			{
 				"list-escaped-range-suffix",
 				appendPath(t, storeURI, "file"),
 				"*/data\\[0-9\\].csv",
-				[]string{},
+				noResults,
 			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				s := storeFromURI(ctx, t, tc.URI, clientFactory, user, ie, kvDB)
 				filesList, err := s.ListFiles(ctx, tc.suffix)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				if len(filesList) != len(tc.resultList) {
-					t.Fatal(`listed incorrect number of files`, filesList)
-				}
-				for i, got := range filesList {
-					if expected := tc.resultList[i]; got != expected {
-						t.Fatal(`resulting list is incorrect. got: `, got, `expected: `, expected, "\n", filesList)
-					}
-				}
+				require.NoError(t, err)
+				require.Equal(t, filesList, tc.resultList)
 			})
 		}
 	})
@@ -589,4 +660,61 @@ func TestWorkloadStorage(t *testing.T) {
 	_, err = cloudimpl.ExternalStorageFromURI(ctx, `workload:///csv/bank/bank?version=nope`,
 		base.ExternalIODirConfig{}, settings, blobs.TestEmptyBlobClientFactory, user, nil, nil)
 	require.EqualError(t, err, `expected bank version "nope" but got "1.0.0"`)
+}
+
+func uploadData(
+	t *testing.T, rnd *rand.Rand, dest roachpb.ExternalStorage, basename string,
+) ([]byte, func()) {
+	data := randutil.RandBytes(rnd, 16<<20)
+	ctx := context.Background()
+
+	s, err := cloudimpl.MakeExternalStorage(
+		ctx, dest, base.ExternalIODirConfig{}, testSettings,
+		nil, nil, nil)
+	require.NoError(t, err)
+	defer s.Close()
+	require.NoError(t, s.WriteFile(ctx, basename, bytes.NewReader(data)))
+	return data, func() {
+		_ = s.Delete(ctx, basename)
+	}
+}
+
+func testAntagonisticRead(t *testing.T, conf roachpb.ExternalStorage) {
+	rnd, _ := randutil.NewPseudoRand()
+
+	const basename = "test-antagonistic-read"
+	data, cleanup := uploadData(t, rnd, conf, basename)
+	defer cleanup()
+
+	// Try reading the data while injecting errors.
+	failures := 0
+	// Override DialContext implementation in http transport.
+	dialer := &antagonisticDialer{rnd: rnd, numRepeatFailures: &failures}
+
+	// Override transport to return antagonistic connection.
+	transport := http.DefaultTransport.(*http.Transport)
+	transport.DialContext =
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, addr)
+		}
+	transport.DisableKeepAlives = true
+
+	defer func() {
+		transport.DialContext = nil
+		transport.DisableKeepAlives = false
+	}()
+
+	ctx := context.Background()
+	s, err := cloudimpl.MakeExternalStorage(
+		ctx, conf, base.ExternalIODirConfig{}, testSettings,
+		nil, nil, nil)
+	require.NoError(t, err)
+	defer s.Close()
+
+	stream, err := s.ReadFile(ctx, basename)
+	require.NoError(t, err)
+	defer stream.Close()
+	read, err := ioutil.ReadAll(stream)
+	require.NoError(t, err)
+	require.Equal(t, data, read)
 }

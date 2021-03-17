@@ -27,8 +27,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -79,13 +80,13 @@ const (
 func GetInProjectionOperator(
 	allocator *colmem.Allocator,
 	t *types.T,
-	input colexecbase.Operator,
+	input colexecop.Operator,
 	colIdx int,
 	resultIdx int,
 	datumTuple *tree.DTuple,
 	negate bool,
-) (colexecbase.Operator, error) {
-	input = newVectorTypeEnforcer(allocator, input, types.Bool, resultIdx)
+) (colexecop.Operator, error) {
+	input = colexecutils.NewVectorTypeEnforcer(allocator, input, types.Bool, resultIdx)
 	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
 	case _CANONICAL_TYPE_FAMILY:
@@ -93,7 +94,7 @@ func GetInProjectionOperator(
 		// {{range .WidthOverloads}}
 		case _TYPE_WIDTH:
 			obj := &projectInOp_TYPE{
-				OneInputNode: NewOneInputNode(input),
+				OneInputNode: colexecop.NewOneInputNode(input),
 				allocator:    allocator,
 				colIdx:       colIdx,
 				outputIdx:    resultIdx,
@@ -109,8 +110,8 @@ func GetInProjectionOperator(
 }
 
 func GetInOperator(
-	t *types.T, input colexecbase.Operator, colIdx int, datumTuple *tree.DTuple, negate bool,
-) (colexecbase.Operator, error) {
+	t *types.T, input colexecop.Operator, colIdx int, datumTuple *tree.DTuple, negate bool,
+) (colexecop.Operator, error) {
 	switch typeconv.TypeFamilyToCanonicalTypeFamily(t.Family()) {
 	// {{range .}}
 	case _CANONICAL_TYPE_FAMILY:
@@ -118,7 +119,7 @@ func GetInOperator(
 		// {{range .WidthOverloads}}
 		case _TYPE_WIDTH:
 			obj := &selectInOp_TYPE{
-				OneInputNode: NewOneInputNode(input),
+				OneInputNode: colexecop.NewOneInputNode(input),
 				colIdx:       colIdx,
 				negate:       negate,
 			}
@@ -135,17 +136,17 @@ func GetInOperator(
 // {{range .WidthOverloads}}
 
 type selectInOp_TYPE struct {
-	OneInputNode
+	colexecop.OneInputNode
 	colIdx    int
 	filterRow []_GOTYPE
 	hasNulls  bool
 	negate    bool
 }
 
-var _ colexecbase.Operator = &selectInOp_TYPE{}
+var _ colexecop.Operator = &selectInOp_TYPE{}
 
 type projectInOp_TYPE struct {
-	OneInputNode
+	colexecop.OneInputNode
 	allocator *colmem.Allocator
 	colIdx    int
 	outputIdx int
@@ -154,7 +155,7 @@ type projectInOp_TYPE struct {
 	negate    bool
 }
 
-var _ colexecbase.Operator = &projectInOp_TYPE{}
+var _ colexecop.Operator = &projectInOp_TYPE{}
 
 func fillDatumRow_TYPE(t *types.T, datumTuple *tree.DTuple) ([]_GOTYPE, bool) {
 	conv := colconv.GetDatumToPhysicalFn(t)
@@ -200,16 +201,16 @@ func cmpIn_TYPE(
 }
 
 func (si *selectInOp_TYPE) Init() {
-	si.input.Init()
+	si.Input.Init()
 }
 
 func (pi *projectInOp_TYPE) Init() {
-	pi.input.Init()
+	pi.Input.Init()
 }
 
 func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 	for {
-		batch := si.input.Next(ctx)
+		batch := si.Input.Next(ctx)
 		if batch.Length() == 0 {
 			return coldata.ZeroBatch
 		}
@@ -285,7 +286,7 @@ func (si *selectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
 }
 
 func (pi *projectInOp_TYPE) Next(ctx context.Context) coldata.Batch {
-	batch := pi.input.Next(ctx)
+	batch := pi.Input.Next(ctx)
 	if batch.Length() == 0 {
 		return coldata.ZeroBatch
 	}

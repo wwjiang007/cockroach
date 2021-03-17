@@ -44,6 +44,9 @@ import (
 )
 
 const (
+	// Refer to README.md to understand the general design guidelines for
+	// help texts.
+
 	welcomeMessage = `#
 # Welcome to the CockroachDB SQL shell.
 # All statements must be terminated by a semicolon.
@@ -543,7 +546,7 @@ func (c *cliState) handleDemo(cmd []string, nextState, errState cliStateEnum) cl
 	}
 
 	if len(cmd) != 2 {
-		return c.invalidSyntax(errState, `\demo expects 2 parameters`)
+		return c.invalidSyntax(errState, `\demo expects 2 parameters, but passed %v`, len(cmd))
 	}
 
 	// Special case the add command it takes a string instead of a node number.
@@ -562,7 +565,7 @@ func (c *cliState) handleDemoAddNode(cmd []string, nextState, errState cliStateE
 	}
 
 	if demoCtx.simulateLatency {
-		fmt.Printf("add command is not supported in --global configurations")
+		fmt.Printf("add command is not supported in --global configurations\n")
 		return nextState
 	}
 
@@ -585,7 +588,7 @@ func (c *cliState) handleDemoNodeCommands(
 		return c.invalidSyntax(
 			errState,
 			"%s",
-			errors.Wrapf(err, "cannot convert %s to string", cmd[2]).Error(),
+			errors.Wrapf(err, "cannot convert %s to string", cmd[1]),
 		)
 	}
 
@@ -743,6 +746,20 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 		return nextState
 	}
 
+	if c.useContinuePrompt {
+		if len(c.fullPrompt) < 3 {
+			c.continuePrompt = "> "
+		} else {
+			// continued statement prompt is: "        -> ".
+			c.continuePrompt = strings.Repeat(" ", len(c.fullPrompt)-3) + "-> "
+		}
+
+		c.ins.SetLeftPrompt(c.continuePrompt)
+		return nextState
+	}
+
+	// Configure the editor to use the new prompt.
+
 	parsedURL, err := url.Parse(c.conn.url)
 	if err != nil {
 		// If parsing fails, we'll keep the entire URL. The Open call succeeded, and that
@@ -797,20 +814,7 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 	}
 
 	c.fullPrompt += " "
-
-	if len(c.fullPrompt) < 3 {
-		c.continuePrompt = "> "
-	} else {
-		// continued statement prompt is: "        -> ".
-		c.continuePrompt = strings.Repeat(" ", len(c.fullPrompt)-3) + "-> "
-	}
-
-	switch c.useContinuePrompt {
-	case true:
-		c.currentPrompt = c.continuePrompt
-	case false:
-		c.currentPrompt = c.fullPrompt
-	}
+	c.currentPrompt = c.fullPrompt
 
 	// Configure the editor to use the new prompt.
 	c.ins.SetLeftPrompt(c.currentPrompt)
@@ -1790,4 +1794,10 @@ func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 		return helpText, err
 	}
 	return "", nil
+}
+
+func printlnUnlessEmbedded(args ...interface{}) {
+	if !sqlCtx.embeddedMode {
+		fmt.Println(args...)
+	}
 }

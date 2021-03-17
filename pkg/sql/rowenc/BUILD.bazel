@@ -24,6 +24,7 @@ go_library(
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/inverted",
         "//pkg/sql/parser",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
@@ -31,6 +32,7 @@ go_library(
         "//pkg/util/bitarray",
         "//pkg/util/duration",
         "//pkg/util/encoding",
+        "//pkg/util/errorutil/unimplemented",
         "//pkg/util/ipaddr",
         "//pkg/util/json",
         "//pkg/util/log",
@@ -51,6 +53,7 @@ go_library(
 
 go_test(
     name = "rowenc_test",
+    size = "medium",
     srcs = [
         "client_index_encoding_test.go",
         "column_type_encoding_test.go",
@@ -75,7 +78,7 @@ go_test(
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/tabledesc",
-        "//pkg/sql/rowenc",
+        "//pkg/sql/inverted",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/testutils",

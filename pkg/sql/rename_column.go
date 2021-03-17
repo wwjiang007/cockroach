@@ -13,7 +13,6 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -21,8 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/errors"
 )
 
 var errEmptyColumnName = pgerror.New(pgcode.Syntax, "empty column name")
@@ -82,9 +79,7 @@ func (n *renameColumnNode) startExec(params runParams) error {
 		return nil
 	}
 
-	if err := tableDesc.Validate(
-		ctx, catalogkv.NewOneLevelUncachedDescGetter(p.txn, p.ExecCfg().Codec),
-	); err != nil {
+	if err := validateDescriptor(ctx, p, tableDesc); err != nil {
 		return err
 	}
 
@@ -105,7 +100,7 @@ func (p *planner) renameColumn(
 		return false, errEmptyColumnName
 	}
 
-	col, _, err := tableDesc.FindColumnByName(*oldName)
+	col, err := tableDesc.FindColumnWithName(*oldName)
 	if err != nil {
 		return false, err
 	}
@@ -113,7 +108,7 @@ func (p *planner) renameColumn(
 	for _, tableRef := range tableDesc.DependedOnBy {
 		found := false
 		for _, colID := range tableRef.ColumnIDs {
-			if colID == col.ID {
+			if colID == col.GetID() {
 				found = true
 			}
 		}
@@ -127,37 +122,19 @@ func (p *planner) renameColumn(
 		// Noop.
 		return false, nil
 	}
-	isShardColumn := tableDesc.IsShardColumn(col)
+	isShardColumn := tableDesc.IsShardColumn(col.ColumnDesc())
 	if isShardColumn && !allowRenameOfShardColumn {
 		return false, pgerror.Newf(pgcode.ReservedName, "cannot rename shard column")
 	}
 	// Understand if the active column already exists before checking for column
 	// mutations to detect assertion failure of empty mutation and no column.
 	// Otherwise we would have to make the above call twice.
-	_, columnNotFoundErr := tableDesc.FindActiveColumnByName(string(*newName))
-	if m := tableDesc.FindColumnMutationByName(*newName); m != nil {
-		switch m.Direction {
-		case descpb.DescriptorMutation_ADD:
-			return false, pgerror.Newf(pgcode.DuplicateColumn,
-				"duplicate: column %q in the middle of being added, not yet public",
-				col.Name)
-		case descpb.DescriptorMutation_DROP:
-			return false, pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-				"column %q being dropped, try again later", col.Name)
-		default:
-			if columnNotFoundErr != nil {
-				return false, errors.AssertionFailedf(
-					"mutation in state %s, direction %s, and no column descriptor",
-					errors.Safe(m.State), errors.Safe(m.Direction))
-			}
-		}
-	}
-	if columnNotFoundErr == nil {
-		return false, sqlerrors.NewColumnAlreadyExistsError(tree.ErrString(newName), tableDesc.Name)
+	_, err = checkColumnDoesNotExist(tableDesc, *newName)
+	if err != nil {
+		return false, err
 	}
 
 	// Rename the column in CHECK constraints.
-	// Renaming columns that are being referenced by checks that are being added is not allowed.
 	for i := range tableDesc.Checks {
 		var err error
 		tableDesc.Checks[i].Expr, err = schemaexpr.RenameColumn(tableDesc.Checks[i].Expr, *oldName, *newName)
@@ -178,13 +155,47 @@ func (p *planner) renameColumn(
 	}
 
 	// Rename the column in partial index predicates.
-	for i := range tableDesc.GetPublicNonPrimaryIndexes() {
-		if index := &tableDesc.GetPublicNonPrimaryIndexes()[i]; index.IsPartial() {
-			newExpr, err := schemaexpr.RenameColumn(index.Predicate, *oldName, *newName)
+	for _, index := range tableDesc.PublicNonPrimaryIndexes() {
+		if index.IsPartial() {
+			newExpr, err := schemaexpr.RenameColumn(index.GetPredicate(), *oldName, *newName)
 			if err != nil {
 				return false, err
 			}
-			index.Predicate = newExpr
+			indexDesc := *index.IndexDesc()
+			indexDesc.Predicate = newExpr
+			tableDesc.SetPublicNonPrimaryIndex(index.Ordinal(), indexDesc)
+		}
+	}
+
+	// Do all of the above renames inside check constraints, computed expressions,
+	// and index predicates that are in mutations.
+	for i := range tableDesc.Mutations {
+		m := &tableDesc.Mutations[i]
+		if constraint := m.GetConstraint(); constraint != nil {
+			if constraint.ConstraintType == descpb.ConstraintToUpdate_CHECK ||
+				constraint.ConstraintType == descpb.ConstraintToUpdate_NOT_NULL {
+				var err error
+				constraint.Check.Expr, err = schemaexpr.RenameColumn(constraint.Check.Expr, *oldName, *newName)
+				if err != nil {
+					return false, err
+				}
+			}
+		} else if otherCol := m.GetColumn(); otherCol != nil {
+			if otherCol.IsComputed() {
+				newExpr, err := schemaexpr.RenameColumn(*otherCol.ComputeExpr, *oldName, *newName)
+				if err != nil {
+					return false, err
+				}
+				otherCol.ComputeExpr = &newExpr
+			}
+		} else if index := m.GetIndex(); index != nil {
+			if index.IsPartial() {
+				var err error
+				index.Predicate, err = schemaexpr.RenameColumn(index.Predicate, *oldName, *newName)
+				if err != nil {
+					return false, err
+				}
+			}
 		}
 	}
 
@@ -216,12 +227,12 @@ func (p *planner) renameColumn(
 		// Keep the shardedDesc name in sync with the column name.
 		shardedDesc.Name = string(newName)
 	}
-	for _, idx := range tableDesc.AllNonDropIndexes() {
-		maybeUpdateShardedDesc(&idx.Sharded)
+	for _, idx := range tableDesc.NonDropIndexes() {
+		maybeUpdateShardedDesc(&idx.IndexDesc().Sharded)
 	}
 
 	// Rename the column in the indexes.
-	tableDesc.RenameColumnDescriptor(col, string(*newName))
+	tableDesc.RenameColumnDescriptor(col.ColumnDesc(), string(*newName))
 
 	// Rename any shard columns which need to be renamed because their name was
 	// based on this column.
@@ -236,6 +247,16 @@ func (p *planner) renameColumn(
 		}
 	}
 
+	// Rename the REGIONAL BY ROW column reference.
+	if tableDesc.IsLocalityRegionalByRow() {
+		rbrColName, err := tableDesc.GetRegionalByRowTableRegionColumnName()
+		if err != nil {
+			return false, err
+		}
+		if rbrColName == *oldName {
+			tableDesc.SetTableLocalityRegionalByRow(*newName)
+		}
+	}
 	return true, nil
 }
 

@@ -28,6 +28,7 @@ go_library(
 
 go_test(
     name = "colserde_test",
+    size = "small",
     srcs = [
         "arrowbatchconverter_test.go",
         "file_test.go",
@@ -35,10 +36,10 @@ go_test(
         "record_batch_test.go",
     ],
     deps = [
+        ":colserde",
         "//pkg/col/coldata",
         "//pkg/col/coldataext",
         "//pkg/col/coldatatestutils",
-        "//pkg/col/colserde",
         "//pkg/col/typeconv",
         "//pkg/settings/cluster",
         "//pkg/sql/catalog/descpb",

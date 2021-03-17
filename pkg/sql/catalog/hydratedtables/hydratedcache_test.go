@@ -38,7 +38,7 @@ func TestHydratedCache(t *testing.T) {
 		m := c.Metrics()
 		dg := mkDescGetter(descs...)
 		res := &descGetterTypeDescriptorResolver{dg: &dg}
-		td := tableDescUDT.ImmutableCopy().(*tabledesc.Immutable)
+		td := tableDescUDT.ImmutableCopy().(catalog.TableDescriptor)
 		hydrated, err := c.GetHydratedTableDescriptor(ctx, td, res)
 		require.NoError(t, err)
 		assertMetrics(t, m, 0, 1)
@@ -50,7 +50,7 @@ func TestHydratedCache(t *testing.T) {
 		// Show that the cache returned a new pointer and hydrated the UDT
 		// (user-defined type).
 		require.NotEqual(t, tableDescUDT, hydrated)
-		require.EqualValues(t, hydrated.Columns[0].Type, typ1T)
+		require.EqualValues(t, hydrated.PublicColumns()[0].GetType(), typ1T)
 
 		// Try again and ensure we get pointer-for-pointer the same descriptor.
 		res.calls = 0
@@ -68,7 +68,7 @@ func TestHydratedCache(t *testing.T) {
 		m := c.Metrics()
 		dg := mkDescGetter(descs...)
 		res := &descGetterTypeDescriptorResolver{dg: &dg}
-		td := tableDescNoUDT.ImmutableCopy().(*tabledesc.Immutable)
+		td := tableDescNoUDT.ImmutableCopy().(catalog.TableDescriptor)
 		_, err := c.GetHydratedTableDescriptor(ctx, td, res)
 		require.NoError(t, err)
 		assertMetrics(t, m, 0, 0)
@@ -78,13 +78,13 @@ func TestHydratedCache(t *testing.T) {
 		m := c.Metrics()
 		dg := mkDescGetter(descs...)
 		res := &descGetterTypeDescriptorResolver{dg: &dg}
-		td := tableDescUDT.ImmutableCopy().(*tabledesc.Immutable)
+		td := tableDescUDT.ImmutableCopy().(catalog.TableDescriptor)
 		hydrated, err := c.GetHydratedTableDescriptor(ctx, td, res)
 		require.NoError(t, err)
 		assertMetrics(t, m, 0, 1)
 
 		// Change the database name.
-		dbDesc := dbdesc.NewExistingMutable(*dg[dbID].(*dbdesc.Immutable).DatabaseDesc())
+		dbDesc := dbdesc.NewBuilder(dg[dbID].(catalog.DatabaseDescriptor).DatabaseDesc()).BuildExistingMutableDatabase()
 		dbDesc.SetName("new_name")
 		dbDesc.Version++
 		dg[dbID] = dbDesc.ImmutableCopy()
@@ -102,7 +102,7 @@ func TestHydratedCache(t *testing.T) {
 		m := c.Metrics()
 		dg := mkDescGetter(descs...)
 		res := &descGetterTypeDescriptorResolver{dg: &dg}
-		td := tableDescUDT.ImmutableCopy().(*tabledesc.Immutable)
+		td := tableDescUDT.ImmutableCopy().(catalog.TableDescriptor)
 		hydrated, err := c.GetHydratedTableDescriptor(ctx, td, res)
 		require.NoError(t, err)
 		assertMetrics(t, m, 0, 1)
@@ -124,7 +124,7 @@ func TestHydratedCache(t *testing.T) {
 		dg := mkDescGetter(descs...)
 		res := &descGetterTypeDescriptorResolver{dg: &dg}
 		res.unqualifiedName = true
-		td := tableDescUDT.ImmutableCopy().(*tabledesc.Immutable)
+		td := tableDescUDT.ImmutableCopy().(catalog.TableDescriptor)
 		hydrated, err := c.GetHydratedTableDescriptor(ctx, td, res)
 		require.NoError(t, err)
 		assertMetrics(t, m, 0, 1)
@@ -146,15 +146,15 @@ func TestHydratedCache(t *testing.T) {
 		dg := mkDescGetter(descs...)
 		res := &descGetterTypeDescriptorResolver{dg: &dg}
 		res.unqualifiedName = true
-		td := tableDescUDT.ImmutableCopy().(*tabledesc.Immutable)
+		td := tableDescUDT.ImmutableCopy().(catalog.TableDescriptor)
 		hydrated, err := c.GetHydratedTableDescriptor(ctx, td, res)
 		require.NoError(t, err)
 		assertMetrics(t, m, 0, 1)
 
 		// Change the type descriptor.
-		typDesc := typedesc.NewExistingMutable(*dg[typ1ID].(*typedesc.Immutable).TypeDesc())
+		typDesc := typedesc.NewBuilder(dg[typ1ID].(catalog.TypeDescriptor).TypeDesc()).BuildExistingMutableType()
 		typDesc.Version++
-		dg[typ1ID] = typedesc.NewImmutable(*typDesc.TypeDesc())
+		dg[typ1ID] = typedesc.NewBuilder(typDesc.TypeDesc()).BuildImmutable()
 
 		// Ensure that a new descriptor is returned.
 		retrieved, err := c.GetHydratedTableDescriptor(ctx, td, res)
@@ -176,7 +176,7 @@ func TestHydratedCache(t *testing.T) {
 			calledCh <- errCh
 			return <-errCh
 		}
-		td := tableDescUDT.ImmutableCopy().(*tabledesc.Immutable)
+		td := tableDescUDT.ImmutableCopy().(catalog.TableDescriptor)
 
 		callOneErrCh := make(chan error, 1)
 		go func() {
@@ -200,9 +200,9 @@ func TestHydratedCache(t *testing.T) {
 		c := NewCache(cluster.MakeTestingClusterSettings())
 		dg := mkDescGetter(descs...)
 		res := &descGetterTypeDescriptorResolver{dg: &dg}
-		mut := tabledesc.NewExistingMutable(*dg[tableUDTID].(catalog.TableDescriptor).TableDesc())
+		mut := tabledesc.NewBuilder(dg[tableUDTID].(catalog.TableDescriptor).TableDesc()).BuildExistingMutable()
 		mut.MaybeIncrementVersion()
-		td := mut.ImmutableCopy().(*tabledesc.Immutable)
+		td := mut.ImmutableCopy().(catalog.TableDescriptor)
 		hydrated, err := c.GetHydratedTableDescriptor(ctx, td, res)
 		require.NoError(t, err)
 		require.Nil(t, hydrated)
@@ -214,7 +214,7 @@ func TestHydratedCache(t *testing.T) {
 		dg := mkDescGetter(descs...)
 		res := &descGetterTypeDescriptorResolver{dg: &dg}
 
-		mut := typedesc.NewExistingMutable(*dg[typ1ID].(catalog.TypeDescriptor).TypeDesc())
+		mut := typedesc.NewBuilder(dg[typ1ID].(catalog.TypeDescriptor).TypeDesc()).BuildExistingMutable()
 		mut.MaybeIncrementVersion()
 		dgWithMut := mkDescGetter(append(descs, mut)...)
 		resWithMut := &descGetterTypeDescriptorResolver{dg: &dgWithMut}
@@ -226,7 +226,7 @@ func TestHydratedCache(t *testing.T) {
 		// This behavior is a bit bizarre but exists to not waste the work of
 		// hydrating the descriptor if we've already started to do it.
 		// This case should not meaningfully arise in practice.
-		td := tableDescUDT.ImmutableCopy().(*tabledesc.Immutable)
+		td := tableDescUDT.ImmutableCopy().(catalog.TableDescriptor)
 		{
 			hydrated, err := c.GetHydratedTableDescriptor(ctx, td, resWithMut)
 			require.NoError(t, err)
@@ -289,11 +289,11 @@ const (
 // server.
 var (
 	dbDesc     = dbdesc.NewInitial(dbID, "db", security.RootUserName())
-	schemaDesc = schemadesc.NewCreatedMutable(descpb.SchemaDescriptor{
+	schemaDesc = schemadesc.NewBuilder(&descpb.SchemaDescriptor{
 		Name:     "schema",
 		ID:       scID,
 		ParentID: dbID,
-	})
+	}).BuildCreatedMutable()
 	enumMembers = []descpb.TypeDescriptor_EnumMember{
 		{
 			LogicalRepresentation:  "hello",
@@ -305,7 +305,7 @@ var (
 		},
 	}
 
-	typ1Desc = typedesc.NewExistingMutable(descpb.TypeDescriptor{
+	typ1Desc = typedesc.NewBuilder(&descpb.TypeDescriptor{
 		Name:                     "enum",
 		ID:                       typ1ID,
 		Version:                  1,
@@ -315,12 +315,12 @@ var (
 		Kind:                     descpb.TypeDescriptor_ENUM,
 		ReferencingDescriptorIDs: []descpb.ID{tableUDTID},
 		EnumMembers:              enumMembers,
-	})
-	typ1Name        = tree.MakeNewQualifiedTypeName(dbDesc.Name, schemaDesc.Name, typ1Desc.Name)
+	}).BuildExistingMutableType()
+	typ1Name        = tree.MakeNewQualifiedTypeName(dbDesc.Name, schemaDesc.GetName(), typ1Desc.Name)
 	typ1T           = mkTypeT(typ1Desc, &typ1Name)
 	typ1TSerialized = &types.T{InternalType: typ1T.InternalType}
 
-	typ2Desc = typedesc.NewExistingMutable(descpb.TypeDescriptor{
+	typ2Desc = typedesc.NewBuilder(&descpb.TypeDescriptor{
 		Name:                     "other_enum",
 		ID:                       typ2ID,
 		Version:                  1,
@@ -330,11 +330,11 @@ var (
 		Kind:                     descpb.TypeDescriptor_ENUM,
 		ReferencingDescriptorIDs: []descpb.ID{tableUDTID},
 		EnumMembers:              enumMembers,
-	})
-	typ2Name        = tree.MakeNewQualifiedTypeName(dbDesc.Name, schemaDesc.Name, typ2Desc.Name)
+	}).BuildExistingMutableType()
+	typ2Name        = tree.MakeNewQualifiedTypeName(dbDesc.Name, schemaDesc.GetName(), typ2Desc.Name)
 	typ2T           = mkTypeT(typ2Desc, &typ2Name)
 	typ2TSerialized = &types.T{InternalType: typ2T.InternalType}
-	tableDescUDT    = tabledesc.NewExistingMutable(descpb.TableDescriptor{
+	tableDescUDT    = tabledesc.NewBuilder(&descpb.TableDescriptor{
 		Name:                    "foo",
 		ID:                      tableUDTID,
 		Version:                 1,
@@ -345,8 +345,8 @@ var (
 			{Name: "b", ID: 1, Type: typ2TSerialized},
 			{Name: "c", ID: 1, Type: typ1TSerialized},
 		},
-	})
-	tableDescNoUDT = tabledesc.NewExistingMutable(descpb.TableDescriptor{
+	}).BuildExistingMutableTable()
+	tableDescNoUDT = tabledesc.NewBuilder(&descpb.TableDescriptor{
 		Name:                    "bar",
 		ID:                      tableNoUDTID,
 		Version:                 1,
@@ -355,7 +355,7 @@ var (
 		Columns: []descpb.ColumnDescriptor{
 			{Name: "a", ID: 1, Type: types.Int},
 		},
-	})
+	}).BuildExistingMutableTable()
 	descs = []catalog.MutableDescriptor{
 		dbDesc, schemaDesc, typ1Desc, typ2Desc, tableDescUDT, tableDescNoUDT,
 	}

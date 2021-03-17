@@ -31,6 +31,7 @@ go_library(
         "//pkg/util/cancelchecker",
         "//pkg/util/contextutil",
         "//pkg/util/log",
+        "//pkg/util/optional",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
@@ -42,6 +43,7 @@ go_library(
 
 go_test(
     name = "flowinfra_test",
+    size = "medium",
     srcs = [
         "cluster_test.go",
         "dep_test.go",
@@ -83,7 +85,6 @@ go_test(
         "//pkg/testutils/buildutil",
         "//pkg/testutils/distsqlutils",
         "//pkg/testutils/serverutils",
-        "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/cancelchecker",

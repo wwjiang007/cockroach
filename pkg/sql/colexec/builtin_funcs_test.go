@@ -19,7 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
@@ -50,35 +52,35 @@ func TestBasicBuiltinFunctions(t *testing.T) {
 		desc         string
 		expr         string
 		inputCols    []int
-		inputTuples  tuples
+		inputTuples  colexectestutils.Tuples
 		inputTypes   []*types.T
-		outputTuples tuples
+		outputTuples colexectestutils.Tuples
 	}{
 		{
 			desc:         "AbsVal",
 			expr:         "abs(@1)",
 			inputCols:    []int{0},
-			inputTuples:  tuples{{1}, {-2}},
+			inputTuples:  colexectestutils.Tuples{{1}, {-2}},
 			inputTypes:   []*types.T{types.Int},
-			outputTuples: tuples{{1, 1}, {-2, 2}},
+			outputTuples: colexectestutils.Tuples{{1, 1}, {-2, 2}},
 		},
 		{
 			desc:         "StringLen",
 			expr:         "length(@1)",
 			inputCols:    []int{0},
-			inputTuples:  tuples{{"Hello"}, {"The"}},
+			inputTuples:  colexectestutils.Tuples{{"Hello"}, {"The"}},
 			inputTypes:   []*types.T{types.String},
-			outputTuples: tuples{{"Hello", 5}, {"The", 3}},
+			outputTuples: colexectestutils.Tuples{{"Hello", 5}, {"The", 3}},
 		},
 	}
 
 	for _, tc := range testCases {
 		log.Infof(ctx, "%s", tc.desc)
-		runTests(t, []tuples{tc.inputTuples}, tc.outputTuples, orderedVerifier,
-			func(input []colexecbase.Operator) (colexecbase.Operator, error) {
-				return createTestProjectingOperator(
+		colexectestutils.RunTests(t, testAllocator, []colexectestutils.Tuples{tc.inputTuples}, tc.outputTuples, colexectestutils.OrderedVerifier,
+			func(input []colexecop.Operator) (colexecop.Operator, error) {
+				return colexectestutils.CreateTestProjectingOperator(
 					ctx, flowCtx, input[0], tc.inputTypes,
-					tc.expr, false, /* canFallbackToRowexec */
+					tc.expr, false /* canFallbackToRowexec */, testMemAcc,
 				)
 			})
 	}
@@ -126,10 +128,10 @@ func benchmarkBuiltinFunctions(b *testing.B, useSelectionVector bool, hasNulls b
 	}
 
 	typs := []*types.T{types.Int}
-	source := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
-	op, err := createTestProjectingOperator(
+	source := colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
+	op, err := colexectestutils.CreateTestProjectingOperator(
 		ctx, flowCtx, source, typs,
-		"abs(@1)" /* projectingExpr */, false, /* canFallbackToRowexec */
+		"abs(@1)" /* projectingExpr */, false /* canFallbackToRowexec */, testMemAcc,
 	)
 	require.NoError(b, err)
 	op.Init()
@@ -171,9 +173,9 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 		eCol[i] = 4
 	}
 	batch.SetLength(coldata.BatchSize())
-	var source colexecbase.Operator
-	source = colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
-	source = newVectorTypeEnforcer(testAllocator, source, types.Bytes, outputIdx)
+	var source colexecop.Operator
+	source = colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
+	source = colexecutils.NewVectorTypeEnforcer(testAllocator, source, types.Bytes, outputIdx)
 
 	// Set up the default operator.
 	expr, err := parser.ParseExpr("substring(@1, @2, @3)")
@@ -181,7 +183,7 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 		b.Fatal(err)
 	}
 	inputCols := []int{0, 1, 2}
-	p := &mockTypeContext{typs: typs}
+	p := &colexectestutils.MockTypeContext{Typs: typs}
 	semaCtx := tree.MakeSemaContext()
 	semaCtx.IVarContainer = p
 	typedExpr, err := tree.TypeCheck(ctx, expr, &semaCtx, types.Any)
@@ -189,7 +191,7 @@ func BenchmarkCompareSpecializedOperators(b *testing.B) {
 		b.Fatal(err)
 	}
 	defaultOp := &defaultBuiltinFuncOperator{
-		OneInputNode:        NewOneInputNode(source),
+		OneInputNode:        colexecop.NewOneInputNode(source),
 		allocator:           testAllocator,
 		evalCtx:             evalCtx,
 		funcExpr:            typedExpr.(*tree.FuncExpr),

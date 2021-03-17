@@ -240,23 +240,6 @@ func TestParseEWKT(t *testing.T) {
 			require.Equal(t, tc.expected, ret)
 		})
 	}
-
-	errorTestCases := []struct {
-		wkt         geopb.EWKT
-		expectedErr string
-	}{
-		{"POINT Z (1 2 3)", "unimplemented: dimension XYZ is not currently supported"},
-		// GEOS assumes all M coordinates as Z coordinates, so the error message is not great here.
-		{"POINT M (1 2 3)", "unimplemented: dimension XYZ is not currently supported"},
-		{"POINT ZM (1 2 3 4)", "unimplemented: dimension XYZ is not currently supported"},
-	}
-	for _, tc := range errorTestCases {
-		t.Run(string(tc.wkt), func(t *testing.T) {
-			_, err := parseEWKT(geopb.SpatialObjectType_GeometryType, tc.wkt, 0, false)
-			require.Error(t, err)
-			require.EqualError(t, err, tc.expectedErr)
-		})
-	}
 }
 
 func TestParseGeometry(t *testing.T) {
@@ -372,7 +355,9 @@ func TestParseGeometry(t *testing.T) {
 		{
 			"invalid",
 			Geometry{},
-			"geos error: ParseException: Unknown type: 'INVALID'",
+			`syntax error: invalid keyword at line 1, pos 0
+LINE 1: invalid
+        ^`,
 		},
 		{
 			"",
@@ -586,7 +571,9 @@ func TestParseGeography(t *testing.T) {
 		{
 			"invalid",
 			Geography{},
-			"geos error: ParseException: Unknown type: 'INVALID'",
+			`syntax error: invalid keyword at line 1, pos 0
+LINE 1: invalid
+        ^`,
 		},
 		{
 			"",

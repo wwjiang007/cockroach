@@ -20,9 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -88,11 +88,10 @@ func NewServer(ctx context.Context, cfg execinfra.ServerConfig) *ServerImpl {
 	}
 	ds.memMonitor.Start(ctx, cfg.ParentMemoryMonitor, mon.BoundAccount{})
 
-	testingGenerateMockContentionEvents.SetOnChange(&cfg.Settings.SV, func() {
-		// Note: If a race occurs with this line, this setting is being improperly
-		// used. Mock contention events should be generated either using the cluster
-		// setting or programmatically using the testing knob, but not both.
-		cfg.TestingKnobs.GenerateMockContentionEvents = testingGenerateMockContentionEvents.Get(&cfg.Settings.SV)
+	colexec.HashAggregationDiskSpillingEnabled.SetOnChange(&cfg.Settings.SV, func() {
+		if !colexec.HashAggregationDiskSpillingEnabled.Get(&cfg.Settings.SV) {
+			telemetry.Inc(sqltelemetry.HashAggregationDiskSpillingDisabled)
+		}
 	})
 
 	return ds
@@ -306,7 +305,9 @@ func (ds *ServerImpl) setupFlow(
 	}
 
 	// Create the FlowCtx for the flow.
-	flowCtx := ds.NewFlowContext(ctx, req.Flow.FlowID, evalCtx, req.TraceKV, localState)
+	flowCtx := ds.newFlowContext(
+		ctx, req.Flow.FlowID, evalCtx, req.TraceKV, req.CollectStats, localState, req.Flow.Gateway == roachpb.NodeID(ds.NodeID.SQLInstanceID()),
+	)
 
 	// req always contains the desired vectorize mode, regardless of whether we
 	// have non-nil localState.EvalContext. We don't want to update EvalContext
@@ -372,26 +373,16 @@ func (ds *ServerImpl) setupFlow(
 	return ctx, f, nil
 }
 
-// testingGenerateMockContentionEvents is a testing cluster setting that
-// produces mock contention events. Refer to
-// KVFetcher.TestingEnableMockContentionEventGeneration for a more in-depth
-// description of these contention events. This setting is currently used to
-// test SQL Execution contention observability.
-// TODO(asubiotto): Remove once KV layer produces real contention events.
-var testingGenerateMockContentionEvents = settings.RegisterBoolSetting(
-	"sql.testing.mock_contention.enabled",
-	"whether the KV layer should generate mock contention events",
-	false,
-)
-
-// NewFlowContext creates a new FlowCtx that can be used during execution of
+// newFlowContext creates a new FlowCtx that can be used during execution of
 // a flow.
-func (ds *ServerImpl) NewFlowContext(
+func (ds *ServerImpl) newFlowContext(
 	ctx context.Context,
 	id execinfrapb.FlowID,
 	evalCtx *tree.EvalContext,
 	traceKV bool,
+	collectStats bool,
 	localState LocalState,
+	isGatewayNode bool,
 ) execinfra.FlowCtx {
 	// TODO(radu): we should sanity check some of these fields.
 	flowCtx := execinfra.FlowCtx{
@@ -401,7 +392,14 @@ func (ds *ServerImpl) NewFlowContext(
 		EvalCtx:        evalCtx,
 		NodeID:         ds.ServerConfig.NodeID,
 		TraceKV:        traceKV,
+		CollectStats:   collectStats,
 		Local:          localState.IsLocal,
+		Gateway:        isGatewayNode,
+		// The flow disk monitor is a child of the server's and is closed on
+		// Cleanup.
+		DiskMonitor: execinfra.NewMonitor(
+			ctx, ds.ParentDiskMonitor, "flow-disk-monitor",
+		),
 	}
 
 	if localState.IsLocal && localState.Collection != nil {

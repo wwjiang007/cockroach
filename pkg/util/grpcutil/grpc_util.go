@@ -16,6 +16,7 @@ import (
 	"io"
 	"strings"
 
+	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -90,11 +91,14 @@ func IsClosedConnection(err error) bool {
 	return netutil.IsClosedConnection(err)
 }
 
-// IsAuthenticationError returns true if err's Cause is an error produced by
-// gRPC due to invalid authentication credentials for the operation.
-func IsAuthenticationError(err error) bool {
+// IsAuthError returns true if err's Cause is an error produced by
+// gRPC due to an authentication or authorization error for the operation.
+func IsAuthError(err error) bool {
 	if s, ok := status.FromError(errors.UnwrapAll(err)); ok {
-		return s.Code() == codes.Unauthenticated
+		switch s.Code() {
+		case codes.Unauthenticated, codes.PermissionDenied:
+			return true
+		}
 	}
 	return false
 }
@@ -111,7 +115,8 @@ func IsAuthenticationError(err error) bool {
 // https://github.com/grpc/grpc-go/issues/1443 is resolved.
 func RequestDidNotStart(err error) bool {
 	if errors.HasType(err, connectionNotReadyError{}) ||
-		errors.HasType(err, (*netutil.InitialHeartbeatFailedError)(nil)) {
+		errors.HasType(err, (*netutil.InitialHeartbeatFailedError)(nil)) ||
+		errors.Is(err, circuit.ErrBreakerOpen) {
 		return true
 	}
 	s, ok := status.FromError(errors.Cause(err))

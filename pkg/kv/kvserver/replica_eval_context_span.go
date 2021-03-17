@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -201,15 +202,29 @@ func (rec SpanSetReplicaEvalContext) GetLease() (roachpb.Lease, roachpb.Lease) {
 	return rec.i.GetLease()
 }
 
-// GetDescAndLease is part of the EvalContext interface.
-func (rec SpanSetReplicaEvalContext) GetDescAndLease(
-	ctx context.Context,
-) (roachpb.RangeDescriptor, roachpb.Lease) {
+// GetRangeInfo is part of the EvalContext interface.
+func (rec SpanSetReplicaEvalContext) GetRangeInfo(ctx context.Context) roachpb.RangeInfo {
 	// Do the latching checks and ignore the results.
 	rec.Desc()
 	rec.GetLease()
 
-	return rec.i.GetDescAndLease(ctx)
+	return rec.i.GetRangeInfo(ctx)
+}
+
+// GetCurrentReadSummary is part of the EvalContext interface.
+func (rec *SpanSetReplicaEvalContext) GetCurrentReadSummary() (rspb.ReadSummary, hlc.Timestamp) {
+	// To capture a read summary over the range, all keys must be latched for
+	// writing to prevent any concurrent reads or writes.
+	desc := rec.i.Desc()
+	rec.ss.AssertAllowed(spanset.SpanReadWrite, roachpb.Span{
+		Key:    keys.MakeRangeKeyPrefix(desc.StartKey),
+		EndKey: keys.MakeRangeKeyPrefix(desc.EndKey),
+	})
+	rec.ss.AssertAllowed(spanset.SpanReadWrite, roachpb.Span{
+		Key:    desc.StartKey.AsRawKey(),
+		EndKey: desc.EndKey.AsRawKey(),
+	})
+	return rec.i.GetCurrentReadSummary()
 }
 
 // GetLimiters returns the per-store limiters.
@@ -230,4 +245,15 @@ func (rec *SpanSetReplicaEvalContext) GetExternalStorageFromURI(
 	ctx context.Context, uri string, user security.SQLUsername,
 ) (cloud.ExternalStorage, error) {
 	return rec.i.GetExternalStorageFromURI(ctx, uri, user)
+}
+
+// RevokeLease stops the replica from using its current lease.
+func (rec *SpanSetReplicaEvalContext) RevokeLease(ctx context.Context, seq roachpb.LeaseSequence) {
+	rec.i.RevokeLease(ctx, seq)
+}
+
+// WatchForMerge arranges to block all requests until the in-progress merge
+// completes.
+func (rec *SpanSetReplicaEvalContext) WatchForMerge(ctx context.Context) error {
+	return rec.i.WatchForMerge(ctx)
 }

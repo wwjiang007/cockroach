@@ -13,10 +13,12 @@ package sql
 import (
 	"context"
 	"encoding/hex"
+	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
@@ -25,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -47,15 +50,14 @@ import (
 // write to different descriptors. It will also validate the structure of the
 // descriptor but not its references.
 //
-// TODO(ajwerner): It is critical that we not validate all of the relevant
-// descriptors during statement execution as it may be the case that more than
-// one descriptor is corrupt. Instead, we should validate all of the relevant
-// descriptors just prior to committing the transaction. This would bring the
-// requirement that if a descriptor is upserted, that it leave the database in
-// a valid state, at least in terms of that descriptor and its references.
-// Perhaps transactions which do end up using this should also end up validating
-// all descriptors at the end of the transaction to ensure that this operation
-// didn't break a reference to this descriptor.
+// It is critical that we not validate all of the relevant descriptors during
+// statement execution as it may be the case that more than one descriptor is
+// corrupt. Instead, we rely on ValidateTxnCommit which runs just prior to
+// committing any transaction. This brings the requirement that if a descriptor
+// is to be upserted, it must leave the database in a valid state, at least in
+// terms of that descriptor and its references. This validation can be disabled
+// via the `sql.catalog.descs.validate_on_write.enabled` cluster setting if need
+// be, even though such a need is rather not obvious to foresee.
 func (p *planner) UnsafeUpsertDescriptor(
 	ctx context.Context, descID int64, encodedDesc []byte, force bool,
 ) error {
@@ -88,6 +90,8 @@ func (p *planner) UnsafeUpsertDescriptor(
 	// Validate that existing is sane and store its hex serialization into
 	// existingStr to be written to the event log.
 	var existingStr string
+	var previousOwner string
+	var previousUserPrivileges []descpb.UserPrivileges
 	if existing != nil {
 		if existing.IsUncommittedVersion() {
 			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
@@ -103,33 +107,46 @@ func (p *planner) UnsafeUpsertDescriptor(
 			return errors.AssertionFailedf("failed to marshal existing descriptor %v: %v", existing, err)
 		}
 		existingStr = hex.EncodeToString(marshaled)
+		previousOwner = existing.GetPrivileges().Owner().Normalized()
+		previousUserPrivileges = existing.GetPrivileges().Users
 	}
 
+	tbl, db, typ, schema := descpb.FromDescriptor(&desc)
 	switch md := existing.(type) {
 	case *tabledesc.Mutable:
-		md.TableDescriptor = *desc.GetTable() // nolint:descriptormarshal
+		md.TableDescriptor = *tbl
 	case *schemadesc.Mutable:
-		md.SchemaDescriptor = *desc.GetSchema()
+		md.SchemaDescriptor = *schema
 	case *dbdesc.Mutable:
-		md.DatabaseDescriptor = *desc.GetDatabase()
+		md.DatabaseDescriptor = *db
 	case *typedesc.Mutable:
-		md.TypeDescriptor = *desc.GetType()
+		md.TypeDescriptor = *typ
 	case nil:
-		// nolint:descriptormarshal
-		if tableDesc := desc.GetTable(); tableDesc != nil {
-			existing = tabledesc.NewCreatedMutable(*tableDesc)
-		} else if schemaDesc := desc.GetSchema(); schemaDesc != nil {
-			existing = schemadesc.NewCreatedMutable(*schemaDesc)
-		} else if dbDesc := desc.GetDatabase(); dbDesc != nil {
-			existing = dbdesc.NewCreatedMutable(*dbDesc)
-		} else if typeDesc := desc.GetType(); typeDesc != nil {
-			existing = typedesc.NewCreatedMutable(*typeDesc)
-		} else {
+		b := catalogkv.NewBuilder(&desc)
+		if b == nil {
 			return pgerror.New(pgcode.InvalidTableDefinition, "invalid ")
 		}
+		existing = b.BuildCreatedMutable()
 	default:
 		return errors.AssertionFailedf("unknown descriptor type %T for id %d", existing, id)
 	}
+
+	objectType := privilege.Any
+	switch existing.DescriptorType() {
+	case catalog.Database:
+		objectType = privilege.Database
+	case catalog.Table:
+		objectType = privilege.Table
+	case catalog.Type:
+		objectType = privilege.Type
+	case catalog.Schema:
+		objectType = privilege.Schema
+	}
+
+	if force {
+		p.Descriptors().SkipValidationOnWrite()
+	}
+
 	{
 		b := p.txn.NewBatch()
 		if err := p.Descriptors().WriteDescToBatch(
@@ -141,13 +158,190 @@ func (p *planner) UnsafeUpsertDescriptor(
 			return err
 		}
 	}
-	return p.logEvent(ctx, id,
-		&eventpb.UnsafeUpsertDescriptor{
-			PreviousDescriptor: existingStr,
-			NewDescriptor:      hex.EncodeToString(encodedDesc),
-			Force:              force,
-			ForceNotice:        forceNoticeString,
+
+	// Log any ownership changes.
+	newOwner := existing.GetPrivileges().Owner().Normalized()
+	if previousOwner != newOwner {
+		if err := logOwnerEvents(ctx, p, newOwner, existing); err != nil {
+			return err
+		}
+	}
+
+	// Log any privilege changes.
+	if err := comparePrivileges(
+		ctx, p, existing, previousUserPrivileges, objectType,
+	); err != nil {
+		return err
+	}
+
+	return p.logEvent(ctx, id, &eventpb.UnsafeUpsertDescriptor{
+		PreviousDescriptor: existingStr,
+		NewDescriptor:      hex.EncodeToString(encodedDesc),
+		Force:              force,
+		ForceNotice:        forceNoticeString,
+	})
+}
+
+// comparePrivileges iterates through all users and for each user, compares
+// their old privileges to their new privileges.
+// It then logs the granted and/or revoked privileges for that user.
+func comparePrivileges(
+	ctx context.Context,
+	p *planner,
+	existing catalog.MutableDescriptor,
+	prevUserPrivileges []descpb.UserPrivileges,
+	objectType privilege.ObjectType,
+) error {
+	computePrivilegeChanges := func(prev, cur *descpb.UserPrivileges) (granted, revoked []string) {
+		// User has no privileges anymore after upsert, all privileges revoked.
+		if cur == nil {
+			revoked = privilege.ListFromBitField(prev.Privileges, objectType).SortedNames()
+			return nil, revoked
+		}
+
+		// User privileges have not changed.
+		if prev.Privileges == cur.Privileges {
+			return nil, nil
+		}
+
+		// Construct a set of this user's old privileges (before upsert).
+		prevPrivilegeSet := make(map[string]struct{})
+		for _, priv := range privilege.ListFromBitField(prev.Privileges, objectType).SortedNames() {
+			prevPrivilegeSet[priv] = struct{}{}
+		}
+
+		// Compare with this user's new privileges.
+		for _, priv := range privilege.ListFromBitField(cur.Privileges, objectType).SortedNames() {
+			if _, ok := prevPrivilegeSet[priv]; !ok {
+				// New privileges that do not exist in the old privileges set imply that they have been granted.
+				granted = append(granted, priv)
+			} else {
+				// Old privilege still exists, remove it from set.
+				delete(prevPrivilegeSet, priv)
+			}
+		}
+
+		// Any remaining old privileges imply they do not exist in
+		// the new privilege set, so they have been revoked.
+		for priv := range prevPrivilegeSet {
+			revoked = append(revoked, priv)
+		}
+		sort.Strings(revoked)
+
+		return granted, revoked
+	}
+
+	curUserPrivileges := existing.GetPrivileges().Users
+	curUserMap := make(map[string]*descpb.UserPrivileges)
+	for i := range curUserPrivileges {
+		curUser := &curUserPrivileges[i]
+		curUserMap[curUser.User().Normalized()] = curUser
+	}
+
+	for i := range prevUserPrivileges {
+		prev := &prevUserPrivileges[i]
+		username := prev.User().Normalized()
+		cur := curUserMap[username]
+		granted, revoked := computePrivilegeChanges(prev, cur)
+		delete(curUserMap, username)
+		if granted == nil && revoked == nil {
+			continue
+		}
+		// Log events.
+		if err := logPrivilegeEvents(
+			ctx, p, existing, granted, revoked, username,
+		); err != nil {
+			return err
+		}
+	}
+
+	// Any leftovers in the new users map indicate privileges for a new user.
+	for i := range curUserPrivileges {
+		username := curUserPrivileges[i].User().Normalized()
+		if _, ok := curUserMap[username]; ok {
+			granted := privilege.ListFromBitField(curUserPrivileges[i].Privileges, objectType).SortedNames()
+			if granted == nil {
+				continue
+			}
+			if err := logPrivilegeEvents(
+				ctx, p, existing, granted, nil, username,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// logPrivilegeEvents logs the privilege event for each user.
+func logPrivilegeEvents(
+	ctx context.Context,
+	p *planner,
+	existing catalog.MutableDescriptor,
+	grantedPrivileges []string,
+	revokedPrivileges []string,
+	grantee string,
+) error {
+
+	eventDetails := eventpb.CommonSQLPrivilegeEventDetails{
+		Grantee:           grantee,
+		GrantedPrivileges: grantedPrivileges,
+		RevokedPrivileges: revokedPrivileges,
+	}
+
+	switch md := existing.(type) {
+	case *tabledesc.Mutable:
+		return p.logEvent(ctx, existing.GetID(), &eventpb.ChangeTablePrivilege{
+			CommonSQLPrivilegeEventDetails: eventDetails,
+			TableName:                      md.GetName(),
 		})
+	case *schemadesc.Mutable:
+		return p.logEvent(ctx, existing.GetID(), &eventpb.ChangeSchemaPrivilege{
+			CommonSQLPrivilegeEventDetails: eventDetails,
+			SchemaName:                     md.GetName(),
+		})
+	case *dbdesc.Mutable:
+		return p.logEvent(ctx, existing.GetID(), &eventpb.ChangeDatabasePrivilege{
+			CommonSQLPrivilegeEventDetails: eventDetails,
+			DatabaseName:                   md.GetName(),
+		})
+	case *typedesc.Mutable:
+		return p.logEvent(ctx, existing.GetID(), &eventpb.ChangeTypePrivilege{
+			CommonSQLPrivilegeEventDetails: eventDetails,
+			TypeName:                       md.GetName(),
+		})
+	}
+	return nil
+}
+
+// logPrivilegeEvents logs the owner event for a descriptor.
+func logOwnerEvents(
+	ctx context.Context, p *planner, newOwner string, existing catalog.MutableDescriptor,
+) error {
+	switch md := existing.(type) {
+	case *tabledesc.Mutable:
+		return p.logEvent(ctx, md.GetID(), &eventpb.AlterTableOwner{
+			TableName: md.GetName(),
+			Owner:     newOwner,
+		})
+	case *schemadesc.Mutable:
+		return p.logEvent(ctx, md.GetID(), &eventpb.AlterSchemaOwner{
+			SchemaName: md.GetName(),
+			Owner:      newOwner,
+		})
+	case *dbdesc.Mutable:
+		return p.logEvent(ctx, md.GetID(), &eventpb.AlterDatabaseOwner{
+			DatabaseName: md.GetName(),
+			Owner:        newOwner,
+		})
+	case *typedesc.Mutable:
+		return p.logEvent(ctx, md.GetID(), &eventpb.AlterTypeOwner{
+			TypeName: md.GetName(),
+			Owner:    newOwner,
+		})
+	}
+	return nil
 }
 
 // UnsafeUpsertNamespaceEntry powers the repair builtin of the same name. The
@@ -189,32 +383,24 @@ func (p *planner) UnsafeUpsertNamespaceEntry(
 	if val.Value != nil {
 		existingID = descpb.ID(val.ValueInt())
 	}
+	flags := p.CommonLookupFlags(true /* required */)
+	flags.IncludeDropped = true
+	flags.IncludeOffline = true
 	validateDescriptor := func() error {
-		desc, err := p.Descriptors().GetMutableDescriptorByID(ctx, descID, p.txn)
+		desc, err := p.Descriptors().GetImmutableDescriptorByID(ctx, p.Txn(), descID, flags)
 		if err != nil && descID != keys.PublicSchemaID {
 			return errors.Wrapf(err, "failed to retrieve descriptor %d", descID)
 		}
+		invalid := false
 		switch desc.(type) {
 		case nil:
 			return nil
-		case *tabledesc.Mutable, *typedesc.Mutable:
-			if parentID == 0 || parentSchemaID == 0 {
-				return pgerror.Newf(pgcode.InvalidCatalogName,
-					"invalid prefix (%d, %d) for object %d",
-					parentID, parentSchemaID, descID)
-			}
-		case *schemadesc.Mutable:
-			if parentID == 0 || parentSchemaID != 0 {
-				return pgerror.Newf(pgcode.InvalidCatalogName,
-					"invalid prefix (%d, %d) for schema %d",
-					parentID, parentSchemaID, descID)
-			}
-		case *dbdesc.Mutable:
-			if parentID != 0 || parentSchemaID != 0 {
-				return pgerror.Newf(pgcode.InvalidCatalogName,
-					"invalid prefix (%d, %d) for database %d",
-					parentID, parentSchemaID, descID)
-			}
+		case catalog.TableDescriptor, catalog.TypeDescriptor:
+			invalid = parentID == descpb.InvalidID || parentSchemaID == descpb.InvalidID
+		case catalog.SchemaDescriptor:
+			invalid = parentID == descpb.InvalidID || parentSchemaID != descpb.InvalidID
+		case catalog.DatabaseDescriptor:
+			invalid = parentID != descpb.InvalidID || parentSchemaID != descpb.InvalidID
 		default:
 			// The public schema does not have a descriptor.
 			if descID == keys.PublicSchemaID {
@@ -223,15 +409,19 @@ func (p *planner) UnsafeUpsertNamespaceEntry(
 			return errors.AssertionFailedf(
 				"unexpected descriptor type %T for descriptor %d", desc, descID)
 		}
+
+		if invalid {
+			return pgerror.Newf(pgcode.InvalidCatalogName,
+				"invalid prefix (%d, %d) for %s %d",
+				parentID, parentSchemaID, desc.DescriptorType(), descID)
+		}
 		return nil
 	}
 	validateParentDescriptor := func() error {
-		if parentID == 0 {
+		if parentID == descpb.InvalidID {
 			return nil
 		}
-		parent, err := p.Descriptors().GetMutableDescriptorByID(
-			ctx, parentID, p.txn,
-		)
+		parent, err := p.Descriptors().GetImmutableDescriptorByID(ctx, p.Txn(), parentID, flags)
 		if err != nil {
 			return errors.Wrapf(err, "failed to look up parent %d", parentID)
 		}
@@ -242,18 +432,16 @@ func (p *planner) UnsafeUpsertNamespaceEntry(
 		return nil
 	}
 	validateParentSchemaDescriptor := func() error {
-		if parentSchemaID == 0 || parentSchemaID == keys.PublicSchemaID {
+		if parentSchemaID == descpb.InvalidID || parentSchemaID == keys.PublicSchemaID {
 			return nil
 		}
-		schema, err := p.Descriptors().GetMutableDescriptorByID(
-			ctx, parentID, p.txn,
-		)
+		schema, err := p.Descriptors().GetImmutableDescriptorByID(ctx, p.Txn(), parentSchemaID, flags)
 		if err != nil {
 			return err
 		}
 		if _, isSchema := schema.(catalog.SchemaDescriptor); !isSchema {
 			return pgerror.Newf(pgcode.InvalidCatalogName,
-				"parentSchemaID %d is a %T, not a schema", parentID, schema)
+				"parentSchemaID %d is a %T, not a schema", parentSchemaID, schema)
 		}
 		return nil
 	}
@@ -329,7 +517,10 @@ func (p *planner) UnsafeDeleteNamespaceEntry(
 				parentID, parentSchemaID, name, existingID, descID)
 		}
 	}
-	desc, err := p.Descriptors().GetMutableDescriptorByID(ctx, descID, p.txn)
+	flags := p.CommonLookupFlags(true /* required */)
+	flags.IncludeDropped = true
+	flags.IncludeOffline = true
+	desc, err := p.Descriptors().GetImmutableDescriptorByID(ctx, p.txn, descID, flags)
 	var forceNoticeString string // for the event
 	if err != nil && !errors.Is(err, catalog.ErrDescriptorNotFound) {
 		if force {
@@ -365,6 +556,8 @@ func (p *planner) UnsafeDeleteNamespaceEntry(
 // This method will perform very minimal validation. An error will be returned
 // if no such descriptor exists. This method can very easily introduce
 // corruption, beware.
+//
+// See UnsafeUpsertDescriptor for additional details, and warnings.
 func (p *planner) UnsafeDeleteDescriptor(ctx context.Context, descID int64, force bool) error {
 	const method = "crdb_internal.unsafe_delete_descriptor()"
 	if err := checkPlannerStateForRepairFunctions(ctx, p, method); err != nil {
@@ -374,7 +567,7 @@ func (p *planner) UnsafeDeleteDescriptor(ctx context.Context, descID int64, forc
 	mut, err := p.Descriptors().GetMutableDescriptorByID(ctx, id, p.txn)
 	var forceNoticeString string // for the event
 	if err != nil {
-		if !errors.Is(err, catalog.ErrDescriptorNotFound) && force {
+		if force {
 			notice := pgnotice.NewWithSeverityf("WARNING",
 				"failed to retrieve existing descriptor, continuing with force flag: %v", err)
 			p.BufferClientNotice(ctx, notice)
@@ -391,6 +584,9 @@ func (p *planner) UnsafeDeleteDescriptor(ctx context.Context, descID int64, forc
 		mut.SetDropped()
 		if err := p.Descriptors().AddUncommittedDescriptor(mut); err != nil {
 			return errors.WithAssertionFailure(err)
+		}
+		if force {
+			p.Descriptors().SkipValidationOnWrite()
 		}
 	}
 	descKey := catalogkeys.MakeDescMetadataKey(p.execCfg.Codec, id)

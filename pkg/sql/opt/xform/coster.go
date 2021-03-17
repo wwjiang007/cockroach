@@ -138,6 +138,11 @@ const (
 	// plan that could satisfy the hints.
 	hugeCost memo.Cost = 1e100
 
+	// fullScanRowCountPenalty adds a penalty to full table scans. This is especially
+	// useful for empty or very small tables, where we would get plans that are
+	// surprising to users (like full scans instead of point lookups).
+	fullScanRowCountPenalty = 10
+
 	// preferLookupJoinFactor is a scale factor for the cost of a lookup join when
 	// we have a hint for preferring a lookup join.
 	preferLookupJoinFactor = 1e-6
@@ -407,9 +412,13 @@ var fnCost = map[string]memo.Cost{
 
 // Init initializes a new coster structure with the given memo.
 func (c *coster) Init(evalCtx *tree.EvalContext, mem *memo.Memo, perturbation float64) {
-	c.mem = mem
-	c.locality = evalCtx.Locality
-	c.perturbation = perturbation
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*c = coster{
+		mem:          mem,
+		locality:     evalCtx.Locality,
+		perturbation: perturbation,
+	}
 }
 
 // ComputeCost calculates the estimated cost of the top-level operator in a
@@ -429,7 +438,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		cost = c.computeScanCost(candidate.(*memo.ScanExpr), required)
 
 	case opt.SelectOp:
-		cost = c.computeSelectCost(candidate.(*memo.SelectExpr))
+		cost = c.computeSelectCost(candidate.(*memo.SelectExpr), required)
 
 	case opt.ProjectOp:
 		cost = c.computeProjectCost(candidate.(*memo.ProjectExpr))
@@ -462,7 +471,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		cost = c.computeZigzagJoinCost(candidate.(*memo.ZigzagJoinExpr))
 
 	case opt.UnionOp, opt.IntersectOp, opt.ExceptOp,
-		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp:
+		opt.UnionAllOp, opt.IntersectAllOp, opt.ExceptAllOp, opt.LocalityOptimizedSearchOp:
 		cost = c.computeSetCost(candidate)
 
 	case opt.GroupByOp, opt.ScalarGroupByOp, opt.DistinctOnOp, opt.EnsureDistinctOnOp,
@@ -521,34 +530,45 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 }
 
 func (c *coster) computeSortCost(sort *memo.SortExpr, required *physical.Required) memo.Cost {
-	// We calculate the cost of a segmented sort. We assume each segment
-	// is of the same size of (rowCount / numSegments). We also calculate the
-	// per-row cost. The cost of the sort is:
+	// We calculate the cost of a (potentially) segmented sort.
 	//
-	// perRowCost * (rowCount + (segmentSize * log2(segmentSize) * numOrderedSegments))
+	// In a non-segmented sort, we have a single segment to sort according to
+	// required.Ordering.Columns.
 	//
-	// The constant term is necessary for cases where the estimated row count is
-	// very small.
+	// In a segmented sort, rows are split into segments according to
+	// InputOrdering.Columns; each segment is sorted according to the remaining
+	// columns from required.Ordering.Columns.
+	//
 	// TODO(rytaft): This is the cost of a local, in-memory sort. When a
 	// certain amount of memory is used, distsql switches to a disk-based sort
 	// with a temp RocksDB store.
+	numKeyCols := len(required.Ordering.Columns)
+	numPreorderedCols := len(sort.InputOrdering.Columns)
 
+	rel := sort.Relational()
+	stats := rel.Stats
 	numSegments := c.countSegments(sort)
-	cost := memo.Cost(0)
-	stats := sort.Relational().Stats
-	rowCount := stats.RowCount
-	perRowCost := c.rowSortCost(len(required.Ordering.Columns) - len(sort.InputOrdering.Columns))
+
+	// Start with a cost of storing each row; this takes the total number of
+	// columns into account so that a sort on fewer columns is preferred (e.g.
+	// sort before projecting a new column).
+	cost := memo.Cost(cpuCostFactor * float64(rel.OutputCols.Len()) * stats.RowCount)
 
 	if !sort.InputOrdering.Any() {
-		// Add the cost for finding the segments.
-		cost += memo.Cost(float64(len(sort.InputOrdering.Columns))*rowCount) * cpuCostFactor
+		// Add the cost for finding the segments: each row is compared to the
+		// previous row on the preordered columns. Most of these comparisons will
+		// yield equality, so we don't use rowCmpCost(): we expect to have to
+		// compare all preordered columns.
+		cost += cpuCostFactor * memo.Cost(numPreorderedCols) * memo.Cost(stats.RowCount)
 	}
 
-	segmentSize := rowCount / numSegments
-	if segmentSize > 1 {
-		cost += memo.Cost(segmentSize) * (memo.Cost(math.Log2(segmentSize)) * memo.Cost(numSegments))
+	// Add the cost to sort the segments. On average, each row is involved in
+	// O(log(segmentSize)) comparisons.
+	numCmpOpsPerRow := float64(1)
+	if segmentSize := stats.RowCount / numSegments; segmentSize > 1 {
+		numCmpOpsPerRow += math.Log2(segmentSize)
 	}
-	cost = perRowCost * (memo.Cost(rowCount) + cost)
+	cost += c.rowCmpCost(numKeyCols-numPreorderedCols) * memo.Cost(numCmpOpsPerRow*stats.RowCount)
 	return cost
 }
 
@@ -564,17 +584,6 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 	rowCount := scan.Relational().Stats.RowCount
 	perRowCost := c.rowScanCost(scan.Table, scan.Index, scan.Cols.Len())
 
-	if required.LimitHint != 0 {
-		rowCount = math.Min(rowCount, required.LimitHint*scanSoftLimitMultiplier)
-	}
-
-	if ordering.ScanIsReverse(scan, &required.Ordering) {
-		if rowCount > 1 {
-			// Need to do binary search to seek to the previous row.
-			perRowCost += memo.Cost(math.Log2(rowCount)) * cpuCostFactor
-		}
-	}
-
 	numSpans := 1
 	if scan.Constraint != nil {
 		numSpans = scan.Constraint.Spans.Count()
@@ -588,18 +597,58 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 		baseCost += virtualScanTableDescriptorFetchCost
 	}
 
-	// Add a small cost if the scan is unconstrained, so all else being equal, we
-	// will prefer a constrained scan. This is important if our row count
-	// estimate turns out to be smaller than the actual row count.
+	// Add a penalty to full table scans. All else being equal, we prefer a
+	// constrained scan. Adding a few rows worth of cost helps prevent surprising
+	// plans for very small tables.
 	if scan.IsUnfiltered(c.mem.Metadata()) {
-		baseCost += cpuCostFactor
+		rowCount += fullScanRowCountPenalty
+
+		// For tables with multiple partitions, add the cost of visiting each
+		// partition.
+		// TODO(rytaft): In the future we should take latency into account here.
+		index := c.mem.Metadata().Table(scan.Table).Index(scan.Index)
+		if partitionCount := index.PartitionCount(); partitionCount > 1 {
+			// Subtract 1 since we already accounted for the first partition when
+			// counting spans.
+			baseCost += memo.Cost(partitionCount-1) * randIOCostFactor
+		}
 	}
-	return baseCost + memo.Cost(rowCount)*(seqIOCostFactor+perRowCost)
+
+	if required.LimitHint != 0 {
+		rowCount = math.Min(rowCount, required.LimitHint*scanSoftLimitMultiplier)
+	}
+
+	if ordering.ScanIsReverse(scan, &required.Ordering) {
+		if rowCount > 1 {
+			// Need to do binary search to seek to the previous row.
+			perRowCost += memo.Cost(math.Log2(rowCount)) * cpuCostFactor
+		}
+	}
+
+	cost := baseCost + memo.Cost(rowCount)*(seqIOCostFactor+perRowCost)
+
+	// If this scan is locality optimized, divide the cost in two in order to make
+	// the total cost of the two scans in the locality optimized plan less then
+	// the cost of the single scan in the non-locality optimized plan.
+	// TODO(rytaft): This is hacky. We should really be making this determination
+	// based on the latency between regions.
+	if scan.LocalityOptimized {
+		cost /= 2
+	}
+	return cost
 }
 
-func (c *coster) computeSelectCost(sel *memo.SelectExpr) memo.Cost {
-	// The filter has to be evaluated on each input row.
+func (c *coster) computeSelectCost(sel *memo.SelectExpr, required *physical.Required) memo.Cost {
+	// Typically the filter has to be evaluated on each input row.
 	inputRowCount := sel.Input.Relational().Stats.RowCount
+
+	// If there is a LimitHint, n, it is expected that the filter will only be
+	// evaluated on the number of rows required to produce n rows.
+	if required.LimitHint != 0 {
+		selectivity := sel.Relational().Stats.Selectivity.AsFloat()
+		inputRowCount = math.Min(inputRowCount, required.LimitHint/selectivity)
+	}
+
 	filterSetup, filterPerRow := c.computeFiltersCost(sel.Filters, util.FastIntMap{})
 	cost := memo.Cost(inputRowCount) * filterPerRow
 	cost += filterSetup
@@ -1054,9 +1103,9 @@ func (c *coster) countSegments(sort *memo.SortExpr) float64 {
 	return orderedStats.DistinctCount
 }
 
-// rowSortCost is the CPU cost to sort one row, which depends on the number of
-// columns in the sort key.
-func (c *coster) rowSortCost(numKeyCols int) memo.Cost {
+// rowCmpCost is the CPU cost to compare a pair of rows, which depends on the
+// number of columns in the sort key.
+func (c *coster) rowCmpCost(numKeyCols int) memo.Cost {
 	// Sorting involves comparisons on the key columns, but the cost isn't
 	// directly proportional: we only compare the second column if the rows are
 	// equal on the first column; and so on. We also account for a fixed

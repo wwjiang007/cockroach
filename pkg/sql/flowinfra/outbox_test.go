@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -71,9 +72,10 @@ func TestOutbox(t *testing.T) {
 			Stopper:    stopper,
 			NodeDialer: nodedialer.New(clientRPC, staticAddressResolver(addr)),
 		},
+		NodeID: base.TestingIDContainer,
 	}
 	streamID := execinfrapb.StreamID(42)
-	outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */)
+	outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 	outbox.Init(rowenc.OneIntCol)
 	var outboxWG sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
@@ -227,9 +229,10 @@ func TestOutboxInitializesStreamBeforeReceivingAnyRows(t *testing.T) {
 			Stopper:    stopper,
 			NodeDialer: nodedialer.New(clientRPC, staticAddressResolver(addr)),
 		},
+		NodeID: base.TestingIDContainer,
 	}
 	streamID := execinfrapb.StreamID(42)
-	outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */)
+	outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 
 	var outboxWG sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
@@ -301,6 +304,7 @@ func TestOutboxClosesWhenConsumerCloses(t *testing.T) {
 					Stopper:    stopper,
 					NodeDialer: nodedialer.New(clientRPC, staticAddressResolver(addr)),
 				},
+				NodeID: base.TestingIDContainer,
 			}
 			streamID := execinfrapb.StreamID(42)
 			var outbox *Outbox
@@ -310,7 +314,7 @@ func TestOutboxClosesWhenConsumerCloses(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			if tc.outboxIsClient {
-				outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */)
+				outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 				outbox.Init(rowenc.OneIntCol)
 				outbox.Start(ctx, &wg, cancel)
 
@@ -376,6 +380,7 @@ func TestOutboxClosesWhenConsumerCloses(t *testing.T) {
 						Settings: cluster.MakeTestingClusterSettings(),
 						Stopper:  stopper,
 					},
+					NodeID: base.TestingIDContainer,
 				})
 				outbox.Init(rowenc.OneIntCol)
 				// In a RunSyncFlow call, the outbox runs under the call's context.
@@ -437,6 +442,7 @@ func TestOutboxCancelsFlowOnError(t *testing.T) {
 			Stopper:    stopper,
 			NodeDialer: nodedialer.New(clientRPC, staticAddressResolver(addr)),
 		},
+		NodeID: base.TestingIDContainer,
 	}
 	streamID := execinfrapb.StreamID(42)
 	var outbox *Outbox
@@ -451,7 +457,7 @@ func TestOutboxCancelsFlowOnError(t *testing.T) {
 		ctxCanceled = true
 	}
 
-	outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */)
+	outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 	outbox.Init(rowenc.OneIntCol)
 	outbox.Start(ctx, &wg, mockCancel)
 
@@ -490,6 +496,7 @@ func TestOutboxUnblocksProducers(t *testing.T) {
 			// a nil nodeDialer will always fail to connect.
 			NodeDialer: nil,
 		},
+		NodeID: base.TestingIDContainer,
 	}
 	streamID := execinfrapb.StreamID(42)
 	var outbox *Outbox
@@ -497,7 +504,7 @@ func TestOutboxUnblocksProducers(t *testing.T) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */)
+	outbox = NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 	outbox.Init(rowenc.OneIntCol)
 
 	// Fill up the outbox.
@@ -560,8 +567,9 @@ func BenchmarkOutbox(b *testing.B) {
 					Stopper:    stopper,
 					NodeDialer: nodedialer.New(clientRPC, staticAddressResolver(addr)),
 				},
+				NodeID: base.TestingIDContainer,
 			}
-			outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */)
+			outbox := NewOutbox(&flowCtx, execinfra.StaticNodeID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 			outbox.Init(rowenc.MakeIntCols(numCols))
 			var outboxWG sync.WaitGroup
 			ctx, cancel := context.WithCancel(context.Background())

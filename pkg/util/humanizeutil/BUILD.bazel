@@ -17,13 +17,11 @@ go_library(
 
 go_test(
     name = "humanizeutil_test",
+    size = "small",
     srcs = [
         "duration_test.go",
         "humanize_test.go",
     ],
     embed = [":humanizeutil"],
-    deps = [
-        "//pkg/util/humanizeutil",
-        "//pkg/util/leaktest",
-    ],
+    deps = ["//pkg/util/leaktest"],
 )

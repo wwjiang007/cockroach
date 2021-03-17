@@ -126,8 +126,8 @@ type TestServerArgs struct {
 	// is running in secure mode.
 	DisableWebSessionAuthentication bool
 
-	// If set, testing specific descriptor validation will be disabled. even if the server
-	DisableTestingDescriptorValidation bool
+	// IF set, the demo login endpoint will be enabled.
+	EnableDemoLoginEndpoint bool
 }
 
 // TestClusterArgs contains the parameters one can set when creating a test
@@ -211,7 +211,7 @@ const (
 	ReplicationAuto TestClusterReplicationMode = iota
 	// ReplicationManual means that the split, merge and replication queues of all
 	// servers are stopped, and the test must manually control splitting, merging
-	// and  replication through the TestServer.
+	// and replication through the TestServer.
 	// Note that the server starts with a number of system ranges,
 	// all with a single replica on node 1.
 	ReplicationManual
@@ -226,19 +226,17 @@ type TestTenantArgs struct {
 	// to be created by StartTenant.
 	Existing bool
 
+	// IdleExitAfter, if set will cause the tenant process to exit if idle.
+	IdleExitAfter time.Duration
+
 	// AllowSettingClusterSettings, if true, allows the tenant to set in-memory
 	// cluster settings.
 	AllowSettingClusterSettings bool
-
-	// TenantIDCodecOverride overrides the tenant ID used to construct the SQL
-	// server's codec, but nothing else (e.g. its certs). Used for testing.
-	TenantIDCodecOverride roachpb.TenantID
 
 	// Stopper, if not nil, is used to stop the tenant manually otherwise the
 	// TestServer stopper will be used.
 	Stopper *stop.Stopper
 
-	// DeterministicExplainAnalyze, if set, will result in overriding fields in
-	// EXPLAIN ANALYZE (PLAN) that can vary between runs (like elapsed times).
-	DeterministicExplainAnalyze bool
+	// TestingKnobs for the test server.
+	TestingKnobs TestingKnobs
 }

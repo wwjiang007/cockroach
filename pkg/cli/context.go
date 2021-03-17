@@ -125,11 +125,17 @@ type cliContext struct {
 	// is, the commands executed are extremely likely to be *input* from
 	// a human user: the standard input is a terminal and `-e` was not
 	// used (the shell has a prompt).
+	//
+	// Refer to README.md to understand the general design guidelines for
+	// CLI utilities with interactive vs non-interactive input.
 	isInteractive bool
 
 	// terminalOutput indicates whether output is going to a terminal,
 	// that is, it is not going to a file, another program for automated
 	// processing, etc.: the standard output is a terminal.
+	//
+	// Refer to README.md to understand the general design guidelines for
+	// CLI utilities with terminal vs non-terminal output.
 	terminalOutput bool
 
 	// tableDisplayFormat indicates how to format result tables.
@@ -180,6 +186,9 @@ type cliContext struct {
 	// that no log directory was specified and there were multiple
 	// on-disk stores.
 	ambiguousLogDir bool
+
+	// For `cockroach version --build-tag`.
+	showVersionUsingOnlyBuildTag bool
 }
 
 // cliCtx captures the command-line parameters common to most CLI utilities.
@@ -220,6 +229,7 @@ func setCliContextDefaults() {
 	cliCtx.ambiguousLogDir = false
 	// TODO(knz): Deprecated in v21.1. Remove this.
 	cliCtx.deprecatedLogOverrides.reset()
+	cliCtx.showVersionUsingOnlyBuildTag = false
 }
 
 // sqlCtx captures the configuration of the `sql` command.
@@ -259,6 +269,11 @@ var sqlCtx = struct {
 	// "intelligent behavior" in the SQL shell as possible and become
 	// more verbose (sets echo).
 	debugMode bool
+
+	// embeddedMode, when set, reduces the amount of informational
+	// messages printed out to exclude details that are not
+	// under user's control when the shell is run by a playground environment.
+	embeddedMode bool
 
 	// Determines whether to display server execution timings in the CLI.
 	enableServerExecutionTimings bool
@@ -398,6 +413,11 @@ var startCtx struct {
 	serverCertPrincipalMap []string
 	serverListenAddr       string
 
+	// The TLS auto-handshake parameters.
+	initToken             string
+	numExpectedNodes      int
+	genCertsForSingleNode bool
+
 	// if specified, this forces the HTTP listen addr to localhost
 	// and disables TLS on the HTTP listener.
 	unencryptedLocalhostHTTP bool
@@ -433,6 +453,9 @@ func setStartContextDefaults() {
 	startCtx.serverSSLCertsDir = base.DefaultCertsDirectory
 	startCtx.serverCertPrincipalMap = nil
 	startCtx.serverListenAddr = ""
+	startCtx.initToken = ""
+	startCtx.numExpectedNodes = 0
+	startCtx.genCertsForSingleNode = false
 	startCtx.unencryptedLocalhostHTTP = false
 	startCtx.tempDir = ""
 	startCtx.externalIODir = ""
@@ -595,13 +618,19 @@ func setStmtDiagContextDefaults() {
 
 // importCtx captures the command-line parameters of the 'import' command.
 var importCtx struct {
-	maxRowSize      int
-	skipForeignKeys bool
+	maxRowSize           int
+	skipForeignKeys      bool
+	ignoreUnsupported    bool
+	ignoreUnsupportedLog string
+	rowLimit             int
 }
 
 func setImportContextDefaults() {
 	importCtx.maxRowSize = 512 * (1 << 10) // 512 KiB
 	importCtx.skipForeignKeys = false
+	importCtx.ignoreUnsupported = false
+	importCtx.ignoreUnsupportedLog = ""
+	importCtx.rowLimit = 0
 }
 
 // GetServerCfgStores provides direct public access to the StoreSpecList inside

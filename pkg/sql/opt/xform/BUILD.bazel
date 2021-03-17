@@ -25,6 +25,7 @@ go_library(
     deps = [
         "//pkg/roachpb",
         "//pkg/sql/catalog/colinfo",
+        "//pkg/sql/inverted",
         "//pkg/sql/opt",
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/constraint",
@@ -50,15 +51,18 @@ go_library(
 
 go_test(
     name = "xform_test",
+    size = "small",
     srcs = [
         "coster_test.go",
         "join_order_builder_test.go",
         "main_test.go",
         "optimizer_test.go",
         "physical_props_test.go",
+        "scan_funcs_test.go",
     ],
     data = glob(["testdata/**"]),
     embed = [":xform"],
+    tags = ["broken_in_bazel"],
     deps = [
         "//pkg/config/zonepb",
         "//pkg/roachpb",
@@ -71,7 +75,6 @@ go_test(
         "//pkg/sql/opt/testutils",
         "//pkg/sql/opt/testutils/opttester",
         "//pkg/sql/opt/testutils/testcat",
-        "//pkg/sql/opt/xform",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util/leaktest",

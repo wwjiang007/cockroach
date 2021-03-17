@@ -68,7 +68,8 @@ func (n *createSequenceNode) ReadingOwnWrites() {}
 func (n *createSequenceNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("sequence"))
 
-	_, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), n.n.Persistence, &n.n.Name)
+	_, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), n.n.Persistence, &n.n.Name,
+		tree.ResolveRequireSequenceDesc, n.n.IfNotExists)
 	if err != nil {
 		if sqlerrors.IsRelationAlreadyExistsError(err) && n.n.IfNotExists {
 			return nil
@@ -128,7 +129,7 @@ func doCreateSequence(
 	}
 
 	// makeSequenceTableDesc already validates the table. No call to
-	// desc.ValidateTable() needed here.
+	// desc.ValidateSelf() needed here.
 
 	key := catalogkv.MakeObjectNameKey(
 		params.ctx,
@@ -151,8 +152,7 @@ func doCreateSequence(
 		return err
 	}
 
-	dg := catalogkv.NewOneLevelUncachedDescGetter(params.p.txn, params.ExecCfg().Codec)
-	if err := desc.Validate(params.ctx, dg); err != nil {
+	if err := validateDescriptor(params.ctx, params.p, desc); err != nil {
 		return err
 	}
 
@@ -231,7 +231,7 @@ func NewSequenceTableDesc(
 	// immediately.
 	desc.State = descpb.DescriptorState_PUBLIC
 
-	if err := desc.ValidateTable(ctx); err != nil {
+	if err := catalog.ValidateSelf(&desc); err != nil {
 		return nil, err
 	}
 	return &desc, nil

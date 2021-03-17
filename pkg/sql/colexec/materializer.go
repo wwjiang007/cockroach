@@ -16,21 +16,22 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
 // Materializer converts an Operator input into a execinfra.RowSource.
 type Materializer struct {
 	execinfra.ProcessorBase
-	NonExplainable
+	colexecop.NonExplainable
 
-	input colexecbase.Operator
+	input colexecop.Operator
 	typs  []*types.T
 
 	drainHelper *drainHelper
@@ -62,7 +63,7 @@ type Materializer struct {
 	cancelFlow func() context.CancelFunc
 
 	// closers is a slice of Closers that should be Closed on termination.
-	closers colexecbase.Closers
+	closers colexecop.Closers
 }
 
 // drainHelper is a utility struct that wraps MetadataSources in a RowSource
@@ -74,6 +75,7 @@ type drainHelper struct {
 	sources      execinfrapb.MetadataSources
 	ctx          context.Context
 	bufferedMeta []execinfrapb.ProducerMetadata
+	getStats     func() []*execinfrapb.ComponentStats
 }
 
 var _ execinfra.RowSource = &drainHelper{}
@@ -85,9 +87,12 @@ var drainHelperPool = sync.Pool{
 	},
 }
 
-func newDrainHelper(sources execinfrapb.MetadataSources) *drainHelper {
+func newDrainHelper(
+	sources execinfrapb.MetadataSources, getStats func() []*execinfrapb.ComponentStats,
+) *drainHelper {
 	d := drainHelperPool.Get().(*drainHelper)
 	d.sources = sources
+	d.getStats = getStats
 	return d
 }
 
@@ -99,9 +104,8 @@ func (d *drainHelper) OutputTypes() []*types.T {
 }
 
 // Start implements the RowSource interface.
-func (d *drainHelper) Start(ctx context.Context) context.Context {
+func (d *drainHelper) Start(ctx context.Context) {
 	d.ctx = ctx
-	return ctx
 }
 
 // Next implements the RowSource interface.
@@ -122,7 +126,21 @@ func (d *drainHelper) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata)
 }
 
 // ConsumerDone implements the RowSource interface.
-func (d *drainHelper) ConsumerDone() {}
+func (d *drainHelper) ConsumerDone() {
+	if d.getStats != nil {
+		// If getStats is non-nil, then the drainHelper is responsible for
+		// attaching the execution statistics to the span, yet we don't get the
+		// recording from the span - that is left to the materializer (more
+		// precisely to the embedded ProcessorBase) which is necessary in order
+		// to not collect same trace data twice.
+		if sp := tracing.SpanFromContext(d.ctx); sp != nil {
+			for _, s := range d.getStats() {
+				sp.RecordStructured(s)
+			}
+		}
+		d.getStats = nil
+	}
+}
 
 // ConsumerClosed implements the RowSource interface.
 func (d *drainHelper) ConsumerClosed() {}
@@ -154,7 +172,8 @@ var materializerEmptyPostProcessSpec = &execinfrapb.PostProcessSpec{}
 // - typs is the output types scheme.
 // - metadataSourcesQueue are all of the metadata sources that are planned on
 // the same node as the Materializer and that need to be drained.
-// - outputStatsToTrace (when tracing is enabled) finishes the stats.
+// - getStats (when tracing is enabled) returns all of the execution statistics
+// of operators which the materializer is responsible for.
 // - cancelFlow should return the context cancellation function that cancels
 // the context of the flow (i.e. it is Flow.ctxCancel). It should only be
 // non-nil in case of a root Materializer (i.e. not when we're wrapping a row
@@ -164,12 +183,12 @@ var materializerEmptyPostProcessSpec = &execinfrapb.PostProcessSpec{}
 func NewMaterializer(
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
-	input colexecbase.Operator,
+	input colexecop.Operator,
 	typs []*types.T,
 	output execinfra.RowReceiver,
 	metadataSourcesQueue []execinfrapb.MetadataSource,
-	toClose []colexecbase.Closer,
-	execStatsForTrace func() *execinfrapb.ComponentStats,
+	toClose []colexecop.Closer,
+	getStats func() []*execinfrapb.ComponentStats,
 	cancelFlow func() context.CancelFunc,
 ) (*Materializer, error) {
 	m := materializerPool.Get().(*Materializer)
@@ -177,7 +196,7 @@ func NewMaterializer(
 		ProcessorBase: m.ProcessorBase,
 		input:         input,
 		typs:          typs,
-		drainHelper:   newDrainHelper(metadataSourcesQueue),
+		drainHelper:   newDrainHelper(metadataSourcesQueue, getStats),
 		converter:     colconv.NewAllVecToDatumConverter(len(typs)),
 		row:           make(rowenc.EncDatumRow, len(typs)),
 		closers:       toClose,
@@ -199,7 +218,9 @@ func NewMaterializer(
 		execinfra.ProcStateOpts{
 			// We append drainHelper to inputs to drain below in order to reuse
 			// the same underlying slice from the pooled materializer.
-			TrailingMetaCallback: func(ctx context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
+				// Note that we delegate draining all of the metadata sources
+				// to drainHelper which is added as an input to drain below.
 				m.close()
 				return nil
 			},
@@ -208,7 +229,6 @@ func NewMaterializer(
 		return nil, err
 	}
 	m.AddInputToDrain(m.drainHelper)
-	m.ExecStatsForTrace = execStatsForTrace
 	m.cancelFlow = cancelFlow
 	return m, nil
 }
@@ -233,16 +253,15 @@ func (m *Materializer) Child(nth int, verbose bool) execinfra.OpNode {
 }
 
 // Start is part of the execinfra.RowSource interface.
-func (m *Materializer) Start(ctx context.Context) context.Context {
-	ctx = m.drainHelper.Start(ctx)
+func (m *Materializer) Start(ctx context.Context) {
 	ctx = m.ProcessorBase.StartInternal(ctx, materializerProcName)
+	m.drainHelper.Start(ctx)
 	// We can encounter an expected error during Init (e.g. an operator
 	// attempts to allocate a batch, but the memory budget limit has been
 	// reached), so we need to wrap it with a catcher.
 	if err := colexecerror.CatchVectorizedRuntimeError(m.input.Init); err != nil {
 		m.MoveToDraining(err)
 	}
-	return ctx
 }
 
 // next is the logic of Next() extracted in a separate method to be used by an

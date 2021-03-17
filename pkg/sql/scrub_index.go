@@ -18,7 +18,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -33,7 +32,7 @@ import (
 //    that refers to a primary index key that cannot be found.
 type indexCheckOperation struct {
 	tableName *tree.TableName
-	tableDesc *tabledesc.Immutable
+	tableDesc catalog.TableDescriptor
 	indexDesc *descpb.IndexDescriptor
 	asOf      hlc.Timestamp
 
@@ -58,7 +57,7 @@ type indexCheckRun struct {
 
 func newIndexCheckOperation(
 	tableName *tree.TableName,
-	tableDesc *tabledesc.Immutable,
+	tableDesc catalog.TableDescriptor,
 	indexDesc *descpb.IndexDescriptor,
 	asOf hlc.Timestamp,
 ) *indexCheckOperation {
@@ -76,16 +75,16 @@ func (o *indexCheckOperation) Start(params runParams) error {
 	ctx := params.ctx
 
 	var colToIdx catalog.TableColMap
-	for i := range o.tableDesc.Columns {
-		id := o.tableDesc.Columns[i].ID
-		colToIdx.Set(id, i)
+	for _, c := range o.tableDesc.PublicColumns() {
+		colToIdx.Set(c.GetID(), c.Ordinal())
 	}
 
 	var pkColumns, otherColumns []*descpb.ColumnDescriptor
 
-	for _, colID := range o.tableDesc.GetPrimaryIndex().ColumnIDs {
-		col := &o.tableDesc.Columns[colToIdx.GetDefault(colID)]
-		pkColumns = append(pkColumns, col)
+	for i := 0; i < o.tableDesc.GetPrimaryIndex().NumColumns(); i++ {
+		colID := o.tableDesc.GetPrimaryIndex().GetColumnID(i)
+		col := o.tableDesc.PublicColumns()[colToIdx.GetDefault(colID)]
+		pkColumns = append(pkColumns, col.ColumnDesc())
 		colToIdx.Set(colID, -1)
 	}
 
@@ -95,8 +94,8 @@ func (o *indexCheckOperation) Start(params runParams) error {
 			// Skip PK column.
 			return
 		}
-		col := &o.tableDesc.Columns[pos]
-		otherColumns = append(otherColumns, col)
+		col := o.tableDesc.PublicColumns()[pos]
+		otherColumns = append(otherColumns, col.ColumnDesc())
 	}
 
 	// Collect all of the columns we are fetching from the index. This
@@ -121,10 +120,10 @@ func (o *indexCheckOperation) Start(params runParams) error {
 	}
 
 	checkQuery := createIndexCheckQuery(
-		colNames(pkColumns), colNames(otherColumns), o.tableDesc.ID, o.indexDesc.ID,
+		colNames(pkColumns), colNames(otherColumns), o.tableDesc.GetID(), o.indexDesc.ID,
 	)
 
-	rows, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Query(
+	rows, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryBuffered(
 		ctx, "scrub-index", params.p.txn, checkQuery,
 	)
 	if err != nil {

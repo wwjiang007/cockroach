@@ -86,6 +86,19 @@ func (ri *RangeIterator) Leaseholder() *roachpb.ReplicaDescriptor {
 	return ri.token.Leaseholder()
 }
 
+// ClosedTimestampPolicy returns the closed timestamp policy of the range at
+// which the iterator is currently positioned. The iterator must be valid.
+//
+// The policy information comes from a cache, and so it can be stale. Returns
+// the default policy of LAG_BY_CLUSTER_SETTING if no policy information is
+// known.
+func (ri *RangeIterator) ClosedTimestampPolicy() roachpb.RangeClosedTimestampPolicy {
+	if !ri.Valid() {
+		panic(ri.Error())
+	}
+	return ri.token.ClosedTimestampPolicy()
+}
+
 // Token returns the eviction token corresponding to the range
 // descriptor for the current iteration. The iterator must be valid.
 func (ri *RangeIterator) Token() rangecache.EvictionToken {
@@ -118,11 +131,13 @@ func (ri *RangeIterator) Valid() bool {
 	return ri.Error() == nil
 }
 
+var errRangeIterNotInitialized = errors.New("range iterator not intialized with Seek()")
+
 // Error returns the error the iterator encountered, if any. If
 // the iterator has not been initialized, returns iterator error.
 func (ri *RangeIterator) Error() error {
 	if !ri.init {
-		return errors.New("range iterator not intialized with Seek()")
+		return errRangeIterNotInitialized // hot path
 	}
 	return ri.err
 }

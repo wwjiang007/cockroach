@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/rsg"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -122,8 +123,17 @@ func TestFormatStatement(t *testing.T) {
 			`CREATE TYPE _ AS ENUM (_, _, _)`},
 		{`ALTER TYPE a ADD VALUE 'hi' BEFORE 'hello'`, tree.FmtAnonymize,
 			`ALTER TYPE _ ADD VALUE _ BEFORE _`},
+		{`ALTER TYPE a DROP VALUE 'hi'`, tree.FmtAnonymize,
+			`ALTER TYPE _ DROP VALUE _`},
 		{`ALTER TYPE a RENAME VALUE 'value1' TO 'value2'`, tree.FmtAnonymize,
 			`ALTER TYPE _ RENAME VALUE _ TO _`},
+
+		{`RESTORE abc.xzy FROM 'a' WITH into_db='foo', skip_missing_foreign_keys`,
+			tree.FmtHideConstants | tree.FmtAnonymize,
+			`RESTORE TABLE _._ FROM _ WITH into_db=_, skip_missing_foreign_keys`},
+		{`RESTORE FROM 'a' WITH into_db='foo', skip_missing_foreign_keys`,
+			tree.FmtHideConstants | tree.FmtAnonymize,
+			`RESTORE FROM _ WITH into_db=_, skip_missing_foreign_keys`},
 	}
 
 	for i, test := range testData {
@@ -321,6 +331,36 @@ func TestFormatExpr(t *testing.T) {
 func TestFormatExpr2(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	enumMembers := []string{"hi", "hello"}
+	enumType := types.MakeEnum(typedesc.TypeIDToOID(500), typedesc.TypeIDToOID(100500))
+	enumType.TypeMeta = types.UserDefinedTypeMetadata{
+		Name: &types.UserDefinedTypeName{
+			Schema: "test",
+			Name:   "greeting",
+		},
+		EnumData: &types.EnumMetadata{
+			LogicalRepresentations: enumMembers,
+			// The physical representations don't matter in this case, but the
+			// enum related code in tree expects that the length of
+			// PhysicalRepresentations is equal to the length of
+			// LogicalRepresentations.
+			PhysicalRepresentations: [][]byte{
+				{0x42, 0x1},
+				{0x42},
+			},
+			IsMemberReadOnly: make([]bool, len(enumMembers)),
+		},
+	}
+	enumHi, err := tree.MakeDEnumFromLogicalRepresentation(enumType, enumMembers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	enumHello, err := tree.MakeDEnumFromLogicalRepresentation(enumType, enumMembers[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// This tests formatting from an expr AST. Suitable for use if your input
 	// isn't easily creatable from a string without running an Eval.
 	testData := []struct {
@@ -343,7 +383,7 @@ func TestFormatExpr2(t *testing.T) {
 			types.MakeTuple([]*types.T{types.Int, types.String}),
 			tree.DNull, tree.NewDString("foo")),
 			tree.FmtParsable,
-			`(NULL::INT8, 'foo':::STRING)`,
+			`(NULL:::INT8, 'foo':::STRING)`,
 		},
 		{tree.NewDTuple(
 			types.MakeTuple([]*types.T{types.Unknown, types.String}),
@@ -359,8 +399,27 @@ func TestFormatExpr2(t *testing.T) {
 			tree.FmtParsable,
 			`ARRAY[NULL,NULL]:::INT8[]`,
 		},
+		{tree.NewDTuple(
+			types.MakeTuple([]*types.T{enumType, enumType}),
+			tree.DNull, enumHi),
+			tree.FmtParsable,
+			`(NULL:::greeting, 'hi':::greeting)`,
+		},
 
-		// Ensure that nulls get properly type annotated when printed in an
+		// Ensure that enums get properly type annotated when printed in an
+		// enclosing tuple for serialization purposes.
+		{tree.NewDTuple(
+			types.MakeTuple([]*types.T{enumType, enumType}),
+			enumHi, enumHello),
+			tree.FmtSerializable,
+			`(x'4201':::@100500, x'42':::@100500)`,
+		},
+		{tree.NewDTuple(
+			types.MakeTuple([]*types.T{enumType, enumType}),
+			tree.DNull, enumHi),
+			tree.FmtSerializable,
+			`(NULL:::@100500, x'4201':::@100500)`,
+		},
 	}
 
 	ctx := context.Background()

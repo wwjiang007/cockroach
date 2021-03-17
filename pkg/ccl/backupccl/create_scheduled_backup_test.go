@@ -33,8 +33,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	pbtypes "github.com/gogo/protobuf/types"
@@ -138,17 +140,17 @@ func (h *testHelper) createBackupSchedule(
 		var id int64
 		require.NoError(t, rows.Scan(&id, &unusedStr, &unusedStr, &unusedTS, &unusedStr, &unusedStr))
 		// Query system.scheduled_job table and load those schedules.
-		datums, cols, err := h.cfg.InternalExecutor.QueryWithCols(
+		datums, cols, err := h.cfg.InternalExecutor.QueryRowExWithCols(
 			context.Background(), "sched-load", nil,
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			"SELECT * FROM system.scheduled_jobs WHERE schedule_id = $1",
 			id,
 		)
 		require.NoError(t, err)
-		require.Equal(t, 1, len(datums))
+		require.NotNil(t, datums)
 
 		s := jobs.NewScheduledJob(h.env)
-		require.NoError(t, s.InitFromDatums(datums[0], cols))
+		require.NoError(t, s.InitFromDatums(datums, cols))
 		schedules = append(schedules, s)
 	}
 
@@ -178,6 +180,9 @@ func (t userType) String() string {
 // itself with the actual scheduling and the execution of those backups.
 func TestSerializesScheduledBackupExecutionArgs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderRaceWithIssue(t, 60718, "flaky test")
+	defer log.Scope(t).Close(t)
+
 	th, cleanup := newTestHelper(t)
 	defer cleanup()
 
@@ -435,6 +440,8 @@ func TestSerializesScheduledBackupExecutionArgs(t *testing.T) {
 
 func TestScheduleBackup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	th, cleanup := newTestHelper(t)
 	defer cleanup()
 
@@ -483,7 +490,7 @@ INSERT INTO t1 values (-1), (10), (-100);
 	}
 
 	expectedSystemTables := make([]string, 0)
-	for systemTableName := range getSystemTablesToIncludeInClusterBackup() {
+	for systemTableName := range GetSystemTablesToIncludeInClusterBackup() {
 		expectedSystemTables = append(expectedSystemTables, systemTableName)
 	}
 
@@ -578,6 +585,8 @@ INSERT INTO t1 values (-1), (10), (-100);
 
 func TestCreateBackupScheduleRequiresAdminRole(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	th, cleanup := newTestHelper(t)
 	defer cleanup()
 
@@ -599,6 +608,8 @@ func TestCreateBackupScheduleRequiresAdminRole(t *testing.T) {
 
 func TestCreateBackupScheduleCollectionOverwrite(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	th, cleanup := newTestHelper(t)
 	defer cleanup()
 
@@ -619,6 +630,8 @@ func TestCreateBackupScheduleCollectionOverwrite(t *testing.T) {
 
 func TestCreateBackupScheduleInExplicitTxnRollback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	th, cleanup := newTestHelper(t)
 	defer cleanup()
 
@@ -639,6 +652,8 @@ func TestCreateBackupScheduleInExplicitTxnRollback(t *testing.T) {
 // (eventually), even after the cluster has been down for a long period.
 func TestScheduleBackupRecoversFromClusterDown(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	th, cleanup := newTestHelper(t)
 	defer cleanup()
 
@@ -707,8 +722,8 @@ INSERT INTO t values (1), (10), (100);
 		require.NoError(t, th.executeSchedules())
 		th.waitForSuccessfulScheduledJob(t, incID)
 
-		return schedules[0].ScheduleID(),
-			schedules[1].ScheduleID(),
+		return fullID,
+			incID,
 			func() {
 				th.sqlDB.Exec(t, "DROP SCHEDULE $1", schedules[0].ScheduleID())
 				th.sqlDB.Exec(t, "DROP SCHEDULE $1", schedules[1].ScheduleID())

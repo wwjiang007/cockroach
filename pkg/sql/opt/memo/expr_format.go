@@ -277,7 +277,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		colList = t.Cols
 
 	case *UnionExpr, *IntersectExpr, *ExceptExpr,
-		*UnionAllExpr, *IntersectAllExpr, *ExceptAllExpr:
+		*UnionAllExpr, *IntersectAllExpr, *ExceptAllExpr, *LocalityOptimizedSearchExpr:
 		colList = e.Private().(*SetPrivate).OutCols
 
 	default:
@@ -321,7 +321,7 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 	// Special-case handling for set operators to show the left and right
 	// input columns that correspond to the output columns.
 	case *UnionExpr, *IntersectExpr, *ExceptExpr,
-		*UnionAllExpr, *IntersectAllExpr, *ExceptAllExpr:
+		*UnionAllExpr, *IntersectAllExpr, *ExceptAllExpr, *LocalityOptimizedSearchExpr:
 		if !f.HasFlags(ExprFmtHideColumns) {
 			private := e.Private().(*SetPrivate)
 			f.formatColList(e, tp, "left columns:", private.LeftCols)
@@ -352,17 +352,18 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 					f.formatExpr(tab.ComputedCols[col], c.Child(f.ColumnString(col)))
 				}
 			}
-			if tab.PartialIndexPredicates != nil {
+			partialIndexPredicates := tab.PartialIndexPredicatesForFormattingOnly()
+			if partialIndexPredicates != nil {
 				c := tp.Child("partial index predicates")
-				indexOrds := make([]cat.IndexOrdinal, 0, len(tab.PartialIndexPredicates))
-				for ord := range tab.PartialIndexPredicates {
+				indexOrds := make([]cat.IndexOrdinal, 0, len(partialIndexPredicates))
+				for ord := range partialIndexPredicates {
 					indexOrds = append(indexOrds, ord)
 				}
 				sort.Ints(indexOrds)
 				for _, ord := range indexOrds {
 					name := string(tab.Table.Index(ord).Name())
 					f.Buffer.Reset()
-					f.formatScalarWithLabel(name, tab.PartialIndexPredicates[ord], c)
+					f.formatScalarWithLabel(name, partialIndexPredicates[ord], c)
 				}
 			}
 		}
@@ -451,15 +452,24 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			tp.Childf("flags: %s", t.Flags.String())
 		}
 		if !f.HasFlags(ExprFmtHideColumns) {
-			idxCols := make(opt.ColList, len(t.KeyCols))
-			idx := md.Table(t.Table).Index(t.Index)
-			for i := range idxCols {
-				idxCols[i] = t.Table.ColumnID(idx.Column(i).Ordinal())
+			if len(t.KeyCols) > 0 {
+				idxCols := make(opt.ColList, len(t.KeyCols))
+				idx := md.Table(t.Table).Index(t.Index)
+				for i := range idxCols {
+					idxCols[i] = t.Table.ColumnID(idx.Column(i).Ordinal())
+				}
+				tp.Childf("key columns: %v = %v", t.KeyCols, idxCols)
 			}
-			tp.Childf("key columns: %v = %v", t.KeyCols, idxCols)
+			if len(t.LookupExpr) > 0 {
+				n := tp.Childf("lookup expression")
+				f.formatExpr(&t.LookupExpr, n)
+			}
 		}
 		if t.LookupColsAreTableKey {
 			tp.Childf("lookup columns are key")
+		}
+		if t.IsSecondJoinInPairedJoiner {
+			tp.Childf("second join in paired joiner")
 		}
 
 	case *InvertedJoinExpr:
@@ -473,6 +483,9 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 				idxCols[i] = t.Table.ColumnID(idx.Column(i).Ordinal())
 			}
 			tp.Childf("prefix key columns: %v = %v", t.PrefixKeyCols, idxCols)
+		}
+		if t.IsFirstJoinInPairedJoiner {
+			f.formatColList(e, tp, "first join in paired joiner; continuation column:", opt.ColList{t.ContinuationCol})
 		}
 		n := tp.Child("inverted-expr")
 		f.formatExpr(t.InvertedExpr, n)
@@ -508,7 +521,8 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			if len(colList) == 0 {
 				tp.Child("columns: <none>")
 			}
-			f.formatArbiters(tp, t.Arbiters, t.Table)
+			f.formatArbiterIndexes(tp, t.ArbiterIndexes, t.Table)
+			f.formatArbiterConstraints(tp, t.ArbiterConstraints, t.Table)
 			f.formatMutationCols(e, tp, "insert-mapping:", t.InsertCols, t.Table)
 			f.formatOptionalColList(e, tp, "check columns:", t.CheckCols)
 			f.formatOptionalColList(e, tp, "partial index put columns:", t.PartialIndexPutCols)
@@ -534,7 +548,8 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 				tp.Child("columns: <none>")
 			}
 			if t.CanaryCol != 0 {
-				f.formatArbiters(tp, t.Arbiters, t.Table)
+				f.formatArbiterIndexes(tp, t.ArbiterIndexes, t.Table)
+				f.formatArbiterConstraints(tp, t.ArbiterConstraints, t.Table)
 				f.formatColList(e, tp, "canary column:", opt.ColList{t.CanaryCol})
 				f.formatOptionalColList(e, tp, "fetch columns:", t.FetchCols)
 				f.formatMutationCols(e, tp, "insert-mapping:", t.InsertCols, t.Table)
@@ -1098,9 +1113,9 @@ func (f *ExprFmtCtx) formatIndex(tabID opt.TableID, idxOrd cat.IndexOrdinal, rev
 	}
 }
 
-// formatArbiters constructs a new treeprinter child containing the
+// formatArbiterIndexes constructs a new treeprinter child containing the
 // specified list of arbiter indexes.
-func (f *ExprFmtCtx) formatArbiters(
+func (f *ExprFmtCtx) formatArbiterIndexes(
 	tp treeprinter.Node, arbiters cat.IndexOrdinals, tabID opt.TableID,
 ) {
 	md := f.Memo.Metadata()
@@ -1111,6 +1126,26 @@ func (f *ExprFmtCtx) formatArbiters(
 		f.Buffer.WriteString("arbiter indexes:")
 		for _, idx := range arbiters {
 			name := string(tab.Index(idx).Name())
+			f.space()
+			f.Buffer.WriteString(name)
+		}
+		tp.Child(f.Buffer.String())
+	}
+}
+
+// formatArbiterConstraints constructs a new treeprinter child containing the
+// specified list of arbiter constraints.
+func (f *ExprFmtCtx) formatArbiterConstraints(
+	tp treeprinter.Node, arbiters cat.UniqueOrdinals, tabID opt.TableID,
+) {
+	md := f.Memo.Metadata()
+	tab := md.Table(tabID)
+
+	if len(arbiters) > 0 {
+		f.Buffer.Reset()
+		f.Buffer.WriteString("arbiter constraints:")
+		for _, uc := range arbiters {
+			name := tab.Unique(uc).Name()
 			f.space()
 			f.Buffer.WriteString(name)
 		}

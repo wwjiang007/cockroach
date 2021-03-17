@@ -17,9 +17,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -45,7 +45,7 @@ func gcIndexes(
 		return err
 	}
 
-	var parentTable *tabledesc.Immutable
+	var parentTable catalog.TableDescriptor
 	if err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
 		parentTable, err = catalogkv.MustGetTableDescByID(ctx, txn, execCfg.Codec, parentID)
 		return err
@@ -66,7 +66,11 @@ func gcIndexes(
 		// All the data chunks have been removed. Now also removed the
 		// zone configs for the dropped indexes, if any.
 		if err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			return sql.RemoveIndexZoneConfigs(ctx, txn, execCfg, parentTable.GetID(), []descpb.IndexDescriptor{indexDesc})
+			freshParentTableDesc, err := catalogkv.MustGetTableDescByID(ctx, txn, execCfg.Codec, parentID)
+			if err != nil {
+				return err
+			}
+			return sql.RemoveIndexZoneConfigs(ctx, txn, execCfg, freshParentTableDesc, []descpb.IndexDescriptor{indexDesc})
 		}); err != nil {
 			return errors.Wrapf(err, "removing index %d zone configs", indexDesc.ID)
 		}
@@ -82,10 +86,10 @@ func gcIndexes(
 func clearIndex(
 	ctx context.Context,
 	execCfg *sql.ExecutorConfig,
-	tableDesc *tabledesc.Immutable,
+	tableDesc catalog.TableDescriptor,
 	index descpb.IndexDescriptor,
 ) error {
-	log.Infof(ctx, "clearing index %d from table %d", index.ID, tableDesc.ID)
+	log.Infof(ctx, "clearing index %d from table %d", index.ID, tableDesc.GetID())
 	if index.IsInterleaved() {
 		return errors.Errorf("unexpected interleaved index %d", index.ID)
 	}
@@ -109,11 +113,11 @@ func clearIndex(
 func completeDroppedIndex(
 	ctx context.Context,
 	execCfg *sql.ExecutorConfig,
-	table *tabledesc.Immutable,
+	table catalog.TableDescriptor,
 	indexID descpb.IndexID,
 	progress *jobspb.SchemaChangeGCProgress,
 ) error {
-	if err := updateDescriptorGCMutations(ctx, execCfg, table.ID, indexID); err != nil {
+	if err := updateDescriptorGCMutations(ctx, execCfg, table.GetID(), indexID); err != nil {
 		return errors.Wrapf(err, "updating GC mutations")
 	}
 

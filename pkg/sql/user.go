@@ -14,6 +14,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -110,8 +111,9 @@ func retrieveUserAndPassword(
 	}
 
 	// Perform the lookup with a timeout.
-	err = runFn(func(ctx context.Context) error {
-		const getHashedPassword = `SELECT "hashedPassword" FROM system.users ` +
+	err = runFn(func(ctx context.Context) (retErr error) {
+		// Use fully qualified table name to avoid looking up "".system.users.
+		const getHashedPassword = `SELECT "hashedPassword" FROM system.public.users ` +
 			`WHERE username=$1`
 		values, err := ie.QueryRowEx(
 			ctx, "get-hashed-pwd", nil, /* txn */
@@ -131,10 +133,11 @@ func retrieveUserAndPassword(
 			return nil
 		}
 
-		getLoginDependencies := `SELECT option, value FROM system.role_options ` +
+		// Use fully qualified table name to avoid looking up "".system.role_options.
+		getLoginDependencies := `SELECT option, value FROM system.public.role_options ` +
 			`WHERE username=$1 AND option IN ('NOLOGIN', 'VALID UNTIL')`
 
-		loginDependencies, err := ie.QueryEx(
+		it, err := ie.QueryIteratorEx(
 			ctx, "get-login-dependencies", nil, /* txn */
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			getLoginDependencies,
@@ -143,11 +146,16 @@ func retrieveUserAndPassword(
 		if err != nil {
 			return errors.Wrapf(err, "error looking up user %s", normalizedUsername)
 		}
+		// We have to make sure to close the iterator since we might return from
+		// the for loop early (before Next() returns false).
+		defer func() { retErr = errors.CombineErrors(retErr, it.Close()) }()
 
 		// To support users created before 20.1, allow all USERS/ROLES to login
 		// if NOLOGIN is not found.
 		canLogin = true
-		for _, row := range loginDependencies {
+		var ok bool
+		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+			row := it.Cur()
 			option := string(tree.MustBeDString(row[0]))
 
 			if option == "NOLOGIN" {
@@ -170,7 +178,7 @@ func retrieveUserAndPassword(
 			}
 		}
 
-		return nil
+		return err
 	})
 
 	if err != nil {
@@ -191,7 +199,7 @@ var userLoginTimeout = settings.RegisterDurationSetting(
 // GetAllRoles returns a "set" (map) of Roles -> true.
 func (p *planner) GetAllRoles(ctx context.Context) (map[security.SQLUsername]bool, error) {
 	query := `SELECT username FROM system.users`
-	rows, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryEx(
+	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIteratorEx(
 		ctx, "read-users", p.txn,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		query)
@@ -200,19 +208,25 @@ func (p *planner) GetAllRoles(ctx context.Context) (map[security.SQLUsername]boo
 	}
 
 	users := make(map[security.SQLUsername]bool)
-	for _, row := range rows {
-		username := tree.MustBeDString(row[0])
+	var ok bool
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+		username := tree.MustBeDString(it.Cur()[0])
 		// The usernames in system.users are already normalized.
 		users[security.MakeSQLUsernameFromPreNormalizedString(string(username))] = true
+	}
+	if err != nil {
+		return nil, err
 	}
 	return users, nil
 }
 
 // RoleExists returns true if the role exists.
-func (p *planner) RoleExists(ctx context.Context, role security.SQLUsername) (bool, error) {
+func RoleExists(
+	ctx context.Context, execCfg *ExecutorConfig, txn *kv.Txn, role security.SQLUsername,
+) (bool, error) {
 	query := `SELECT username FROM system.users WHERE username = $1`
-	row, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryRowEx(
-		ctx, "read-users", p.txn,
+	row, err := execCfg.InternalExecutor.QueryRowEx(
+		ctx, "read-users", txn,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 		query, role,
 	)
@@ -223,7 +237,7 @@ func (p *planner) RoleExists(ctx context.Context, role security.SQLUsername) (bo
 	return row != nil, nil
 }
 
-var roleMembersTableName = tree.MakeTableName("system", "role_members")
+var roleMembersTableName = tree.MakeTableNameWithSchema("system", tree.PublicSchemaName, "role_members")
 
 // BumpRoleMembershipTableVersion increases the table version for the
 // role membership table.

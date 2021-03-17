@@ -21,6 +21,7 @@ go_library(
 
 go_test(
     name = "workloadccl_test",
+    size = "small",
     srcs = [
         "bench_test.go",
         "fixture_test.go",
@@ -31,7 +32,6 @@ go_test(
         "//pkg/base",
         "//pkg/ccl",
         "//pkg/ccl/utilccl",
-        "//pkg/ccl/workloadccl",
         "//pkg/security",
         "//pkg/security/securitytest",
         "//pkg/server",

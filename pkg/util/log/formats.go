@@ -12,6 +12,8 @@ package log
 
 type logFormatter interface {
 	formatterName() string
+	// doc is used to generate the formatter documentation.
+	doc() string
 	// formatEntry formats a logEntry into a newly allocated *buffer.
 	// The caller is responsible for calling putBuffer() afterwards.
 	formatEntry(entry logEntry) *buffer
@@ -26,5 +28,21 @@ var formatters = func() map[string]logFormatter {
 	r(formatCrdbV1WithCounter{})
 	r(formatCrdbV1TTY{})
 	r(formatCrdbV1TTYWithCounter{})
+	r(formatCrdbV2{})
+	r(formatCrdbV2TTY{})
+	r(formatFluentJSONCompact{})
+	r(formatFluentJSONFull{})
+	r(formatJSONCompact{})
+	r(formatJSONFull{})
 	return m
 }()
+
+// GetFormatterDocs returns the embedded documentation for all the
+// supported formats.
+func GetFormatterDocs() map[string]string {
+	m := make(map[string]string)
+	for fmtName, f := range formatters {
+		m[fmtName] = f.doc()
+	}
+	return m
+}

@@ -80,6 +80,11 @@ type sessionVar struct {
 	// initialization).  Currently only used for transaction_isolation.
 	RuntimeSet func(_ context.Context, evalCtx *extendedEvalContext, s string) error
 
+	// SetWithPlanner is like Set except it can only be used in sessions
+	// that are already running and the planner is passed in.
+	// The planner can be used to check privileges before setting.
+	SetWithPlanner func(_ context.Context, p *planner, s string) error
+
 	// GlobalDefault is the string value to use as default for RESET or
 	// during session initialization when no default value was provided
 	// by the client.
@@ -227,10 +232,13 @@ var varGen = map[string]sessionVar{
 			}
 			return dbName, nil
 		},
-		Set: func(
-			ctx context.Context, m *sessionDataMutator, dbName string,
-		) error {
+		Set: func(_ context.Context, m *sessionDataMutator, dbName string) error {
 			m.SetDatabase(dbName)
+			return nil
+		},
+		SetWithPlanner: func(
+			_ context.Context, p *planner, dbName string) error {
+			p.sessionDataMutator.SetDatabase(dbName)
 			return nil
 		},
 		Get: func(evalCtx *extendedEvalContext) string { return evalCtx.SessionData.Database },
@@ -248,10 +256,11 @@ var varGen = map[string]sessionVar{
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
 			s = strings.ToLower(s)
 			parts := strings.Split(s, ",")
-			if strings.TrimSpace(parts[0]) != "iso" ||
-				(len(parts) == 2 && strings.TrimSpace(parts[1]) != "mdy") ||
-				len(parts) > 2 {
-				err := newVarValueError("DateStyle", s, "ISO", "ISO, MDY")
+			isOnlyISO := len(parts) == 1 && strings.TrimSpace(parts[0]) == "iso"
+			isISOMDY := len(parts) == 2 && strings.TrimSpace(parts[0]) == "iso" && strings.TrimSpace(parts[1]) == "mdy"
+			isMDYISO := len(parts) == 2 && strings.TrimSpace(parts[0]) == "mdy" && strings.TrimSpace(parts[1]) == "iso"
+			if !(isOnlyISO || isISOMDY || isMDYISO) {
+				err := newVarValueError("DateStyle", s, "ISO", "ISO, MDY", "MDY, ISO")
 				err = errors.WithDetail(err, compatErrMsg)
 				return err
 			}
@@ -644,6 +653,25 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`locality_optimized_partitioned_index_scan`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`locality_optimized_partitioned_index_scan`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar(`locality_optimized_partitioned_index_scan`, s)
+			if err != nil {
+				return err
+			}
+			m.SetLocalityOptimizedSearch(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.LocalityOptimizedSearch)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(localityOptimizedSearchMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
 	`enable_implicit_select_for_update`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enable_implicit_select_for_update`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
@@ -843,8 +871,10 @@ var varGen = map[string]sessionVar{
 					// TODO(knz): if/when we want to support this, we'll need to change
 					// the interface between GetStringVal() and Set() to take string
 					// arrays instead of a single string.
-					return "", unimplemented.Newf("schema names containing commas in search_path",
-						"schema name %q not supported in search_path", s)
+					return "",
+						errors.WithHintf(unimplemented.NewWithIssuef(53971,
+							`schema name %q has commas so is not supported in search_path.`, s),
+							`Did you mean to omit quotes? SET search_path = %s`, s)
 				}
 				buf.WriteString(comma)
 				buf.WriteString(s)
@@ -916,7 +946,13 @@ var varGen = map[string]sessionVar{
 
 	// Supported for PG compatibility only.
 	// See https://www.postgresql.org/docs/10/static/runtime-config-compatible.html#GUC-STANDARD-CONFORMING-STRINGS
+	// If this gets properly implemented, we will need to re-evaluate how escape_string_warning is implemented
 	`standard_conforming_strings`: makeCompatBoolVar(`standard_conforming_strings`, true, false /* anyAllowed */),
+
+	// See https://www.postgresql.org/docs/10/runtime-config-compatible.html#GUC-ESCAPE-STRING-WARNING
+	// Supported for PG compatibility only.
+	// If this gets properly implemented, we will need to re-evaluate how standard_conforming_strings is implemented
+	`escape_string_warning`: makeCompatBoolVar(`escape_string_warning`, true, true /* anyAllowed */),
 
 	// See https://www.postgresql.org/docs/10/static/runtime-config-compatible.html#GUC-SYNCHRONIZE-SEQSCANS
 	// The default in pg is "on" but the behavior in CockroachDB is "off". As this does not affect
@@ -947,7 +983,7 @@ var varGen = map[string]sessionVar{
 		GetStringVal: makeTimeoutVarGetter(`idle_in_session_timeout`),
 		Set:          idleInSessionTimeoutVarSet,
 		Get: func(evalCtx *extendedEvalContext) string {
-			ms := evalCtx.SessionData.StmtTimeout.Nanoseconds() / int64(time.Millisecond)
+			ms := evalCtx.SessionData.IdleInSessionTimeout.Nanoseconds() / int64(time.Millisecond)
 			return strconv.FormatInt(ms, 10)
 		},
 		GlobalDefault: func(sv *settings.Values) string {
@@ -959,7 +995,7 @@ var varGen = map[string]sessionVar{
 		GetStringVal: makeTimeoutVarGetter(`idle_in_transaction_session_timeout`),
 		Set:          idleInTransactionSessionTimeoutVarSet,
 		Get: func(evalCtx *extendedEvalContext) string {
-			ms := evalCtx.SessionData.StmtTimeout.Nanoseconds() / int64(time.Millisecond)
+			ms := evalCtx.SessionData.IdleInTransactionSessionTimeout.Nanoseconds() / int64(time.Millisecond)
 			return strconv.FormatInt(ms, 10)
 		},
 		GlobalDefault: func(sv *settings.Values) string { return "0" },
@@ -1088,6 +1124,63 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`experimental_enable_implicit_column_partitioning`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_implicit_column_partitioning`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("experimental_enable_implicit_column_partitioning", s)
+			if err != nil {
+				return err
+			}
+			m.SetImplicitColumnPartitioningEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.ImplicitColumnPartitioningEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(implicitColumnPartitioningEnabledClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`enable_drop_enum_value`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_drop_enum_value`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("enable_drop_enum_value", s)
+			if err != nil {
+				return err
+			}
+			m.SetDropEnumValueEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.DropEnumValueEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(dropEnumValueEnabledClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
+	`override_multi_region_zone_config`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`override_multi_region_zone_config`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("override_multi_region_zone_config", s)
+			if err != nil {
+				return err
+			}
+			m.SetOverrideMultiRegionZoneConfigEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.OverrideMultiRegionZoneConfigEnabled)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(overrideMultiRegionZoneConfigClusterMode.Get(sv))
+		},
+	},
+
+	// CockroachDB extension.
 	`experimental_enable_hash_sharded_indexes`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_hash_sharded_indexes`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
@@ -1143,44 +1236,6 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
-	// CockroachDB extension.
-	// TODO(mgartner): remove this once multi-column inverted indexes are fully
-	// supported.
-	`experimental_enable_multi_column_inverted_indexes`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_multi_column_inverted_indexes`),
-		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar(`experimental_enable_multi_column_inverted_indexes`, s)
-			if err != nil {
-				return err
-			}
-			m.SetMutliColumnInvertedIndexes(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) string {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData.EnableMultiColumnInvertedIndexes)
-		},
-		GlobalDefault: func(sv *settings.Values) string {
-			return formatBoolAsPostgresSetting(experimentalMultiColumnInvertedIndexesMode.Get(sv))
-		},
-	},
-
-	// CockroachDB extension.
-	`experimental_enable_virtual_columns`: {
-		GetStringVal: makePostgresBoolGetStringValFn(`experimental_enable_virtual_columns`),
-		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar(`experimental_enable_virtual_columns`, s)
-			if err != nil {
-				return err
-			}
-			m.SetVirtualColumnsEnabled(b)
-			return nil
-		},
-		Get: func(evalCtx *extendedEvalContext) string {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData.VirtualColumnsEnabled)
-		},
-		GlobalDefault: globalFalse,
-	},
-
 	// TODO(rytaft): remove this once unique without index constraints are fully
 	// supported.
 	`experimental_enable_unique_without_index_constraints`: {
@@ -1198,6 +1253,43 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return formatBoolAsPostgresSetting(experimentalUniqueWithoutIndexConstraintsMode.Get(sv))
+		},
+	},
+
+	`experimental_use_new_schema_changer`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`experimental_use_new_schema_changer`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			mode, ok := sessiondata.NewSchemaChangerModeFromString(s)
+			if !ok {
+				return newVarValueError(`experimental_use_new_schema_changer`, s,
+					"off", "on", "unsafe_always")
+			}
+			m.SetUseNewSchemaChanger(mode)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return evalCtx.SessionData.NewSchemaChangerMode.String()
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return sessiondata.NewSchemaChangerMode(experimentalUseNewSchemaChanger.Get(sv)).String()
+		},
+	},
+
+	`enable_experimental_stream_replication`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_experimental_stream_replication`),
+		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar(`enable_experimental_stream_replication`, s)
+			if err != nil {
+				return err
+			}
+			m.SetStreamReplicationEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext) string {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData.EnableStreamReplication)
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(experimentalStreamReplicationEnabled.Get(sv))
 		},
 	},
 }
@@ -1401,11 +1493,14 @@ func (p *planner) SetSessionVar(ctx context.Context, varName, newVal string) err
 		return err
 	}
 
-	if v.Set == nil && v.RuntimeSet == nil {
+	if v.Set == nil && v.RuntimeSet == nil && v.SetWithPlanner == nil {
 		return newCannotChangeParameterError(name)
 	}
 	if v.RuntimeSet != nil {
 		return v.RuntimeSet(ctx, &p.extendedEvalCtx, newVal)
+	}
+	if v.SetWithPlanner != nil {
+		return v.SetWithPlanner(ctx, p, newVal)
 	}
 	return v.Set(ctx, p.sessionDataMutator, newVal)
 }

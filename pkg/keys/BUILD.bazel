@@ -23,13 +23,13 @@ go_library(
 
 go_test(
     name = "keys_test",
+    size = "small",
     srcs = [
         "keys_test.go",
         "printer_test.go",
     ],
     embed = [":keys"],
     deps = [
-        "//pkg/keys",
         "//pkg/roachpb",
         "//pkg/testutils",
         "//pkg/util/bitarray",

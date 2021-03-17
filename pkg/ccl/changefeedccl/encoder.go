@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 )
@@ -82,12 +84,14 @@ type Encoder interface {
 	EncodeResolvedTimestamp(context.Context, string, hlc.Timestamp) ([]byte, error)
 }
 
-func getEncoder(opts map[string]string) (Encoder, error) {
+func getEncoder(opts map[string]string, targets jobspb.ChangefeedTargets) (Encoder, error) {
 	switch changefeedbase.FormatType(opts[changefeedbase.OptFormat]) {
 	case ``, changefeedbase.OptFormatJSON:
 		return makeJSONEncoder(opts)
 	case changefeedbase.OptFormatAvro:
-		return newConfluentAvroEncoder(opts)
+		return newConfluentAvroEncoder(opts, targets)
+	case changefeedbase.OptFormatNative:
+		return &nativeEncoder{}, nil
 	default:
 		return nil, errors.Errorf(`unknown %s: %s`, changefeedbase.OptFormat, opts[changefeedbase.OptFormat])
 	}
@@ -141,16 +145,18 @@ func (e *jsonEncoder) EncodeKey(_ context.Context, row encodeRow) ([]byte, error
 }
 
 func (e *jsonEncoder) encodeKeyRaw(row encodeRow) ([]interface{}, error) {
-	colIdxByID := row.tableDesc.ColumnIdxMap()
-	jsonEntries := make([]interface{}, len(row.tableDesc.GetPrimaryIndex().ColumnIDs))
-	for i, colID := range row.tableDesc.GetPrimaryIndex().ColumnIDs {
+	colIdxByID := catalog.ColumnIDToOrdinalMap(row.tableDesc.PublicColumns())
+	primaryIndex := row.tableDesc.GetPrimaryIndex()
+	jsonEntries := make([]interface{}, primaryIndex.NumColumns())
+	for i := 0; i < primaryIndex.NumColumns(); i++ {
+		colID := primaryIndex.GetColumnID(i)
 		idx, ok := colIdxByID.Get(colID)
 		if !ok {
 			return nil, errors.Errorf(`unknown column id: %d`, colID)
 		}
 		datum := row.datums[idx]
-		datum, col := row.datums[idx], row.tableDesc.GetColumnAtIdx(idx)
-		if err := datum.EnsureDecoded(col.Type, &e.alloc); err != nil {
+		datum, col := row.datums[idx], row.tableDesc.PublicColumns()[idx]
+		if err := datum.EnsureDecoded(col.GetType(), &e.alloc); err != nil {
 			return nil, err
 		}
 		var err error
@@ -170,16 +176,15 @@ func (e *jsonEncoder) EncodeValue(_ context.Context, row encodeRow) ([]byte, err
 
 	var after map[string]interface{}
 	if !row.deleted {
-		columns := row.tableDesc.GetPublicColumns()
+		columns := row.tableDesc.PublicColumns()
 		after = make(map[string]interface{}, len(columns))
-		for i := range columns {
-			col := &columns[i]
+		for i, col := range columns {
 			datum := row.datums[i]
-			if err := datum.EnsureDecoded(col.Type, &e.alloc); err != nil {
+			if err := datum.EnsureDecoded(col.GetType(), &e.alloc); err != nil {
 				return nil, err
 			}
 			var err error
-			after[col.Name], err = tree.AsJSON(datum.Datum, time.UTC)
+			after[col.GetName()], err = tree.AsJSON(datum.Datum, time.UTC)
 			if err != nil {
 				return nil, err
 			}
@@ -188,16 +193,15 @@ func (e *jsonEncoder) EncodeValue(_ context.Context, row encodeRow) ([]byte, err
 
 	var before map[string]interface{}
 	if row.prevDatums != nil && !row.prevDeleted {
-		columns := row.prevTableDesc.GetPublicColumns()
+		columns := row.prevTableDesc.PublicColumns()
 		before = make(map[string]interface{}, len(columns))
-		for i := range columns {
-			col := &columns[i]
+		for i, col := range columns {
 			datum := row.prevDatums[i]
-			if err := datum.EnsureDecoded(col.Type, &e.alloc); err != nil {
+			if err := datum.EnsureDecoded(col.GetType(), &e.alloc); err != nil {
 				return nil, err
 			}
 			var err error
-			before[col.Name], err = tree.AsJSON(datum.Datum, time.UTC)
+			before[col.GetName()], err = tree.AsJSON(datum.Datum, time.UTC)
 			if err != nil {
 				return nil, err
 			}
@@ -272,7 +276,9 @@ func (e *jsonEncoder) EncodeResolvedTimestamp(
 // columns in a record.
 type confluentAvroEncoder struct {
 	registryURL                        string
+	schemaPrefix                       string
 	updatedField, beforeField, keyOnly bool
+	targets                            jobspb.ChangefeedTargets
 
 	keyCache      map[tableIDAndVersion]confluentRegisteredKeySchema
 	valueCache    map[tableIDAndVersionPair]confluentRegisteredEnvelopeSchema
@@ -298,8 +304,13 @@ type confluentRegisteredEnvelopeSchema struct {
 
 var _ Encoder = &confluentAvroEncoder{}
 
-func newConfluentAvroEncoder(opts map[string]string) (*confluentAvroEncoder, error) {
+func newConfluentAvroEncoder(
+	opts map[string]string, targets jobspb.ChangefeedTargets,
+) (*confluentAvroEncoder, error) {
 	e := &confluentAvroEncoder{registryURL: opts[changefeedbase.OptConfluentSchemaRegistry]}
+
+	e.schemaPrefix = opts[changefeedbase.OptAvroSchemaPrefix]
+	e.targets = targets
 
 	switch opts[changefeedbase.OptEnvelope] {
 	case string(changefeedbase.OptEnvelopeKeyOnly):
@@ -329,27 +340,34 @@ func newConfluentAvroEncoder(opts map[string]string) (*confluentAvroEncoder, err
 		return nil, errors.Errorf(`WITH option %s is required for %s=%s`,
 			changefeedbase.OptConfluentSchemaRegistry, changefeedbase.OptFormat, changefeedbase.OptFormatAvro)
 	}
-
 	e.keyCache = make(map[tableIDAndVersion]confluentRegisteredKeySchema)
 	e.valueCache = make(map[tableIDAndVersionPair]confluentRegisteredEnvelopeSchema)
 	e.resolvedCache = make(map[string]confluentRegisteredEnvelopeSchema)
 	return e, nil
 }
 
+// Get the raw SQL-formatted string for a table name
+// and apply full_table_name and avro_schema_prefix options
+func (e *confluentAvroEncoder) rawTableName(desc catalog.TableDescriptor) string {
+	return e.schemaPrefix + e.targets[desc.GetID()].StatementTimeName
+}
+
 // EncodeKey implements the Encoder interface.
 func (e *confluentAvroEncoder) EncodeKey(ctx context.Context, row encodeRow) ([]byte, error) {
 	cacheKey := makeTableIDAndVersion(row.tableDesc.GetID(), row.tableDesc.GetVersion())
+
 	registered, ok := e.keyCache[cacheKey]
 	if !ok {
 		var err error
-		registered.schema, err = indexToAvroSchema(row.tableDesc, row.tableDesc.GetPrimaryIndex())
+		tableName := e.rawTableName(row.tableDesc)
+		registered.schema, err = indexToAvroSchema(row.tableDesc, row.tableDesc.GetPrimaryIndex().IndexDesc(), tableName, e.schemaPrefix)
 		if err != nil {
 			return nil, err
 		}
 
 		// NB: This uses the kafka name escaper because it has to match the name
 		// of the kafka topic.
-		subject := SQLNameToKafkaName(row.tableDesc.GetName()) + confluentSubjectSuffixKey
+		subject := SQLNameToKafkaName(tableName) + confluentSubjectSuffixKey
 		registered.registryID, err = e.register(ctx, &registered.schema.avroRecord, subject)
 		if err != nil {
 			return nil, err
@@ -383,26 +401,27 @@ func (e *confluentAvroEncoder) EncodeValue(ctx context.Context, row encodeRow) (
 		var beforeDataSchema *avroDataRecord
 		if e.beforeField && row.prevTableDesc != nil {
 			var err error
-			beforeDataSchema, err = tableToAvroSchema(row.prevTableDesc, `before`)
+			beforeDataSchema, err = tableToAvroSchema(row.prevTableDesc, `before`, e.schemaPrefix)
 			if err != nil {
 				return nil, err
 			}
 		}
 
-		afterDataSchema, err := tableToAvroSchema(row.tableDesc, avroSchemaNoSuffix)
+		afterDataSchema, err := tableToAvroSchema(row.tableDesc, avroSchemaNoSuffix, e.schemaPrefix)
 		if err != nil {
 			return nil, err
 		}
 
 		opts := avroEnvelopeOpts{afterField: true, beforeField: e.beforeField, updatedField: e.updatedField}
-		registered.schema, err = envelopeToAvroSchema(row.tableDesc.GetName(), opts, beforeDataSchema, afterDataSchema)
+		registered.schema, err = envelopeToAvroSchema(e.rawTableName(row.tableDesc), opts, beforeDataSchema, afterDataSchema, e.schemaPrefix)
+
 		if err != nil {
 			return nil, err
 		}
 
 		// NB: This uses the kafka name escaper because it has to match the name
 		// of the kafka topic.
-		subject := SQLNameToKafkaName(row.tableDesc.GetName()) + confluentSubjectSuffixValue
+		subject := SQLNameToKafkaName(e.rawTableName(row.tableDesc)) + confluentSubjectSuffixValue
 		registered.registryID, err = e.register(ctx, &registered.schema.avroRecord, subject)
 		if err != nil {
 			return nil, err
@@ -440,7 +459,7 @@ func (e *confluentAvroEncoder) EncodeResolvedTimestamp(
 	if !ok {
 		opts := avroEnvelopeOpts{resolvedField: true}
 		var err error
-		registered.schema, err = envelopeToAvroSchema(topic, opts, nil /* before */, nil /* after */)
+		registered.schema, err = envelopeToAvroSchema(topic, opts, nil /* before */, nil /* after */, e.schemaPrefix /* namespace */)
 		if err != nil {
 			return nil, err
 		}
@@ -533,3 +552,27 @@ func (e *confluentAvroEncoder) register(
 
 	return id, nil
 }
+
+// nativeEncoder only implements EncodeResolvedTimestamp.
+// Unfortunately, the encoder assumes that it operates with encodeRow -- something
+// that's just not the case when emitting raw KVs.
+// In addition, there is a kafka specific concept (topic) that's exposed at the Encoder level.
+// TODO(yevgeniy): Refactor encoder interface so that it operates on kvfeed events.
+// In addition, decouple the concept of topic from the Encoder.
+type nativeEncoder struct{}
+
+func (e *nativeEncoder) EncodeKey(ctx context.Context, row encodeRow) ([]byte, error) {
+	panic("EncodeKey should not be called on nativeEncoder")
+}
+
+func (e *nativeEncoder) EncodeValue(ctx context.Context, row encodeRow) ([]byte, error) {
+	panic("EncodeValue should not be called on nativeEncoder")
+}
+
+func (e *nativeEncoder) EncodeResolvedTimestamp(
+	ctx context.Context, s string, ts hlc.Timestamp,
+) ([]byte, error) {
+	return protoutil.Marshal(&ts)
+}
+
+var _ Encoder = &nativeEncoder{}

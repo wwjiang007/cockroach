@@ -12,6 +12,7 @@ package typedesc_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -330,8 +331,8 @@ func TestTypeDescIsCompatibleWith(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		a := typedesc.NewImmutable(test.a)
-		b := typedesc.NewImmutable(test.b)
+		a := typedesc.NewBuilder(&test.a).BuildImmutableType()
+		b := typedesc.NewBuilder(&test.b).BuildImmutableType()
 		err := a.IsCompatibleWith(b)
 		if test.err == "" {
 			require.NoError(t, err)
@@ -348,26 +349,29 @@ func TestValidateTypeDesc(t *testing.T) {
 	ctx := context.Background()
 
 	descs := catalog.MapDescGetter{}
-	descs[100] = dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+	descs[100] = dbdesc.NewBuilder(&descpb.DatabaseDescriptor{
 		Name: "db",
 		ID:   100,
-	})
-	descs[101] = schemadesc.NewImmutable(descpb.SchemaDescriptor{
-		ID:   101,
-		Name: "schema",
-	})
-	descs[102] = typedesc.NewImmutable(descpb.TypeDescriptor{
+	}).BuildImmutable()
+	descs[101] = schemadesc.NewBuilder(&descpb.SchemaDescriptor{
+		ID:       101,
+		ParentID: 100,
+		Name:     "schema",
+	}).BuildImmutable()
+	descs[102] = typedesc.NewBuilder(&descpb.TypeDescriptor{
 		ID:   102,
 		Name: "type",
-	})
-	descs[200] = dbdesc.NewImmutable(descpb.DatabaseDescriptor{
+	}).BuildImmutable()
+	descs[200] = dbdesc.NewBuilder(&descpb.DatabaseDescriptor{
 		Name: "multi-region-db",
 		ID:   200,
 		RegionConfig: &descpb.DatabaseDescriptor_RegionConfig{
-			Regions:       descpb.Regions{"us-east-1"},
+			Regions: []descpb.DatabaseDescriptor_RegionConfig_Region{
+				{Name: "us-east-1"},
+			},
 			PrimaryRegion: "us-east-1",
 		},
-	})
+	}).BuildImmutable()
 
 	defaultPrivileges := descpb.NewDefaultPrivilegeDescriptor(security.RootUserName())
 	invalidPrivileges := descpb.NewDefaultPrivilegeDescriptor(security.RootUserName())
@@ -398,13 +402,23 @@ func TestValidateTypeDesc(t *testing.T) {
 				Privileges: defaultPrivileges,
 			},
 		},
+
 		{
-			`enum members are not sorted [{[2] a ALL} {[1] b ALL}]`,
+			`invalid parent schema ID 0`,
 			descpb.TypeDescriptor{
-				Name:     "t",
-				ID:       typeDescID,
-				ParentID: 1,
-				Kind:     descpb.TypeDescriptor_ENUM,
+				Name:       "t",
+				ID:         typeDescID,
+				ParentID:   100,
+				Privileges: defaultPrivileges,
+			},
+		},
+		{
+			`enum members are not sorted [{[2] a ALL NONE} {[1] b ALL NONE}]`,
+			descpb.TypeDescriptor{
+				Name:           "t",
+				ID:             typeDescID,
+				ParentID:       100,
+				ParentSchemaID: keys.PublicSchemaID,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
 					{
 						LogicalRepresentation:  "a",
@@ -421,10 +435,11 @@ func TestValidateTypeDesc(t *testing.T) {
 		{
 			`duplicate enum physical rep [1]`,
 			descpb.TypeDescriptor{
-				Name:     "t",
-				ID:       typeDescID,
-				ParentID: 1,
-				Kind:     descpb.TypeDescriptor_ENUM,
+				Name:           "t",
+				ID:             typeDescID,
+				ParentID:       100,
+				ParentSchemaID: keys.PublicSchemaID,
+				Kind:           descpb.TypeDescriptor_ENUM,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
 					{
 						LogicalRepresentation:  "a",
@@ -441,10 +456,14 @@ func TestValidateTypeDesc(t *testing.T) {
 		{
 			`duplicate enum physical rep [1]`,
 			descpb.TypeDescriptor{
-				Name:     "t",
-				ID:       typeDescID,
-				ParentID: 200,
-				Kind:     descpb.TypeDescriptor_MULTIREGION_ENUM,
+				Name:           "t",
+				ID:             typeDescID,
+				ParentID:       200,
+				ParentSchemaID: keys.PublicSchemaID,
+				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
+				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
+					PrimaryRegion: "us-east-1",
+				},
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
 					{
 						LogicalRepresentation:  "us-east-1",
@@ -461,10 +480,11 @@ func TestValidateTypeDesc(t *testing.T) {
 		{
 			`duplicate enum member "a"`,
 			descpb.TypeDescriptor{
-				Name:     "t",
-				ID:       typeDescID,
-				ParentID: 1,
-				Kind:     descpb.TypeDescriptor_ENUM,
+				Name:           "t",
+				ID:             typeDescID,
+				ParentID:       100,
+				ParentSchemaID: keys.PublicSchemaID,
+				Kind:           descpb.TypeDescriptor_ENUM,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
 					{
 						LogicalRepresentation:  "a",
@@ -481,10 +501,11 @@ func TestValidateTypeDesc(t *testing.T) {
 		{
 			`duplicate enum member "us-east-1"`,
 			descpb.TypeDescriptor{
-				Name:     "t",
-				ID:       typeDescID,
-				ParentID: 1,
-				Kind:     descpb.TypeDescriptor_ENUM,
+				Name:           "t",
+				ID:             typeDescID,
+				ParentID:       200,
+				ParentSchemaID: keys.PublicSchemaID,
+				Kind:           descpb.TypeDescriptor_ENUM,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
 					{
 						LogicalRepresentation:  "us-east-1",
@@ -499,28 +520,90 @@ func TestValidateTypeDesc(t *testing.T) {
 			},
 		},
 		{
+			`read only capability member must have transition direction set`,
+			descpb.TypeDescriptor{
+				Name:           "t",
+				ID:             typeDescID,
+				ParentID:       100,
+				ParentSchemaID: keys.PublicSchemaID,
+				Kind:           descpb.TypeDescriptor_ENUM,
+				EnumMembers: []descpb.TypeDescriptor_EnumMember{
+					{
+						LogicalRepresentation:  "a",
+						PhysicalRepresentation: []byte{1},
+						Capability:             descpb.TypeDescriptor_EnumMember_READ_ONLY,
+						Direction:              descpb.TypeDescriptor_EnumMember_NONE,
+					},
+				},
+				Privileges: defaultPrivileges,
+			},
+		},
+		{
+			`public enum member can not have transition direction set`,
+			descpb.TypeDescriptor{
+				Name:           "t",
+				ID:             typeDescID,
+				ParentID:       100,
+				ParentSchemaID: keys.PublicSchemaID,
+				Kind:           descpb.TypeDescriptor_ENUM,
+				EnumMembers: []descpb.TypeDescriptor_EnumMember{
+					{
+						LogicalRepresentation:  "a",
+						PhysicalRepresentation: []byte{1},
+						Capability:             descpb.TypeDescriptor_EnumMember_ALL,
+						Direction:              descpb.TypeDescriptor_EnumMember_ADD,
+					},
+				},
+				Privileges: defaultPrivileges,
+			},
+		},
+		{
+			`public enum member can not have transition direction set`,
+			descpb.TypeDescriptor{
+				Name:           "t",
+				ID:             typeDescID,
+				ParentID:       100,
+				ParentSchemaID: keys.PublicSchemaID,
+				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
+				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
+					PrimaryRegion: "us-east1",
+				},
+				EnumMembers: []descpb.TypeDescriptor_EnumMember{
+					{
+						LogicalRepresentation:  "us-east1",
+						PhysicalRepresentation: []byte{1},
+						Capability:             descpb.TypeDescriptor_EnumMember_ALL,
+						Direction:              descpb.TypeDescriptor_EnumMember_REMOVE,
+					},
+				},
+				Privileges: defaultPrivileges,
+			},
+		},
+		{
 			`ALIAS type desc has nil alias type`,
 			descpb.TypeDescriptor{
-				Name:       "t",
-				ID:         typeDescID,
-				ParentID:   1,
-				Kind:       descpb.TypeDescriptor_ALIAS,
-				Privileges: defaultPrivileges,
+				Name:           "t",
+				ID:             typeDescID,
+				ParentID:       100,
+				ParentSchemaID: keys.PublicSchemaID,
+				Kind:           descpb.TypeDescriptor_ALIAS,
+				Privileges:     defaultPrivileges,
 			},
 		},
 		{
-			`parentID 500 does not exist`,
+			`referenced database ID 500: descriptor not found`,
 			descpb.TypeDescriptor{
-				Name:       "t",
-				ID:         typeDescID,
-				ParentID:   500,
-				Kind:       descpb.TypeDescriptor_ALIAS,
-				Alias:      types.Int,
-				Privileges: defaultPrivileges,
+				Name:           "t",
+				ID:             typeDescID,
+				ParentID:       500,
+				ParentSchemaID: keys.PublicSchemaID,
+				Kind:           descpb.TypeDescriptor_ALIAS,
+				Alias:          types.Int,
+				Privileges:     defaultPrivileges,
 			},
 		},
 		{
-			`parentSchemaID 500 does not exist`,
+			`referenced schema ID 500: descriptor not found`,
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
@@ -532,7 +615,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			},
 		},
 		{
-			`arrayTypeID 500 does not exist for "ENUM"`,
+			`arrayTypeID 500 does not exist for "ENUM": referenced type ID 500: descriptor not found`,
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
@@ -544,12 +627,12 @@ func TestValidateTypeDesc(t *testing.T) {
 			},
 		},
 		{
-			`arrayTypeID 500 does not exist for "MULTIREGION_ENUM"`,
+			`arrayTypeID 500 does not exist for "MULTIREGION_ENUM": referenced type ID 500: descriptor not found`,
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
 				ParentID:       200,
-				ParentSchemaID: 101,
+				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
 					PrimaryRegion: "us-east-1",
@@ -565,12 +648,12 @@ func TestValidateTypeDesc(t *testing.T) {
 			},
 		},
 		{
-			"referencing descriptor 500 does not exist",
+			"referenced table ID 500: descriptor not found",
 			descpb.TypeDescriptor{
 				Name:                     "t",
 				ID:                       typeDescID,
 				ParentID:                 100,
-				ParentSchemaID:           101,
+				ParentSchemaID:           keys.PublicSchemaID,
 				Kind:                     descpb.TypeDescriptor_ENUM,
 				ArrayTypeID:              102,
 				ReferencingDescriptorIDs: []descpb.ID{500},
@@ -578,12 +661,12 @@ func TestValidateTypeDesc(t *testing.T) {
 			},
 		},
 		{
-			"referencing descriptor 500 does not exist",
+			"referenced table ID 500: descriptor not found",
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
 				ParentID:       200,
-				ParentSchemaID: 101,
+				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
 					PrimaryRegion: "us-east-1",
@@ -600,7 +683,7 @@ func TestValidateTypeDesc(t *testing.T) {
 			},
 		},
 		{
-			"user testuser must not have SELECT privileges on system type with ID=50",
+			"user testuser must not have SELECT privileges on type with ID=50",
 			descpb.TypeDescriptor{
 				Name:           "t",
 				ID:             typeDescID,
@@ -617,7 +700,7 @@ func TestValidateTypeDesc(t *testing.T) {
 				Name:           "t",
 				ID:             typeDescID,
 				ParentID:       200,
-				ParentSchemaID: 101,
+				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
 					PrimaryRegion: "us-east-1",
@@ -642,7 +725,7 @@ func TestValidateTypeDesc(t *testing.T) {
 				Name:           "t",
 				ID:             typeDescID,
 				ParentID:       200,
-				ParentSchemaID: 101,
+				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
 					PrimaryRegion: "us-east-1",
@@ -684,7 +767,7 @@ func TestValidateTypeDesc(t *testing.T) {
 				Name:           "t",
 				ID:             typeDescID,
 				ParentID:       200,
-				ParentSchemaID: 101,
+				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
 					{
@@ -702,7 +785,7 @@ func TestValidateTypeDesc(t *testing.T) {
 				Name:           "t",
 				ID:             typeDescID,
 				ParentID:       200,
-				ParentSchemaID: 101,
+				ParentSchemaID: keys.PublicSchemaID,
 				Kind:           descpb.TypeDescriptor_MULTIREGION_ENUM,
 				RegionConfig: &descpb.TypeDescriptor_RegionConfig{
 					PrimaryRegion: "us-east-2",
@@ -720,11 +803,12 @@ func TestValidateTypeDesc(t *testing.T) {
 	}
 
 	for i, test := range testData {
-		desc := typedesc.NewImmutable(test.desc)
-		if err := desc.Validate(ctx, descs); err == nil {
-			t.Errorf("#%d expected err: %s but found nil: %v", i, test.err, test.desc)
-		} else if test.err != err.Error() && "internal error: "+test.err != err.Error() {
-			t.Errorf("#%d expected err: %s but found: %s", i, test.err, err)
+		desc := typedesc.NewBuilder(&test.desc).BuildImmutable()
+		expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
+		if err := catalog.ValidateSelfAndCrossReferences(ctx, descs, desc); err == nil {
+			t.Errorf("#%d expected err: %s but found nil: %v", i, expectedErr, test.desc)
+		} else if expectedErr != err.Error() {
+			t.Errorf("#%d expected err: %s but found: %s", i, expectedErr, err)
 		}
 	}
 }

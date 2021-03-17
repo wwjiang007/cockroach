@@ -106,7 +106,7 @@ func wrapExamine(
 			cause:    errors.New("validation failed"),
 		}
 	}
-	fmt.Println("No problems found!")
+	fmt.Fprintln(out, "No problems found!")
 	return nil
 }
 
@@ -216,14 +216,19 @@ FROM system.namespace`
 
 	if err := selectRowsMap(sqlConn, stmt, make([]driver.Value, 4), func(vals []driver.Value) error {
 		md := jobs.JobMetadata{}
-		md.ID = vals[0].(int64)
+		md.ID = jobspb.JobID(vals[0].(int64))
 		md.Status = jobs.Status(vals[1].(string))
 		md.Payload = &jobspb.Payload{}
 		if err := protoutil.Unmarshal(vals[2].([]byte), md.Payload); err != nil {
 			return err
 		}
 		md.Progress = &jobspb.Progress{}
-		if err := protoutil.Unmarshal(vals[3].([]byte), md.Progress); err != nil {
+		// Progress is a nullable column, so have to check for nil here.
+		progressBytes, ok := vals[3].([]byte)
+		if !ok {
+			return errors.Errorf("unexpected NULL progress on job row: %v", md)
+		}
+		if err := protoutil.Unmarshal(progressBytes, md.Progress); err != nil {
 			return err
 		}
 		if md.Status == jobs.StatusRunning {
@@ -324,7 +329,7 @@ func runZipDirDoctor(cmd *cobra.Command, args []string) (retErr error) {
 		if err != nil {
 			return errors.Errorf("failed to parse job id %s: %v", fields[0], err)
 		}
-		md.ID = int64(id)
+		md.ID = jobspb.JobID(id)
 
 		last := len(fields) - 1
 		payloadBytes, err := hx.DecodeString(fields[last-1])

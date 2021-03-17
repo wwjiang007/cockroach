@@ -163,14 +163,18 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 
 	for i := 0; i < tab.UniqueCount(); i++ {
 		var withoutIndexStr string
-		if tab.Unique(i).WithoutIndex() {
+		uniq := tab.Unique(i)
+		if uniq.WithoutIndex() {
 			withoutIndexStr = "WITHOUT INDEX "
 		}
-		child.Childf(
+		c := child.Childf(
 			"UNIQUE %s%s",
 			withoutIndexStr,
 			formatCols(tab, tab.Unique(i).ColumnCount(), tab.Unique(i).ColumnOrdinal),
 		)
+		if pred, isPartial := uniq.Predicate(); isPartial {
+			c.Childf("WHERE %s", pred)
+		}
 	}
 
 	// TODO(radu): show stats.
@@ -180,15 +184,19 @@ func FormatTable(cat Catalog, tab Table, tp treeprinter.Node) {
 // debugging and testing.
 func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 	idx := tab.Index(ord)
-	inverted := ""
-	if idx.IsInverted() {
-		inverted = "INVERTED "
+	idxType := ""
+	if idx.Ordinal() == PrimaryIndex {
+		idxType = "PRIMARY "
+	} else if idx.IsUnique() {
+		idxType = "UNIQUE "
+	} else if idx.IsInverted() {
+		idxType = "INVERTED "
 	}
 	mutation := ""
 	if IsMutationIndex(tab, ord) {
 		mutation = " (mutation)"
 	}
-	child := tp.Childf("%sINDEX %s%s", inverted, idx.Name(), mutation)
+	child := tp.Childf("%sINDEX %s%s", idxType, idx.Name(), mutation)
 
 	var buf bytes.Buffer
 	colCount := idx.ColumnCount()
@@ -210,16 +218,25 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 			fmt.Fprintf(&buf, " (storing)")
 		}
 
+		if i < idx.ImplicitPartitioningColumnCount() {
+			fmt.Fprintf(&buf, " (implicit)")
+		}
+
 		child.Child(buf.String())
 	}
 
 	FormatZone(idx.Zone(), child)
 
-	partPrefixes := idx.PartitionByListPrefixes()
-	if len(partPrefixes) != 0 {
-		c := child.Child("partition by list prefixes")
-		for i := range partPrefixes {
-			c.Child(partPrefixes[i].String())
+	if n := idx.PartitionCount(); n > 0 {
+		c := child.Child("partitions")
+		for i := 0; i < n; i++ {
+			p := idx.Partition(i)
+			part := c.Child(p.Name())
+			prefixes := part.Child("partition by list prefixes")
+			for _, datums := range p.PartitionByListPrefixes() {
+				prefixes.Child(datums.String())
+			}
+			FormatZone(p.Zone(), part)
 		}
 	}
 	if n := idx.InterleaveAncestorCount(); n > 0 {
@@ -240,8 +257,7 @@ func formatCatalogIndex(tab Table, ord int, tp treeprinter.Node) {
 		}
 	}
 	if pred, isPartial := idx.Predicate(); isPartial {
-		c := child.Child("WHERE")
-		c.Childf(pred)
+		child.Childf("WHERE %s", pred)
 	}
 }
 
@@ -315,14 +331,28 @@ func formatColumn(col *Column, buf *bytes.Buffer) {
 	if col.HasDefault() {
 		fmt.Fprintf(buf, " default (%s)", col.DefaultExprStr())
 	}
-	if col.IsHidden() {
-		fmt.Fprintf(buf, " [hidden]")
+	kind := col.Kind()
+	// Omit the visibility for mutation and virtual inverted columns, which are
+	// always inacessible.
+	if kind != WriteOnly && kind != DeleteOnly && kind != VirtualInverted {
+		switch col.Visibility() {
+		case Hidden:
+			fmt.Fprintf(buf, " [hidden]")
+		case Inaccessible:
+			fmt.Fprintf(buf, " [inaccessible]")
+		}
 	}
-	switch col.Kind() {
-	case WriteOnly, DeleteOnly:
-		fmt.Fprintf(buf, " [mutation]")
+
+	switch kind {
+	case WriteOnly:
+		fmt.Fprintf(buf, " [write-only]")
+
+	case DeleteOnly:
+		fmt.Fprintf(buf, " [delete-only]")
+
 	case System:
 		fmt.Fprintf(buf, " [system]")
+
 	case VirtualInverted:
 		fmt.Fprintf(buf, " [virtual-inverted]")
 	}

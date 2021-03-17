@@ -164,7 +164,7 @@ func newSampleAggregator(
 	if err := s.Init(
 		nil, post, input.OutputTypes(), flowCtx, processorID, output, memMonitor,
 		execinfra.ProcStateOpts{
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				s.close()
 				return nil
 			},
@@ -181,14 +181,14 @@ func (s *sampleAggregator) pushTrailingMeta(ctx context.Context) {
 
 // Run is part of the Processor interface.
 func (s *sampleAggregator) Run(ctx context.Context) {
+	ctx = s.StartInternal(ctx, sampleAggregatorProcName)
 	s.input.Start(ctx)
-	s.StartInternal(ctx, sampleAggregatorProcName)
 
-	earlyExit, err := s.mainLoop(s.Ctx)
+	earlyExit, err := s.mainLoop(ctx)
 	if err != nil {
-		execinfra.DrainAndClose(s.Ctx, s.Out.Output(), err, s.pushTrailingMeta, s.input)
+		execinfra.DrainAndClose(ctx, s.Out.Output(), err, s.pushTrailingMeta, s.input)
 	} else if !earlyExit {
-		s.pushTrailingMeta(s.Ctx)
+		s.pushTrailingMeta(ctx)
 		s.input.ConsumerClosed()
 		s.Out.Close()
 	}
@@ -223,10 +223,10 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 		// If it changed by less than 1%, just check for cancellation (which is more
 		// efficient).
 		if fractionCompleted < 1.0 && fractionCompleted < lastReportedFractionCompleted+0.01 {
-			return job.CheckStatus(ctx)
+			return job.CheckStatus(ctx, nil /* txn */)
 		}
 		lastReportedFractionCompleted = fractionCompleted
-		return job.FractionProgressed(ctx, jobs.FractionUpdater(fractionCompleted))
+		return job.FractionProgressed(ctx, nil /* txn */, jobs.FractionUpdater(fractionCompleted))
 	}
 
 	var rowsProcessed uint64

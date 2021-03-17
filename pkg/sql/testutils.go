@@ -48,7 +48,10 @@ func CreateTestTableDescriptor(
 			nil, /* vs */
 			st,
 			n,
-			parentID, keys.PublicSchemaID, id,
+			parentID,
+			keys.PublicSchemaID,
+			id,
+			nil,             /* regionConfig */
 			hlc.Timestamp{}, /* creationTime */
 			privileges,
 			nil, /* affected */
@@ -134,6 +137,7 @@ func (dsp *DistSQLPlanner) Exec(
 		p.txn,
 		execCfg.Clock,
 		p.ExtendedEvalContext().Tracing,
+		execCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 

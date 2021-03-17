@@ -201,7 +201,7 @@ func newSamplerProcessor(
 	if err := s.Init(
 		nil, post, outTypes, flowCtx, processorID, output, memMonitor,
 		execinfra.ProcStateOpts{
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				s.close()
 				return nil
 			},
@@ -218,14 +218,14 @@ func (s *samplerProcessor) pushTrailingMeta(ctx context.Context) {
 
 // Run is part of the Processor interface.
 func (s *samplerProcessor) Run(ctx context.Context) {
+	ctx = s.StartInternal(ctx, samplerProcName)
 	s.input.Start(ctx)
-	s.StartInternal(ctx, samplerProcName)
 
-	earlyExit, err := s.mainLoop(s.Ctx)
+	earlyExit, err := s.mainLoop(ctx)
 	if err != nil {
-		execinfra.DrainAndClose(s.Ctx, s.Out.Output(), err, s.pushTrailingMeta, s.input)
+		execinfra.DrainAndClose(ctx, s.Out.Output(), err, s.pushTrailingMeta, s.input)
 	} else if !earlyExit {
-		s.pushTrailingMeta(s.Ctx)
+		s.pushTrailingMeta(ctx)
 		s.input.ConsumerClosed()
 		s.Out.Close()
 	}
@@ -308,7 +308,7 @@ func (s *samplerProcessor) mainLoop(ctx context.Context) (earlyExit bool, err er
 					case <-timer.C:
 						timer.Read = true
 						break
-					case <-s.flowCtx.Stopper().ShouldStop():
+					case <-s.flowCtx.Stopper().ShouldQuiesce():
 						break
 					}
 				}

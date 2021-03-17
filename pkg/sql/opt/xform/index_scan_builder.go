@@ -11,6 +11,7 @@
 package xform
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
@@ -51,10 +52,14 @@ type indexScanBuilder struct {
 }
 
 func (b *indexScanBuilder) init(c *CustomFuncs, tabID opt.TableID) {
-	b.c = c
-	b.f = c.e.f
-	b.mem = c.e.mem
-	b.tabID = tabID
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*b = indexScanBuilder{
+		c:     c,
+		f:     c.e.f,
+		mem:   c.e.mem,
+		tabID: tabID,
+	}
 }
 
 // primaryKeyCols returns the columns from the scanned table's primary index.
@@ -83,7 +88,7 @@ func (b *indexScanBuilder) setScan(scanPrivate *memo.ScanPrivate) {
 // addInvertedFilter wraps the input expression with an InvertedFilter
 // expression having the given span expression.
 func (b *indexScanBuilder) addInvertedFilter(
-	spanExpr *invertedexpr.SpanExpression,
+	spanExpr *inverted.SpanExpression,
 	pfState *invertedexpr.PreFiltererStateForInvertedFilterer,
 	invertedCol opt.ColumnID,
 ) {

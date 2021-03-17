@@ -12,6 +12,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
@@ -210,16 +212,26 @@ func TestIntentDemuxWriter(t *testing.T) {
 			case "new-writer":
 				var separated bool
 				d.ScanArgs(t, "enable-separated", &separated)
-				w = intentDemuxWriter{w: &pw, enabledSeparatedIntents: separated}
+				// This is a low-level test that explicitly wraps the writer, so it
+				// doesn't matter how the original call to createTestPebbleEngine
+				// behaved in terms of separated intents config.
+				w = wrapIntentWriter(context.Background(), &pw,
+					makeSettingsForSeparatedIntents(false /* oldClusterVersion */, separated),
+					false /* isLongLived */)
 				return ""
 			case "put-intent":
 				pw.reset()
 				key := scanRoachKey(t, d, "k")
 				// We don't bother populating most fields in the proto.
 				var meta enginepb.MVCCMetadata
-				var ts, txn int
-				d.ScanArgs(t, "ts", &ts)
-				meta.Timestamp.WallTime = int64(ts)
+				var tsS string
+				d.ScanArgs(t, "ts", &tsS)
+				ts, err := hlc.ParseTimestamp(tsS)
+				if err != nil {
+					t.Fatalf("%v", err)
+				}
+				meta.Timestamp = ts.ToLegacyTimestamp()
+				var txn int
 				d.ScanArgs(t, "txn", &txn)
 				txnUUID := uuid.FromUint128(uint128.FromInts(0, uint64(txn)))
 				meta.Txn = &enginepb.TxnMeta{ID: txnUUID}
@@ -229,10 +241,13 @@ func TestIntentDemuxWriter(t *testing.T) {
 				}
 				state := readPrecedingIntentState(t, d)
 				txnDidNotUpdateMeta := readTxnDidNotUpdateMeta(t, d)
-				scratch, err = w.PutIntent(key, val, state, txnDidNotUpdateMeta, txnUUID, scratch)
+				var delta int
+				scratch, delta, err = w.PutIntent(
+					context.Background(), key, val, state, txnDidNotUpdateMeta, txnUUID, scratch)
 				if err != nil {
 					return err.Error()
 				}
+				fmt.Fprintf(&pw.b, "Return Value: separated-delta=%d\n", delta)
 				printEngContents(&pw.b, eng)
 				return pw.b.String()
 			case "clear-intent":
@@ -243,10 +258,12 @@ func TestIntentDemuxWriter(t *testing.T) {
 				txnUUID := uuid.FromUint128(uint128.FromInts(0, uint64(txn)))
 				state := readPrecedingIntentState(t, d)
 				txnDidNotUpdateMeta := readTxnDidNotUpdateMeta(t, d)
-				scratch, err = w.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID, scratch)
+				var delta int
+				scratch, delta, err = w.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID, scratch)
 				if err != nil {
 					return err.Error()
 				}
+				fmt.Fprintf(&pw.b, "Return Value: separated-delta=%d\n", delta)
 				printEngContents(&pw.b, eng)
 				return pw.b.String()
 			case "clear-range":

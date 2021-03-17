@@ -13,6 +13,7 @@ package cockroach.roachpb;
 option go_package = "roachpb";
 
 import "kv/kvserver/concurrency/lock/locking.proto";
+import "kv/kvserver/readsummary/rspb/summary.proto";
 import "roachpb/metadata.proto";
 import "storage/enginepb/mvcc.proto";
 import "storage/enginepb/mvcc3.proto";
@@ -144,11 +145,57 @@ message MergeTrigger {
   ];
 
   // FreezeStart is a timestamp that is guaranteed to be greater than the
-  // timestamps at which any requests were serviced by the responding replica
+  // timestamps at which any requests were serviced by the right-hand side range
   // before it stopped responding to requests altogether (in anticipation of
   // being subsumed). It is suitable for use as the timestamp cache's low water
-  // mark for the keys previously owned by the subsumed range.
-  util.hlc.Timestamp freeze_start = 5 [(gogoproto.nullable) = false];
+  // mark for the keys previously owned by the subsumed range, though this role
+  // is largely being... subsumed by the RightReadSummary.
+  util.hlc.Timestamp freeze_start = 5 [(gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
+
+  // right_closed_timestamp is the closed timestamp of the RHS at the moment of
+  // the subsumption. Because the SubsumeRequest synchronizes with all other
+  // requests, the range's closed timestamp does not advance past the snapshot
+  // captured here.
+  //
+  // Like the freeze_start, this is used by the merged range to conditionally
+  // bump the timestamp cache for the keys previously owned by the subsumed
+  // range.
+  //
+  // Note that the closed timestamp is also reflected in the right_read_summary.
+  // However, we carry it explicitly too because, in case the leaseholders of
+  // the two sides are collocated at merge time, we don't need to use the
+  // read_summary and simply use this field.
+  util.hlc.Timestamp right_closed_timestamp = 6 [(gogoproto.nullable) = false];
+  
+  // RightReadSummary is a summary of the reads that have been performed on the
+  // right-hand side up to the point of the Subsume request, which serializes
+  // with past reads and begins blocking future reads. It is suitable for use to
+  // update the timestamp cache for the keys previously owned by the subsumed
+  // range.
+  //
+  // RightReadSummary can be used in place of FreezeStart, when available. It
+  // has two distinct advantages:
+  // 1. it can transfer a higher-resolution snapshot of the reads on the range
+  //    through a range merge, to make the merge less disruptive to writes on
+  //    the post-merge range because the timestamp cache won't be bumped as
+  //    high.
+  // 2. it can transfer information about reads with synthetic timestamps, which
+  //    are not otherwise captured by the FreezeStart clock timestamp.
+  //
+  // When a RightReadSummary is set in ReplicatedEvalResult.Merge.Trigger, there
+  // is always also a write to the RangePriorReadSummaryKey in the corresponding
+  // RaftCommand.WriteBatch. The persisted summary may be identical to the
+  // summary in this field, but it does not have to be. Notably, we intended for
+  // the summary included in the ReplicatedEvalResult.Merge.Trigger to
+  // eventually be a much higher-resolution version of the ReadSummmary than the
+  // version persisted. This scheme of persisting a compressed ReadSummary
+  // indefinitely and including a higher-resolution ReadSummary on the
+  // RaftCommand allows us to optimize for the common case where the merge is
+  // applied on the LHS's leaseholder through Raft log application while
+  // ensuring correctness in the case where the merge is applied on the LHS's
+  // leaseholder through a Raft snapshot.
+  kv.kvserver.readsummary.ReadSummary right_read_summary = 7;
 }
 
 // ReplicaChangeType is a parameter of ChangeReplicasTrigger.
@@ -165,11 +212,11 @@ enum ReplicaChangeType {
 // Removed() methods return the replicas being added and removed, respectively.
 // If more than one change is specified (i.e. len(Added())+len(Removed())
 // exceeds one), this initiates an atomic replication change in which the
-// "removed" replicas are of type VOTER_OUTGOING or VOTER_DEMOTING (if they are
-// to be turned into learners instead); as a caveat a single demotion already
-// counts as two changes (and is tracked as a Removal() only). This joint
-// configuration is left via another ChangeReplicasTrigger which does not
-// specify any additions nor removals.
+// "removed" replicas are of type VOTER_OUTGOING or VOTER_DEMOTING_{LEARNER,
+// NON_VOTER} (if they are to be turned into learners or non-voters instead); as
+// a caveat a single demotion already counts as two changes (and is tracked as a
+// Removal() only). This joint configuration is left via another
+// ChangeReplicasTrigger which does not specify any additions nor removals.
 message ChangeReplicasTrigger {
   option (gogoproto.goproto_stringer) = false;
 
@@ -285,7 +332,8 @@ message ObservedTimestamp {
   option (gogoproto.populate) = true;
 
   int32 node_id = 1 [(gogoproto.customname) = "NodeID", (gogoproto.casttype) = "NodeID"];
-  util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false];
+  util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
 }
 
 // A Transaction is a unit of work performed on the database.
@@ -310,6 +358,10 @@ message Transaction {
   // The last time that the transaction's record was sent a heartbeat by its
   // coordinator to indicate client activity. Concurrent transactions will
   // avoid aborting a transaction if it observes recent-enough activity.
+  //
+  // NOTE: this could use a ClockTimestamp type, but doing so results in a
+  // large diff that doesn't seem worth it, given that we never feed this
+  // timestamp back into a clock.
   util.hlc.Timestamp last_heartbeat = 5 [(gogoproto.nullable) = false];
   // This flag is set if the transaction's timestamp was "leaked" beyond the
   // transaction (e.g. via cluster_logical_timestamp()). If true, this prevents
@@ -334,17 +386,35 @@ message Transaction {
   // successful refresh or, if the refresh is unsuccessful, after a transaction
   // restart.
   util.hlc.Timestamp read_timestamp = 15 [(gogoproto.nullable) = false];
-  // Initial Timestamp + clock skew. Reads which encounter values with
-  // timestamps between timestamp and max_timestamp trigger a txn
-  // retry error, unless the node being read is listed in observed_timestamps
-  // (in which case no more read uncertainty can occur).
-  // The case max_timestamp < timestamp is possible for transactions which have
-  // been pushed; in this case, max_timestamp should be ignored.
-  util.hlc.Timestamp max_timestamp = 7 [(gogoproto.nullable) = false];
+  // The transaction's global uncertainty limit is its initial timestamp +
+  // maximum cluster-wide clock skew. This value defines the inclusive upper
+  // bound of the transaction's uncertainty interval.
+  //
+  // Reads which encounter values with timestamps between read_timestamp and
+  // global_uncertainty_limit ("within the uncertainty interval") trigger a
+  // retry error (ReadWithinUncertaintyIntervalError). This forces the
+  // transaction to increase its read timestamp, either through a refresh or a
+  // retry, in order to ensure that the transaction observes the "uncertain"
+  // value.
+  //
+  // However, the uncertainty limit applied to values can be reduced when
+  // evaluating a request on a node from which the transaction has acquired an
+  // observed timestamp. This reduced uncertainty limit is reflected in the
+  // local_uncertainty_limit variable at the time of request evaluation.
+  //
+  // See pkg/kv/kvserver/observedts for more details.
+  //
+  // The case global_uncertainty_limit < read_timestamp is possible for
+  // transactions which have been pushed or have refreshed; in this case,
+  // global_uncertainty_limit should be ignored.
+  util.hlc.Timestamp global_uncertainty_limit = 7 [(gogoproto.nullable) = false];
   // A list of <NodeID, timestamp> pairs. The list maps NodeIDs to timestamps
-  // as observed from their local clock during this transaction. The purpose of
-  // this list is to avoid uncertainty related restarts which normally occur
-  // when reading a value in the near future as per the max_timestamp field.
+  // as observed from their local clock during this transaction. The purpose
+  // of this list is to allow a transaction to avoid uncertainty related
+  // restarts which occur when reading a value in the near future, per the
+  // global_uncertainty_limit field. The list helps avoid these restarts by
+  // establishing a lower local_uncertainty_limit when evaluating a request on
+  // a node in the list.
   //
   // See pkg/kv/kvserver/observedts for more details.
   //
@@ -435,7 +505,7 @@ message TransactionRecord {
   option (gogoproto.populate) = true;
 
   // See comments on Transaction proto.
-  storage.enginepb.TxnMeta meta     = 1  [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  storage.enginepb.TxnMeta meta            = 1  [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   TransactionStatus status                 = 4;
   util.hlc.Timestamp last_heartbeat        = 5  [(gogoproto.nullable) = false];
   repeated Span lock_spans                 = 11 [(gogoproto.nullable) = false];
@@ -506,7 +576,8 @@ message Lease {
   // The start is a timestamp at which the lease begins. This value
   // must be greater than the last lease expiration or the lease request
   // is considered invalid.
-  util.hlc.Timestamp start = 1 [(gogoproto.nullable) = false];
+  util.hlc.Timestamp start = 1 [(gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
 
   // The expiration is a timestamp at which the lease expires. This means that a
   // new lease can be granted for a later timestamp. This field is only set for
@@ -525,7 +596,8 @@ message Lease {
   // to help with the rollout (such that a lease applied by some nodes before
   // the rollout and some nodes after the rollout is serialized the same).
   // TODO(andrei): Make this non-nullable after the rollout.
-  util.hlc.Timestamp proposed_ts  = 5 [(gogoproto.customname) = "ProposedTS"];
+  util.hlc.Timestamp proposed_ts  = 5 [(gogoproto.customname) = "ProposedTS",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
 
   // The epoch of the lease holder's node liveness entry. If this value is
   // non-zero, the expiration field is ignored.
@@ -622,11 +694,46 @@ message LeafTxnFinalState {
   reserved 8;
 }
 
-// RangeInfo describes a range which executed a request. It contains
-// the range descriptor and lease information at the time of execution.
+// RangeClosedTimestampPolicy represents the policy used by the leaseholder of a
+// range to establish and publish closed timestamps. The policy dictates how far
+// in the past (lag) or in the future (lead) MVCC history is closed off.
+enum RangeClosedTimestampPolicy {
+  option (gogoproto.goproto_enum_prefix) = false;
+
+  // LAG_BY_CLUSTER_SETTING indicates that the range's closed timestamp is
+  // configured to lag behind present time by the value configured for the
+  // `kv.closed_timestamp.target_duration` cluster setting.
+  LAG_BY_CLUSTER_SETTING = 0;
+  // LEAD_FOR_GLOBAL_READS indicates that the range's closed timestamp is
+  // configured to lead present time such that all followers of the range are
+  // able to serve consistent, present time reads. Because the policy describes
+  // a goal and not the lead time itself, the lead time is allowed vary as a
+  // function of maximum clock uncertainty and closed timestamp propagation time
+  // (which itself is a function of leaseholder -> follower network latency and
+  // closed timestamp update periodicity).
+  LEAD_FOR_GLOBAL_READS = 1;
+
+  // Keep this sentinel value higher than the rest.
+  MAX_CLOSED_TIMESTAMP_POLICY = 2;
+}
+
+// ClientRangeInfo represents the kvclient's knowledge about the state of the
+// range (i.e. of the range descriptor, lease, and closed timestamp policy). The
+// kvserver checks whether the client's info is up to date and, if it isn't, it
+// will return a RangeInfo with up-to-date information.
+message ClientRangeInfo {
+  int64 descriptor_generation = 1 [(gogoproto.casttype) = "RangeGeneration"];
+  int64 lease_sequence = 2 [(gogoproto.casttype) = "LeaseSequence"];
+  RangeClosedTimestampPolicy closed_timestamp_policy = 3;
+}
+
+// RangeInfo describes a range which executed a request. It contains the range
+// descriptor, lease information, and closed timestamp policy at the time of
+// execution.
 message RangeInfo {
   option (gogoproto.goproto_stringer) = false;
 
   RangeDescriptor desc = 1 [(gogoproto.nullable) = false];
   Lease lease = 2 [(gogoproto.nullable) = false];
+  RangeClosedTimestampPolicy closed_timestamp_policy = 3;
 }

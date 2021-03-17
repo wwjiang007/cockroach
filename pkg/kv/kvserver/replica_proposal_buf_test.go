@@ -17,10 +17,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
@@ -33,6 +39,7 @@ import (
 // testProposer is a testing implementation of proposer.
 type testProposer struct {
 	syncutil.RWMutex
+	clock      *hlc.Clock
 	ds         destroyStatus
 	lai        uint64
 	enqueued   int
@@ -44,16 +51,40 @@ type testProposer struct {
 	// If not nil, this is called by RejectProposalWithRedirectLocked(). If nil,
 	// RejectProposalWithRedirectLocked() panics.
 	onRejectProposalWithRedirectLocked func(prop *ProposalData, redirectTo roachpb.ReplicaID)
+
+	// leaderReplicaInDescriptor is set if the leader (as indicated by raftGroup)
+	// is known, and that leader is part of the range's descriptor (as seen by the
+	// current replica). This can be used to simulate the local replica being so
+	// far behind that it doesn't have an up to date descriptor.
+	leaderReplicaInDescriptor bool
+	// If leaderReplicaInDescriptor is set, this specifies what type of replica it
+	// is. Some types of replicas are not eligible to get a lease.
+	leaderReplicaType roachpb.ReplicaType
+	rangePolicy       roachpb.RangeClosedTimestampPolicy
 }
+
+var _ proposer = &testProposer{}
 
 type testProposerRaft struct {
 	status raft.BasicStatus
+	// lastProps are the command that the propBuf flushed last.
+	lastProps []kvserverpb.RaftCommand
 }
 
-var _ proposerRaft = testProposerRaft{}
+var _ proposerRaft = &testProposerRaft{}
 
-func (t testProposerRaft) Step(raftpb.Message) error {
-	// TODO(andrei, nvanbenschoten): Capture the message and test against it.
+func (t *testProposerRaft) Step(msg raftpb.Message) error {
+	if msg.Type != raftpb.MsgProp {
+		return nil
+	}
+	// Decode and save all the commands.
+	t.lastProps = make([]kvserverpb.RaftCommand, len(msg.Entries))
+	for i, e := range msg.Entries {
+		_ /* idKey */, encodedCommand := DecodeRaftCommand(e.Data)
+		if err := protoutil.Unmarshal(encodedCommand, &t.lastProps[i]); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -90,6 +121,24 @@ func (t *testProposer) enqueueUpdateCheck() {
 	t.enqueued++
 }
 
+func (t *testProposer) closedTimestampTarget() hlc.Timestamp {
+	if t.clock == nil {
+		return hlc.Timestamp{}
+	}
+	return closedts.TargetForPolicy(
+		t.clock.NowAsClockTimestamp(),
+		t.clock.MaxOffset(),
+		1*time.Second,
+		0,
+		200*time.Millisecond,
+		t.rangePolicy,
+	)
+}
+
+func (t *testProposer) raftTransportClosedTimestampEnabled() bool {
+	return true
+}
+
 func (t *testProposer) withGroupLocked(fn func(proposerRaft) error) error {
 	// Note that t.raftGroup can be nil, which FlushLockedWithRaftGroup supports.
 	return fn(t.raftGroup)
@@ -97,6 +146,39 @@ func (t *testProposer) withGroupLocked(fn func(proposerRaft) error) error {
 
 func (t *testProposer) registerProposalLocked(p *ProposalData) {
 	t.registered++
+}
+
+func (t *testProposer) leaderStatusRLocked(raftGroup proposerRaft) rangeLeaderInfo {
+	leaderKnown := raftGroup.BasicStatus().Lead != raft.None
+	var leaderRep roachpb.ReplicaID
+	var iAmTheLeader, leaderEligibleForLease bool
+	if leaderKnown {
+		leaderRep = roachpb.ReplicaID(raftGroup.BasicStatus().Lead)
+		iAmTheLeader = leaderRep == t.replicaID()
+		repDesc := roachpb.ReplicaDescriptor{
+			ReplicaID: leaderRep,
+			Type:      &t.leaderReplicaType,
+		}
+
+		if t.leaderReplicaInDescriptor {
+			// Fill in a RangeDescriptor just enough for the CheckCanReceiveLease()
+			// call.
+			rngDesc := roachpb.RangeDescriptor{
+				InternalReplicas: []roachpb.ReplicaDescriptor{repDesc},
+			}
+			err := roachpb.CheckCanReceiveLease(repDesc, &rngDesc)
+			leaderEligibleForLease = err == nil
+		} else {
+			// This matches replicaProposed.leaderStatusRLocked().
+			leaderEligibleForLease = true
+		}
+	}
+	return rangeLeaderInfo{
+		leaderKnown:            leaderKnown,
+		leader:                 leaderRep,
+		iAmTheLeader:           iAmTheLeader,
+		leaderEligibleForLease: leaderEligibleForLease,
+	}
 }
 
 func (t *testProposer) rejectProposalWithRedirectLocked(
@@ -108,17 +190,55 @@ func (t *testProposer) rejectProposalWithRedirectLocked(
 	t.onRejectProposalWithRedirectLocked(prop, redirectTo)
 }
 
-func newPropData(leaseReq bool) (*ProposalData, []byte) {
+// proposalCreator holds on to a lease and creates proposals using it.
+type proposalCreator struct {
+	lease kvserverpb.LeaseStatus
+}
+
+func (pc proposalCreator) newPutProposal() (*ProposalData, []byte) {
 	var ba roachpb.BatchRequest
-	if leaseReq {
-		ba.Add(&roachpb.RequestLeaseRequest{})
-	} else {
-		ba.Add(&roachpb.PutRequest{})
+	ba.Add(&roachpb.PutRequest{})
+	return pc.newProposal(ba)
+}
+
+func (pc proposalCreator) newLeaseProposal(lease roachpb.Lease) (*ProposalData, []byte) {
+	var ba roachpb.BatchRequest
+	ba.Add(&roachpb.RequestLeaseRequest{Lease: lease})
+	return pc.newProposal(ba)
+}
+
+func (pc proposalCreator) newProposal(ba roachpb.BatchRequest) (*ProposalData, []byte) {
+	var lease *roachpb.Lease
+	r, ok := ba.GetArg(roachpb.RequestLease)
+	if ok {
+		lease = &r.(*roachpb.RequestLeaseRequest).Lease
 	}
-	return &ProposalData{
-		command: &kvserverpb.RaftCommand{},
-		Request: &ba,
-	}, make([]byte, 0, kvserverpb.MaxRaftCommandFooterSize())
+	p := &ProposalData{
+		ctx:   context.Background(),
+		idKey: kvserverbase.CmdIDKey("test-cmd"),
+		command: &kvserverpb.RaftCommand{
+			ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
+				State: &kvserverpb.ReplicaState{Lease: lease},
+			},
+		},
+		Request:     &ba,
+		leaseStatus: pc.lease,
+	}
+	return p, pc.encodeProposal(p)
+}
+
+func (pc proposalCreator) encodeProposal(p *ProposalData) []byte {
+	cmdLen := p.command.Size()
+	needed := raftCommandPrefixLen + cmdLen +
+		kvserverpb.MaxMaxLeaseFooterSize() +
+		kvserverpb.MaxClosedTimestampFooterSize()
+	data := make([]byte, raftCommandPrefixLen, needed)
+	encodeRaftCommandPrefix(data, raftVersionStandard, p.idKey)
+	data = data[:raftCommandPrefixLen+p.command.Size()]
+	if _, err := protoutil.MarshalTo(p.command, data[raftCommandPrefixLen:]); err != nil {
+		panic(err)
+	}
+	return data
 }
 
 // TestProposalBuffer tests the basic behavior of the Raft proposal buffer.
@@ -129,14 +249,23 @@ func TestProposalBuffer(t *testing.T) {
 
 	var p testProposer
 	var b propBuf
-	b.Init(&p)
+	var pc proposalCreator
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	b.Init(&p, tracker.NewLockfreeTracker(), clock, cluster.MakeTestingClusterSettings())
 
 	// Insert propBufArrayMinSize proposals. The buffer should not be flushed.
 	num := propBufArrayMinSize
 	for i := 0; i < num; i++ {
 		leaseReq := i == 3
-		pd, data := newPropData(leaseReq)
-		mlai, err := b.Insert(ctx, pd, data)
+		var pd *ProposalData
+		var data []byte
+		if leaseReq {
+			pd, data = pc.newLeaseProposal(roachpb.Lease{})
+		} else {
+			pd, data = pc.newPutProposal()
+		}
+		_, tok := b.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
+		mlai, err := b.Insert(ctx, pd, data, tok)
 		require.Nil(t, err)
 		if leaseReq {
 			expMlai := uint64(i)
@@ -153,12 +282,14 @@ func TestProposalBuffer(t *testing.T) {
 		require.Equal(t, 1, p.enqueued)
 		require.Equal(t, 0, p.registered)
 	}
+	require.Equal(t, num, b.evalTracker.Count())
 
 	// Insert another proposal. This causes the buffer to flush. Doing so
 	// results in a lease applied index being skipped, which is harmless.
 	// Remember that the lease request above did not receive a lease index.
-	pd, data := newPropData(false)
-	mlai, err := b.Insert(ctx, pd, data)
+	pd, data := pc.newPutProposal()
+	_, tok := b.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
+	mlai, err := b.Insert(ctx, pd, data, tok)
 	require.Nil(t, err)
 	expMlai := uint64(num + 1)
 	require.Equal(t, expMlai, mlai)
@@ -169,6 +300,7 @@ func TestProposalBuffer(t *testing.T) {
 	require.Equal(t, num, p.registered)
 	require.Equal(t, uint64(num), b.liBase)
 	require.Equal(t, 2*propBufArrayMinSize, b.arr.len())
+	require.Equal(t, 1, b.evalTracker.Count())
 
 	// Increase the proposer's applied lease index and flush. The buffer's
 	// lease index offset should jump up.
@@ -181,7 +313,8 @@ func TestProposalBuffer(t *testing.T) {
 
 	// Insert one more proposal. The lease applied index should adjust to
 	// the increase accordingly.
-	mlai, err = b.Insert(ctx, pd, data)
+	_, tok = b.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
+	mlai, err = b.Insert(ctx, pd, data, tok)
 	require.Nil(t, err)
 	expMlai = p.lai + 1
 	require.Equal(t, expMlai, mlai)
@@ -209,7 +342,9 @@ func TestProposalBufferConcurrentWithDestroy(t *testing.T) {
 
 	var p testProposer
 	var b propBuf
-	b.Init(&p)
+	var pc proposalCreator
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	b.Init(&p, tracker.NewLockfreeTracker(), clock, cluster.MakeTestingClusterSettings())
 
 	mlais := make(map[uint64]struct{})
 	dsErr := errors.New("destroyed")
@@ -220,8 +355,9 @@ func TestProposalBufferConcurrentWithDestroy(t *testing.T) {
 	for i := 0; i < concurrency; i++ {
 		g.Go(func() error {
 			for {
-				pd, data := newPropData(false)
-				mlai, err := b.Insert(ctx, pd, data)
+				pd, data := pc.newPutProposal()
+				_, tok := b.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
+				mlai, err := b.Insert(ctx, pd, data, tok)
 				if err != nil {
 					if errors.Is(err, dsErr) {
 						return nil
@@ -280,12 +416,16 @@ func TestProposalBufferRegistersAllOnProposalError(t *testing.T) {
 
 	var p testProposer
 	var b propBuf
-	b.Init(&p)
+	var pc proposalCreator
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	b.Init(&p, tracker.NewLockfreeTracker(), clock, cluster.MakeTestingClusterSettings())
 
 	num := propBufArrayMinSize
+	toks := make([]TrackedRequestToken, num)
 	for i := 0; i < num; i++ {
-		pd, data := newPropData(false)
-		_, err := b.Insert(ctx, pd, data)
+		pd, data := pc.newPutProposal()
+		_, toks[i] = b.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
+		_, err := b.Insert(ctx, pd, data, toks[i])
 		require.Nil(t, err)
 	}
 	require.Equal(t, num, b.Len())
@@ -303,6 +443,7 @@ func TestProposalBufferRegistersAllOnProposalError(t *testing.T) {
 	err := b.flushLocked(ctx)
 	require.Equal(t, propErr, err)
 	require.Equal(t, num, p.registered)
+	require.Zero(t, b.evalTracker.Count())
 }
 
 // TestProposalBufferRegistrationWithInsertionErrors tests that if during
@@ -315,12 +456,22 @@ func TestProposalBufferRegistrationWithInsertionErrors(t *testing.T) {
 
 	var p testProposer
 	var b propBuf
-	b.Init(&p)
+	var pc proposalCreator
+	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	b.Init(&p, tracker.NewLockfreeTracker(), clock, cluster.MakeTestingClusterSettings())
 
 	num := propBufArrayMinSize / 2
+	toks1 := make([]TrackedRequestToken, num)
 	for i := 0; i < num; i++ {
-		pd, data := newPropData(i%2 == 0)
-		_, err := b.Insert(ctx, pd, data)
+		var pd *ProposalData
+		var data []byte
+		if i%2 == 0 {
+			pd, data = pc.newLeaseProposal(roachpb.Lease{})
+		} else {
+			pd, data = pc.newPutProposal()
+		}
+		_, toks1[i] = b.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
+		_, err := b.Insert(ctx, pd, data, toks1[i])
 		require.Nil(t, err)
 	}
 
@@ -329,9 +480,17 @@ func TestProposalBufferRegistrationWithInsertionErrors(t *testing.T) {
 		return 0, insertErr
 	}
 
+	toks2 := make([]TrackedRequestToken, num)
 	for i := 0; i < num; i++ {
-		pd, data := newPropData(i%2 == 0)
-		_, err := b.Insert(ctx, pd, data)
+		var pd *ProposalData
+		var data []byte
+		if i%2 == 0 {
+			pd, data = pc.newLeaseProposal(roachpb.Lease{})
+		} else {
+			pd, data = pc.newPutProposal()
+		}
+		_, toks2[i] = b.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
+		_, err := b.Insert(ctx, pd, data, toks2[i])
 		require.Equal(t, insertErr, err)
 	}
 	require.Equal(t, 2*num, b.Len())
@@ -340,6 +499,7 @@ func TestProposalBufferRegistrationWithInsertionErrors(t *testing.T) {
 
 	require.Equal(t, 0, b.Len())
 	require.Equal(t, num, p.registered)
+	require.Zero(t, b.evalTracker.Count())
 }
 
 // TestPropBufCnt tests the basic behavior of the counter maintained by the
@@ -391,9 +551,16 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 	// Each subtest will try to propose a lease acquisition in a different Raft
 	// scenario. Some proposals should be allowed, some should be rejected.
 	for _, tc := range []struct {
-		name         string
-		state        raft.StateType
-		leader       uint64
+		name  string
+		state raft.StateType
+		// raft.None means there's no leader, or the leader is unknown.
+		leader uint64
+		// Empty means VOTER_FULL.
+		leaderRepType roachpb.ReplicaType
+		// Set to simulate situations where the local replica is so behind that the
+		// leader is not even part of the range descriptor.
+		leaderNotInRngDesc bool
+
 		expRejection bool
 	}{
 		{
@@ -404,7 +571,7 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 			expRejection: false,
 		},
 		{
-			name:  "follower known leader",
+			name:  "follower, known eligible leader",
 			state: raft.StateFollower,
 			// Someone else is leader.
 			leader: self + 1,
@@ -412,7 +579,28 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 			expRejection: true,
 		},
 		{
-			name:  "follower unknown leader",
+			name:  "follower, known ineligible leader",
+			state: raft.StateFollower,
+			// Someone else is leader.
+			leader: self + 1,
+			// The leader type makes it ineligible to get the lease. Thus, the local
+			// proposal will not be rejected.
+			leaderRepType: roachpb.VOTER_DEMOTING_LEARNER,
+			expRejection:  false,
+		},
+		{
+			// Here we simulate the leader being known by Raft, but the local replica
+			// is so far behind that it doesn't contain the leader replica.
+			name:  "follower, known leader not in range descriptor",
+			state: raft.StateFollower,
+			// Someone else is leader.
+			leader:             self + 1,
+			leaderNotInRngDesc: true,
+			// We assume that the leader is eligible, and redirect.
+			expRejection: true,
+		},
+		{
+			name:  "follower, unknown leader",
 			state: raft.StateFollower,
 			// Unknown leader.
 			leader: raft.None,
@@ -423,6 +611,7 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var p testProposer
+			var pc proposalCreator
 			// p.replicaID() is hardcoded; it'd better be hardcoded to what this test
 			// expects.
 			require.Equal(t, self, uint64(p.replicaID()))
@@ -448,13 +637,21 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 					Lead:      tc.leader,
 				},
 			}
-			r := testProposerRaft{status: raftStatus}
+			r := &testProposerRaft{
+				status: raftStatus,
+			}
 			p.raftGroup = r
-			var b propBuf
-			b.Init(&p)
+			p.leaderReplicaInDescriptor = !tc.leaderNotInRngDesc
+			p.leaderReplicaType = tc.leaderRepType
 
-			pd, data := newPropData(true /* leaseReq */)
-			_, err := b.Insert(ctx, pd, data)
+			var b propBuf
+			clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+			tracker := tracker.NewLockfreeTracker()
+			b.Init(&p, tracker, clock, cluster.MakeTestingClusterSettings())
+
+			pd, data := pc.newLeaseProposal(roachpb.Lease{})
+			_, tok := b.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
+			_, err := b.Insert(ctx, pd, data, tok.Move(ctx))
 			require.NoError(t, err)
 			require.NoError(t, b.flushLocked(ctx))
 			if tc.expRejection {
@@ -462,6 +659,245 @@ func TestProposalBufferRejectLeaseAcqOnFollower(t *testing.T) {
 			} else {
 				require.Equal(t, roachpb.ReplicaID(0), rejected)
 			}
+			require.Zero(t, tracker.Count())
 		})
 	}
 }
+
+// Test that the propBuf properly assigns closed timestamps to proposals being
+// flushed out of it. Each subtest proposes one command and checks for the
+// expected closed timestamp being written to the proposal by the propBuf.
+func TestProposalBufferClosedTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	const maxOffset = 500 * time.Millisecond
+	mc := hlc.NewManualClock((1613588135 * time.Second).Nanoseconds())
+	clock := hlc.NewClock(mc.UnixNano, maxOffset)
+	st := cluster.MakeTestingClusterSettings()
+	closedts.TargetDuration.Override(&st.SV, time.Second)
+	closedts.SideTransportCloseInterval.Override(&st.SV, 200*time.Millisecond)
+	now := clock.NowAsClockTimestamp()
+	nowTS := now.ToTimestamp()
+	nowMinusClosedLag := nowTS.Add(-closedts.TargetDuration.Get(&st.SV).Nanoseconds(), 0)
+	nowMinusTwiceClosedLag := nowTS.Add(-2*closedts.TargetDuration.Get(&st.SV).Nanoseconds(), 0)
+	nowPlusGlobalReadLead := nowTS.Add((maxOffset +
+		275*time.Millisecond /* sideTransportPropTime */ +
+		25*time.Millisecond /* bufferTime */).Nanoseconds(), 0).
+		WithSynthetic(true)
+	expiredLeaseTimestamp := nowTS.Add(-1000, 0)
+	someClosedTS := nowTS.Add(-2000, 0)
+
+	type reqType int
+	checkClosedTS := func(t *testing.T, r *testProposerRaft, exp hlc.Timestamp) {
+		require.Len(t, r.lastProps, 1)
+		if exp.IsEmpty() {
+			require.Nil(t, r.lastProps[0].ClosedTimestamp)
+		} else {
+			require.NotNil(t, r.lastProps[0].ClosedTimestamp)
+			closedTS := *r.lastProps[0].ClosedTimestamp
+			closedTS.Logical = 0 // ignore logical ticks from clock
+			require.Equal(t, exp, closedTS)
+		}
+	}
+
+	// The lease that the proposals are made under.
+	curLease := roachpb.Lease{
+		Epoch:    0, // Expiration-based lease.
+		Sequence: 1,
+		Start:    hlc.ClockTimestamp{},
+		// Expiration is filled by each test.
+		Expiration: nil,
+	}
+
+	const (
+		regularWrite reqType = iota
+		// newLease means that the request is a lease acquisition (new lease or
+		// lease extension).
+		newLease
+		leaseTransfer
+	)
+
+	for _, tc := range []struct {
+		name string
+
+		reqType reqType
+		// The lower bound of all currently-evaluating requests. We can't close this
+		// or above.
+		trackerLowerBound hlc.Timestamp
+		// The expiration of the current lease. The closed timestamp of most
+		// proposal is upper-bounded by this, which matters for
+		// LEAD_FOR_GLOBAL_READS ranges (on other ranges the propBuf would never
+		// like to close a timestamp above the current lease expiration because it
+		// wouldn't be processing commands if the lease is expired).
+		leaseExp    hlc.Timestamp
+		rangePolicy roachpb.RangeClosedTimestampPolicy
+		// The highest closed timestamp that the propBuf has previously attached to
+		// a proposal. The propBuf should never propose a new closedTS below this.
+		prevClosedTimestamp hlc.Timestamp
+
+		// lease is used when reqType = newLease. This will be the lease being
+		// proposed.
+		lease roachpb.Lease
+
+		expClosed hlc.Timestamp
+	}{
+		{
+			name:                "basic",
+			reqType:             regularWrite,
+			trackerLowerBound:   hlc.Timestamp{},
+			leaseExp:            hlc.MaxTimestamp,
+			rangePolicy:         roachpb.LAG_BY_CLUSTER_SETTING,
+			prevClosedTimestamp: hlc.Timestamp{},
+			expClosed:           nowMinusClosedLag,
+		},
+		{
+			// The request tracker will prevent us from closing below its lower bound.
+			name:                "not closing below evaluating requests",
+			reqType:             regularWrite,
+			trackerLowerBound:   nowMinusTwiceClosedLag,
+			leaseExp:            hlc.MaxTimestamp,
+			rangePolicy:         roachpb.LAG_BY_CLUSTER_SETTING,
+			prevClosedTimestamp: hlc.Timestamp{},
+			expClosed:           nowMinusTwiceClosedLag.FloorPrev(),
+		},
+		{
+			// Like the basic test, except that we can't close timestamp below what
+			// we've already closed previously.
+			name:                "no regression",
+			reqType:             regularWrite,
+			trackerLowerBound:   hlc.Timestamp{},
+			leaseExp:            hlc.MaxTimestamp,
+			rangePolicy:         roachpb.LAG_BY_CLUSTER_SETTING,
+			prevClosedTimestamp: someClosedTS,
+			expClosed:           someClosedTS,
+		},
+		{
+			name:    "brand new lease",
+			reqType: newLease,
+			lease: roachpb.Lease{
+				// Higher sequence => this is a brand new lease, not an extension.
+				Sequence: curLease.Sequence + 1,
+				Start:    now,
+			},
+			trackerLowerBound: hlc.Timestamp{},
+			// The current lease can be expired; we won't backtrack the closed
+			// timestamp to this expiration.
+			leaseExp:    expiredLeaseTimestamp,
+			rangePolicy: roachpb.LAG_BY_CLUSTER_SETTING,
+			expClosed:   now.ToTimestamp(),
+		},
+		{
+			name:    "lease extension",
+			reqType: newLease,
+			lease: roachpb.Lease{
+				// Same sequence => this is a lease extension.
+				Sequence: curLease.Sequence,
+				Start:    now,
+			},
+			trackerLowerBound: hlc.Timestamp{},
+			// The current lease can be expired; we won't backtrack the closed
+			// timestamp to this expiration.
+			leaseExp:    expiredLeaseTimestamp,
+			rangePolicy: roachpb.LAG_BY_CLUSTER_SETTING,
+			// Lease extensions don't carry closed timestamps because they don't get
+			// MLAIs, and so they can be reordered.
+			expClosed: hlc.Timestamp{},
+		},
+		{
+			// Lease transfers behave just like regular writes. The lease start time
+			// doesn't matter.
+			name:    "lease transfer",
+			reqType: leaseTransfer,
+			lease: roachpb.Lease{
+				Sequence: curLease.Sequence + 1,
+				Start:    now,
+			},
+			trackerLowerBound: hlc.Timestamp{},
+			leaseExp:          hlc.MaxTimestamp,
+			rangePolicy:       roachpb.LAG_BY_CLUSTER_SETTING,
+			expClosed:         nowMinusClosedLag,
+		},
+		{
+			// With the LEAD_FOR_GLOBAL_READS policy, we're expecting to close
+			// timestamps in the future.
+			name:                "global range",
+			reqType:             regularWrite,
+			trackerLowerBound:   hlc.Timestamp{},
+			leaseExp:            hlc.MaxTimestamp,
+			rangePolicy:         roachpb.LEAD_FOR_GLOBAL_READS,
+			prevClosedTimestamp: hlc.Timestamp{},
+			expClosed:           nowPlusGlobalReadLead,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &testProposerRaft{}
+			p := testProposer{
+				clock:       clock,
+				lai:         10,
+				raftGroup:   r,
+				rangePolicy: tc.rangePolicy,
+			}
+			tracker := mockTracker{
+				lowerBound: tc.trackerLowerBound,
+			}
+			pc := proposalCreator{lease: kvserverpb.LeaseStatus{Lease: curLease}}
+			pc.lease.Lease.Expiration = &tc.leaseExp
+
+			var b propBuf
+			b.Init(&p, tracker, clock, st)
+			b.forwardClosedTimestampLocked(tc.prevClosedTimestamp)
+
+			var pd *ProposalData
+			var data []byte
+			switch tc.reqType {
+			case regularWrite:
+				pd, data = pc.newPutProposal()
+			case newLease:
+				pd, data = pc.newLeaseProposal(tc.lease)
+			case leaseTransfer:
+				var ba roachpb.BatchRequest
+				ba.Add(&roachpb.TransferLeaseRequest{
+					Lease: roachpb.Lease{
+						Start:    now,
+						Sequence: pc.lease.Lease.Sequence + 1,
+					},
+					PrevLease: pc.lease.Lease,
+				})
+				pd, data = pc.newProposal(ba)
+			default:
+				t.Fatalf("unknown req type %d", tc.reqType)
+			}
+			tok := TrackedRequestToken{
+				done: false,
+				tok:  nil,
+				b:    &b,
+			}
+			_, err := b.Insert(ctx, pd, data, tok)
+			require.NoError(t, err)
+			require.NoError(t, b.flushLocked(ctx))
+			checkClosedTS(t, r, tc.expClosed)
+		})
+	}
+}
+
+type mockTracker struct {
+	lowerBound hlc.Timestamp
+}
+
+func (t mockTracker) Track(ctx context.Context, ts hlc.Timestamp) tracker.RemovalToken {
+	panic("unimplemented")
+}
+
+func (t mockTracker) Untrack(context.Context, tracker.RemovalToken) {}
+
+func (t mockTracker) LowerBound(context.Context) hlc.Timestamp {
+	return t.lowerBound
+}
+
+func (t mockTracker) Count() int {
+	panic("unimplemented")
+}
+
+var _ tracker.Tracker = mockTracker{}

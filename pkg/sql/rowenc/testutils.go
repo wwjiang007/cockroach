@@ -178,6 +178,9 @@ func RandDatumWithNullChance(rng *rand.Rand, typ *types.T, nullChance int) tree.
 		for i := range typ.TupleContents() {
 			tuple.D[i] = RandDatum(rng, typ.TupleContents()[i], true)
 		}
+		// Calling ResolvedType causes the internal TupleContents types to be
+		// populated.
+		tuple.ResolvedType()
 		return &tuple
 	case types.BitFamily:
 		width := typ.Width()
@@ -821,6 +824,12 @@ func RandTypeFromSlice(rng *rand.Rand, typs []*types.T) *types.T {
 func RandColumnType(rng *rand.Rand) *types.T {
 	for {
 		typ := RandType(rng)
+		switch typ.Oid() {
+		case oid.T_int2vector, oid.T_oidvector:
+			// OIDVECTOR and INT2VECTOR are not valid column types for
+			// user-created tables.
+			continue
+		}
 		if err := colinfo.ValidateColumnDefType(typ); err == nil {
 			return typ
 		}
@@ -999,9 +1008,17 @@ func RandEncDatumRowsOfTypes(rng *rand.Rand, numRows int, types []*types.T) EncD
 func TestingMakePrimaryIndexKey(
 	desc catalog.TableDescriptor, vals ...interface{},
 ) (roachpb.Key, error) {
+	return TestingMakePrimaryIndexKeyForTenant(desc, keys.SystemSQLCodec, vals...)
+}
+
+// TestingMakePrimaryIndexKeyForTenant is the same as TestingMakePrimaryIndexKey, but
+// allows specification of the codec to use when encoding keys.
+func TestingMakePrimaryIndexKeyForTenant(
+	desc catalog.TableDescriptor, codec keys.SQLCodec, vals ...interface{},
+) (roachpb.Key, error) {
 	index := desc.GetPrimaryIndex()
-	if len(vals) > len(index.ColumnIDs) {
-		return nil, errors.Errorf("got %d values, PK has %d columns", len(vals), len(index.ColumnIDs))
+	if len(vals) > index.NumColumns() {
+		return nil, errors.Errorf("got %d values, PK has %d columns", len(vals), index.NumColumns())
 	}
 	datums := make([]tree.Datum, len(vals))
 	for i, v := range vals {
@@ -1018,30 +1035,24 @@ func TestingMakePrimaryIndexKey(
 			return nil, errors.Errorf("unexpected value type %T", v)
 		}
 		// Check that the value type matches.
-		colID := index.ColumnIDs[i]
-		var done bool
-		if err := desc.ForeachPublicColumn(func(c *descpb.ColumnDescriptor) error {
-			if !done && c.ID == colID {
-				colTyp := datums[i].ResolvedType()
-				if t := colTyp.Family(); t != c.Type.Family() {
-					return errors.Errorf("column %d of type %s, got value of type %s", i, c.Type.Family(), t)
-				}
-				done = true
+		colID := index.GetColumnID(i)
+		col, _ := desc.FindColumnWithID(colID)
+		if col != nil && col.Public() {
+			colTyp := datums[i].ResolvedType()
+			if t := colTyp.Family(); t != col.GetType().Family() {
+				return nil, errors.Errorf("column %d of type %s, got value of type %s", i, col.GetType().Family(), t)
 			}
-			return nil
-		}); err != nil {
-			return nil, err
 		}
 	}
 	// Create the ColumnID to index in datums slice map needed by
 	// MakeIndexKeyPrefix.
 	var colIDToRowIndex catalog.TableColMap
 	for i := range vals {
-		colIDToRowIndex.Set(index.ColumnIDs[i], i)
+		colIDToRowIndex.Set(index.GetColumnID(i), i)
 	}
 
-	keyPrefix := MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, index.ID)
-	key, _, err := EncodeIndexKey(desc, index, colIDToRowIndex, datums, keyPrefix)
+	keyPrefix := MakeIndexKeyPrefix(codec, desc, index.GetID())
+	key, _, err := EncodeIndexKey(desc, index.IndexDesc(), colIDToRowIndex, datums, keyPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -1141,6 +1152,15 @@ func RandCreateTableWithInterleave(
 			}
 		}
 	}
+
+	// colIdx generates numbers that are incorporated into column names.
+	colIdx := func(ordinal int) int {
+		if generateColumnIndexNumber != nil {
+			return int(generateColumnIndexNumber())
+		}
+		return ordinal
+	}
+
 	var interleaveDef *tree.InterleaveDef
 	if interleaveIntoPK != nil && len(interleaveIntoPK.Columns) > 0 {
 		// Make the interleave prefix, which has to be exactly the columns in the
@@ -1160,11 +1180,7 @@ func RandCreateTableWithInterleave(
 			// Loop until we generate an indexable column type.
 			var extraCol *tree.ColumnTableDef
 			for {
-				colIdx := i + prefixLength
-				if generateColumnIndexNumber != nil {
-					colIdx = int(generateColumnIndexNumber())
-				}
-				extraCol = randColumnTableDef(rng, tableIdx, colIdx)
+				extraCol = randColumnTableDef(rng, tableIdx, colIdx(i+prefixLength))
 				extraColType := tree.MustBeStaticallyKnownType(extraCol.Type)
 				if colinfo.ColumnTypeIsIndexable(extraColType) {
 					break
@@ -1200,20 +1216,18 @@ func RandCreateTableWithInterleave(
 		}
 	} else {
 		// Make new defs from scratch.
-		for i := 0; i < nColumns; i++ {
-			colIdx := i
-			if generateColumnIndexNumber != nil {
-				colIdx = int(generateColumnIndexNumber())
-			}
-			columnDef := randColumnTableDef(rng, tableIdx, colIdx)
+		nComputedColumns := randutil.RandIntInRange(rng, 0, (nColumns+1)/2)
+		nNormalColumns := nColumns - nComputedColumns
+		for i := 0; i < nNormalColumns; i++ {
+			columnDef := randColumnTableDef(rng, tableIdx, colIdx(i))
 			columnDefs = append(columnDefs, columnDef)
 			defs = append(defs, columnDef)
 		}
 
 		// Make a random primary key with high likelihood.
 		if rng.Intn(8) != 0 {
-			indexDef := randIndexTableDefFromCols(rng, columnDefs)
-			if len(indexDef.Columns) > 0 {
+			indexDef, ok := randIndexTableDefFromCols(rng, columnDefs)
+			if ok && !indexDef.Inverted {
 				defs = append(defs, &tree.UniqueConstraintTableDef{
 					PrimaryKey:    true,
 					IndexTableDef: indexDef,
@@ -1231,16 +1245,26 @@ func RandCreateTableWithInterleave(
 				}
 			}
 		}
+
+		// Make defs for computed columns.
+		normalColDefs := columnDefs
+		for i := nNormalColumns; i < nColumns; i++ {
+			columnDef := randComputedColumnTableDef(rng, normalColDefs, tableIdx, colIdx(i))
+			columnDefs = append(columnDefs, columnDef)
+			defs = append(defs, columnDef)
+		}
 	}
 
 	// Make indexes.
 	nIdxs := rng.Intn(10)
 	for i := 0; i < nIdxs; i++ {
-		indexDef := randIndexTableDefFromCols(rng, columnDefs)
-		if len(indexDef.Columns) == 0 {
+		indexDef, ok := randIndexTableDefFromCols(rng, columnDefs)
+		if !ok {
 			continue
 		}
-		unique := rng.Intn(2) == 0
+		// Make forward indexes unique 50% of the time. Inverted indexes cannot
+		// be unique.
+		unique := !indexDef.Inverted && rng.Intn(2) == 0
 		if unique {
 			defs = append(defs, &tree.UniqueConstraintTableDef{
 				IndexTableDef: indexDef,
@@ -1369,11 +1393,15 @@ func IndexStoringMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Stateme
 		}
 		return colMap
 	}
-	generateStoringCols := func(rng *rand.Rand, tableCols []tree.Name, indexCols map[tree.Name]struct{}) []tree.Name {
+	generateStoringCols := func(rng *rand.Rand, tableInfo tableInfo, indexCols map[tree.Name]struct{}) []tree.Name {
 		var storingCols []tree.Name
-		for _, col := range tableCols {
-			_, ok := indexCols[col]
-			if ok {
+		for colOrdinal, col := range tableInfo.columnNames {
+			if _, ok := indexCols[col]; ok {
+				// Skip PK columns and columns already in the index.
+				continue
+			}
+			if tableInfo.columnsTableDefs[colOrdinal].Computed.Virtual {
+				// Virtual columns can't be stored.
 				continue
 			}
 			if rng.Intn(2) == 0 {
@@ -1398,7 +1426,7 @@ func IndexStoringMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Stateme
 				for _, elem := range ast.Columns {
 					indexCols[elem.Column] = struct{}{}
 				}
-				ast.Storing = generateStoringCols(rng, tableInfo.columnNames, indexCols)
+				ast.Storing = generateStoringCols(rng, tableInfo, indexCols)
 				changed = true
 			}
 		case *tree.CreateTable:
@@ -1425,7 +1453,7 @@ func IndexStoringMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Stateme
 					for _, elem := range idx.Columns {
 						indexCols[elem.Column] = struct{}{}
 					}
-					idx.Storing = generateStoringCols(rng, tableInfo.columnNames, indexCols)
+					idx.Storing = generateStoringCols(rng, tableInfo, indexCols)
 					changed = true
 				}
 			}
@@ -1488,24 +1516,130 @@ func PartialIndexMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Stateme
 	return stmts, changed
 }
 
-// randColumnTableDef produces a random ColumnTableDef, with a random type and
-// nullability.
+// randColumnTableDef produces a random ColumnTableDef for a non-computed
+// column, with a random type and nullability.
 func randColumnTableDef(rand *rand.Rand, tableIdx int, colIdx int) *tree.ColumnTableDef {
 	columnDef := &tree.ColumnTableDef{
 		// We make a unique name for all columns by prefixing them with the table
 		// index to make it easier to reference columns from different tables.
 		Name: tree.Name(fmt.Sprintf("col%d_%d", tableIdx, colIdx)),
-		Type: RandSortingType(rand),
+		Type: RandColumnType(rand),
 	}
 	columnDef.Nullable.Nullability = tree.Nullability(rand.Intn(int(tree.SilentNull) + 1))
 	return columnDef
 }
 
-// randIndexTableDefFromCols creates an IndexTableDef with a random subset of
-// the given columns and a random direction.
+// randComputedColumnTableDef produces a random ColumnTableDef for a computed
+// column (either STORED or VIRTUAL). The computed expressions refer to columns
+// in normalColDefs.
+func randComputedColumnTableDef(
+	rng *rand.Rand, normalColDefs []*tree.ColumnTableDef, tableIdx int, colIdx int,
+) *tree.ColumnTableDef {
+	newDef := randColumnTableDef(rng, tableIdx, colIdx)
+	newDef.Computed.Computed = true
+	newDef.Computed.Virtual = (rng.Intn(2) == 0)
+
+	if rng.Intn(2) == 0 {
+		// Try to find a set of numeric columns with the same type; the computed
+		// expression will be of the form "a+b+c".
+		var cols []*tree.ColumnTableDef
+		var fam types.Family
+		for _, idx := range rng.Perm(len(normalColDefs)) {
+			x := normalColDefs[idx]
+			xFam := x.Type.(*types.T).Family()
+
+			if len(cols) == 0 {
+				switch xFam {
+				case types.IntFamily, types.FloatFamily, types.DecimalFamily:
+					fam = xFam
+					cols = append(cols, x)
+				}
+			} else if fam == xFam {
+				cols = append(cols, x)
+				if len(cols) > 1 && rng.Intn(2) == 0 {
+					break
+				}
+			}
+		}
+		if len(cols) > 1 {
+			var expr tree.Expr
+			expr = tree.NewUnresolvedName(string(cols[0].Name))
+			for _, x := range cols[1:] {
+				expr = &tree.BinaryExpr{
+					Operator: tree.Plus,
+					Left:     expr,
+					Right:    tree.NewUnresolvedName(string(x.Name)),
+				}
+			}
+			newDef.Type = cols[0].Type
+			newDef.Computed.Expr = expr
+			return newDef
+		}
+	}
+
+	// Pick a single column and create a computed column that depends on it.
+	// The expression is as follows:
+	//  - for numeric types (int, float, decimal), the expression is "x+1";
+	//  - for string type, the expression is "lower(x)";
+	//  - for types that can be cast to string in computed columns, the expression
+	//    is "lower(x::string)";
+	//  - otherwise, the expression is "IF(x IS NULL, 'foo', 'bar')".
+	x := normalColDefs[randutil.RandIntInRange(rng, 0, len(normalColDefs))]
+	xTyp := x.Type.(*types.T)
+
+	switch xTyp.Family() {
+	case types.IntFamily, types.FloatFamily, types.DecimalFamily:
+		newDef.Type = xTyp
+		newDef.Computed.Expr = &tree.BinaryExpr{
+			Operator: tree.Plus,
+			Left:     tree.NewUnresolvedName(string(x.Name)),
+			Right:    RandDatum(rng, xTyp, false /* nullOk */),
+		}
+
+	case types.StringFamily:
+		newDef.Type = types.String
+		newDef.Computed.Expr = &tree.FuncExpr{
+			Func:  tree.WrapFunction("lower"),
+			Exprs: tree.Exprs{tree.NewUnresolvedName(string(x.Name))},
+		}
+
+	default:
+		volatility, ok := tree.LookupCastVolatility(xTyp, types.String)
+		if ok && volatility <= tree.VolatilityImmutable {
+			// We can cast to string; use lower(x::string)
+			newDef.Type = types.String
+			newDef.Computed.Expr = &tree.FuncExpr{
+				Func: tree.WrapFunction("lower"),
+				Exprs: tree.Exprs{
+					&tree.CastExpr{
+						Expr: tree.NewUnresolvedName(string(x.Name)),
+						Type: types.String,
+					},
+				},
+			}
+		} else {
+			// We cannot cast this type to string in a computed column expression.
+			// Use IF(x IS NULL, 'foo', 'bar').
+			newDef.Type = types.String
+			newDef.Computed.Expr = &tree.IfExpr{
+				Cond: &tree.IsNullExpr{
+					Expr: tree.NewUnresolvedName(string(x.Name)),
+				},
+				True: RandDatum(rng, types.String, true /* nullOK */),
+				Else: RandDatum(rng, types.String, true /* nullOK */),
+			}
+		}
+	}
+
+	return newDef
+}
+
+// randIndexTableDefFromCols attempts to create an IndexTableDef with a random
+// subset of the given columns and a random direction. If unsuccessful, ok=false
+// is returned.
 func randIndexTableDefFromCols(
 	rng *rand.Rand, columnTableDefs []*tree.ColumnTableDef,
-) tree.IndexTableDef {
+) (def tree.IndexTableDef, ok bool) {
 	cpy := make([]*tree.ColumnTableDef, len(columnTableDefs))
 	copy(cpy, columnTableDefs)
 	rng.Shuffle(len(cpy), func(i, j int) { cpy[i], cpy[j] = cpy[j], cpy[i] })
@@ -1513,18 +1647,28 @@ func randIndexTableDefFromCols(
 
 	cols := cpy[:nCols]
 
-	indexElemList := make(tree.IndexElemList, 0, len(cols))
+	def.Columns = make(tree.IndexElemList, 0, len(cols))
 	for i := range cols {
 		semType := tree.MustBeStaticallyKnownType(cols[i].Type)
-		if !colinfo.ColumnTypeIsIndexable(semType) {
-			continue
+
+		// The non-terminal index columns must be indexable.
+		if isLastCol := i == len(cols)-1; !isLastCol && !colinfo.ColumnTypeIsIndexable(semType) {
+			return tree.IndexTableDef{}, false
 		}
-		indexElemList = append(indexElemList, tree.IndexElem{
+
+		// The last index column can be inverted-indexable, which makes the
+		// index an inverted index.
+		if colinfo.ColumnTypeIsInvertedIndexable(semType) {
+			def.Inverted = true
+		}
+
+		def.Columns = append(def.Columns, tree.IndexElem{
 			Column:    cols[i].Name,
 			Direction: tree.Direction(rng.Intn(int(tree.Descending) + 1)),
 		})
 	}
-	return tree.IndexTableDef{Columns: indexElemList}
+
+	return def, true
 }
 
 // randPartialIndexPredicateFromCols creates a partial index expression with a

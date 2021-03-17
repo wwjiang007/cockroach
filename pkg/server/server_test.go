@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -407,8 +408,8 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 		t.Errorf("expected %d keys to be deleted, but got %d instead", writes, dr.Keys)
 	}
 
-	now := s.Clock().Now()
-	txnProto := roachpb.MakeTransaction("MyTxn", nil, 0, now, 0)
+	now := s.Clock().NowAsClockTimestamp()
+	txnProto := roachpb.MakeTransaction("MyTxn", nil, 0, now.ToTimestamp(), 0)
 	txn := kv.NewTxnFromProto(ctx, db, s.NodeID(), now, kv.RootTxn, &txnProto)
 
 	scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next(), false)
@@ -624,8 +625,8 @@ func TestSystemConfigGossip(t *testing.T) {
 			return err
 		}
 
-		expected := valAt(2).GetDatabase()
-		db := got.GetDatabase()
+		_, expected, _, _ := descpb.FromDescriptor(valAt(2))
+		_, db, _, _ := descpb.FromDescriptor(&got)
 		if db == nil {
 			panic(errors.Errorf("found nil database: %v", got))
 		}
@@ -697,7 +698,7 @@ func TestClusterIDMismatch(t *testing.T) {
 
 	engines := make([]storage.Engine, 2)
 	for i := range engines {
-		e := storage.NewDefaultInMem()
+		e := storage.NewDefaultInMemForTesting()
 		defer e.Close()
 
 		sIdent := roachpb.StoreIdent{
@@ -765,8 +766,8 @@ func TestEnsureInitialWallTimeMonotonicity(t *testing.T) {
 			m := hlc.NewManualClock(test.clockStartTime)
 			c := hlc.NewClock(m.UnixNano, maxOffset)
 
-			sleepUntilFn := func(until int64, currentTime func() int64) {
-				delta := until - currentTime()
+			sleepUntilFn := func(t hlc.Timestamp) {
+				delta := t.WallTime - c.Now().WallTime
 				if delta > 0 {
 					m.Increment(delta)
 				}
@@ -1129,4 +1130,36 @@ func TestGWRuntimeMarshalProto(t *testing.T) {
 		nil, /* request */
 		errors.New("boom"),
 	)
+}
+
+func TestDecommissionNodeStatus(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual, // saves time
+	})
+	defer tc.Stopper().Stop(ctx)
+	decomNodeID := tc.Server(2).NodeID()
+
+	// Make sure node status entries have been created.
+	for i := 0; i < tc.NumServers(); i++ {
+		srv := tc.Server(i)
+		entry, err := srv.DB().Get(ctx, keys.NodeStatusKey(srv.NodeID()))
+		require.NoError(t, err)
+		require.NotNil(t, entry.Value, "node status entry not found for node %d", srv.NodeID())
+	}
+
+	// Decommission the node.
+	srv := tc.Server(0)
+	require.NoError(t, srv.Decommission(
+		ctx, livenesspb.MembershipStatus_DECOMMISSIONING, []roachpb.NodeID{decomNodeID}))
+	require.NoError(t, srv.Decommission(
+		ctx, livenesspb.MembershipStatus_DECOMMISSIONED, []roachpb.NodeID{decomNodeID}))
+
+	// The node status entry should now have been cleaned up.
+	entry, err := srv.DB().Get(ctx, keys.NodeStatusKey(decomNodeID))
+	require.NoError(t, err)
+	require.Nil(t, entry.Value, "found stale node status entry for node %d", decomNodeID)
 }

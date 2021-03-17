@@ -33,6 +33,10 @@ func (op Operation) Result() *Result {
 		return &o.Result
 	case *MergeOperation:
 		return &o.Result
+	case *ChangeReplicasOperation:
+		return &o.Result
+	case *TransferLeaseOperation:
+		return &o.Result
 	case *BatchOperation:
 		return &o.Result
 	case *ClosureTxnOperation:
@@ -104,6 +108,8 @@ func (op Operation) format(w *strings.Builder, fctx formatCtx) {
 		o.format(w, fctx)
 	case *ChangeReplicasOperation:
 		o.format(w, fctx)
+	case *TransferLeaseOperation:
+		o.format(w, fctx)
 	case *BatchOperation:
 		newFctx := fctx
 		newFctx.indent = fctx.indent + `  `
@@ -159,7 +165,11 @@ func (op Operation) format(w *strings.Builder, fctx formatCtx) {
 }
 
 func (op GetOperation) format(w *strings.Builder, fctx formatCtx) {
-	fmt.Fprintf(w, `%s.Get(ctx, %s)`, fctx.receiver, roachpb.Key(op.Key))
+	methodName := `Get`
+	if op.ForUpdate {
+		methodName = `GetForUpdate`
+	}
+	fmt.Fprintf(w, `%s.%s(ctx, %s)`, fctx.receiver, methodName, roachpb.Key(op.Key))
 	switch op.Result.Type {
 	case ResultType_Error:
 		err := errors.DecodeError(context.TODO(), *op.Result.Err)
@@ -228,6 +238,11 @@ func (op BatchOperation) format(w *strings.Builder, fctx formatCtx) {
 
 func (op ChangeReplicasOperation) format(w *strings.Builder, fctx formatCtx) {
 	fmt.Fprintf(w, `%s.AdminChangeReplicas(ctx, %s, %s)`, fctx.receiver, roachpb.Key(op.Key), op.Changes)
+	op.Result.format(w)
+}
+
+func (op TransferLeaseOperation) format(w *strings.Builder, fctx formatCtx) {
+	fmt.Fprintf(w, `%s.TransferLeaseOperation(ctx, %s, %d)`, fctx.receiver, roachpb.Key(op.Key), op.Target)
 	op.Result.format(w)
 }
 

@@ -16,6 +16,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
@@ -91,6 +92,20 @@ func assertStrategy(
 		log.Fatalf(ctx, "expected strategy %s, found strategy %s", expect, header.Strategy)
 	}
 }
+
+// Separated locks and snapshots send/receive:
+// When running in a mixed version cluster with 21.1 and 20.2, snapshots sent
+// by 21.1 nodes will attempt to read the lock table key space and send any
+// keys in it. But there will be none, so 20.2 nodes receiving such snapshots
+// are fine. A 21.1 node receiving a snapshot will construct SSTs for the lock
+// table key range which will only contain ClearRange for those ranges.
+//
+// When the cluster transitions to clusterversion.SeparatedLocks, the nodes
+// that see that transition can immediately start writing separated
+// intents/locks. Since the 21.1 nodes that have not seen that transition are
+// always ready to handle separated intents, including receiving them in
+// snapshots, the cluster will behave correctly despite nodes seeing this
+// state transition at different times.
 
 // kvBatchSnapshotStrategy is an implementation of snapshotStrategy that streams
 // batches of KV pairs in the BatchRepr format.
@@ -523,7 +538,7 @@ func (s *Store) reserveSnapshot(
 		case s.snapshotApplySem <- struct{}{}:
 		case <-ctx.Done():
 			return nil, "", ctx.Err()
-		case <-s.stopper.ShouldStop():
+		case <-s.stopper.ShouldQuiesce():
 			return nil, "", errors.Errorf("stopped")
 		default:
 			return nil, snapshotApplySemBusyMsg, nil
@@ -533,7 +548,7 @@ func (s *Store) reserveSnapshot(
 		case s.snapshotApplySem <- struct{}{}:
 		case <-ctx.Done():
 			return nil, "", ctx.Err()
-		case <-s.stopper.ShouldStop():
+		case <-s.stopper.ShouldQuiesce():
 			return nil, "", errors.Errorf("stopped")
 		}
 	}
@@ -652,11 +667,11 @@ func (s *Store) checkSnapshotOverlapLocked(
 
 	// TODO(benesch): consider discovering and GC'ing *all* overlapping ranges,
 	// not just the first one that getOverlappingKeyRangeLocked happens to return.
-	if exRange := s.getOverlappingKeyRangeLocked(&desc); exRange != nil {
+	if it := s.getOverlappingKeyRangeLocked(&desc); it.item != nil {
 		// We have a conflicting range, so we must block the snapshot.
 		// When such a conflict exists, it will be resolved by one range
 		// either being split or garbage collected.
-		exReplica, err := s.GetReplica(exRange.Desc().RangeID)
+		exReplica, err := s.GetReplica(it.Desc().RangeID)
 		msg := IntersectingSnapshotMsg
 		if err != nil {
 			log.Warningf(ctx, "unable to look up overlapping replica on %s: %v", exReplica, err)
@@ -665,16 +680,14 @@ func (s *Store) checkSnapshotOverlapLocked(
 				if r.RaftStatus() == nil {
 					return true
 				}
-				// TODO(benesch): this check does detect inactivity on replicas with
-				// epoch-based leases. Since the validity of an epoch-based lease is
-				// tied to the owning node's liveness, the lease can be valid well after
-				// the leader of the range has cut off communication with this replica.
-				// Expiration based leases, by contrast, will expire quickly if the
-				// leader of the range stops sending this replica heartbeats.
-				lease, pendingLease := r.GetLease()
-				now := s.Clock().Now()
-				return !r.IsLeaseValid(ctx, lease, now) &&
-					(pendingLease.Empty() || !r.IsLeaseValid(ctx, pendingLease, now))
+				// TODO(benesch): this check does not detect inactivity on
+				// replicas with epoch-based leases. Since the validity of an
+				// epoch-based lease is tied to the owning node's liveness, the
+				// lease can be valid well after the leader of the range has cut
+				// off communication with this replica. Expiration based leases,
+				// by contrast, will expire quickly if the leader of the range
+				// stops sending this replica heartbeats.
+				return !r.CurrentLeaseStatus(ctx).IsValid()
 			}
 			// We unconditionally send this replica through the GC queue. It's
 			// reasonably likely that the GC queue will do nothing because the replica
@@ -844,7 +857,7 @@ var rebalanceSnapshotRate = settings.RegisterByteSizeSetting(
 	"the rate limit (bytes/sec) to use for rebalance and upreplication snapshots",
 	envutil.EnvOrDefaultBytes("COCKROACH_PREEMPTIVE_SNAPSHOT_RATE", 8<<20),
 	validatePositive,
-).WithPublic()
+).WithPublic().WithSystemOnly()
 
 // recoverySnapshotRate is the rate at which Raft-initiated spanshots can be
 // sent. Ideally, one would never see a Raft-initiated snapshot; we'd like all
@@ -857,7 +870,7 @@ var recoverySnapshotRate = settings.RegisterByteSizeSetting(
 	"the rate limit (bytes/sec) to use for recovery snapshots",
 	envutil.EnvOrDefaultBytes("COCKROACH_RAFT_SNAPSHOT_RATE", 8<<20),
 	validatePositive,
-).WithPublic()
+).WithPublic().WithSystemOnly()
 
 // snapshotSenderBatchSize is the size that key-value batches are allowed to
 // grow to during Range snapshots before being sent to the receiver. This limit
@@ -916,7 +929,8 @@ func SendEmptySnapshot(
 	to roachpb.ReplicaDescriptor,
 ) error {
 	// Create an engine to use as a buffer for the empty snapshot.
-	eng := storage.NewDefaultInMem()
+	eng := storage.NewInMem(
+		context.Background(), roachpb.Attributes{}, 1<<20, nil /* settings */)
 	defer eng.Close()
 
 	var ms enginepb.MVCCStats
@@ -926,6 +940,11 @@ func SendEmptySnapshot(
 	); err != nil {
 		return err
 	}
+
+	var replicaVersion roachpb.Version
+	if st.Version.IsActive(ctx, clusterversion.ReplicaVersions) {
+		replicaVersion = st.Version.ActiveVersionOrEmpty(ctx).Version
+	}
 	ms, err := stateloader.WriteInitialReplicaState(
 		ctx,
 		eng,
@@ -934,6 +953,7 @@ func SendEmptySnapshot(
 		roachpb.Lease{},
 		hlc.Timestamp{}, // gcThreshold
 		stateloader.TruncatedStateUnreplicated,
+		replicaVersion,
 	)
 	if err != nil {
 		return err

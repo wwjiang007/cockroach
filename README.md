@@ -65,7 +65,7 @@ CockroachDB supports the PostgreSQL wire protocol, so you can use any available 
 
 ## Need Help?
 
-- [CockroachDB Community Slack](https://cockroa.ch/slack) - Join our slack to
+- [CockroachDB Community Slack](https://go.crdb.dev/p/slack) - Join our slack to
   connect with our engineers and other users running CockroachDB.
 - [CockroachDB Forum](https://forum.cockroachlabs.com/) and
   [Stack Overflow](https://stackoverflow.com/questions/tagged/cockroachdb) - Ask questions,
@@ -92,7 +92,7 @@ for more details.
 
 Engineering discussion takes place on our public mailing list,
 [cockroach-db@googlegroups.com](https://groups.google.com/forum/#!forum/cockroach-db),
-and feel free to join our [Community Slack](https://cockroa.ch/slack) (there's
+and feel free to join our [Community Slack](https://go.crdb.dev/p/slack) (there's
 a dedicated #contributors channel!) to ask questions, discuss your ideas, or
 connect with other contributors.
 
@@ -103,6 +103,14 @@ For an in-depth discussion of the CockroachDB architecture, see our
 Guide](https://www.cockroachlabs.com/docs/stable/architecture/overview.html).
 For the original design motivation, see our [design
 doc](https://github.com/cockroachdb/cockroach/blob/master/docs/design.md).
+
+## Licensing
+
+Current CockroachDB code is released under a combination of two licenses, the [Business Source License (BSL)](https://www.cockroachlabs.com/docs/stable/licensing.html#bsl) and the [Cockroach Community License (CCL)](https://www.cockroachlabs.com/docs/stable/licensing.html#ccl-free).
+
+When contributing to a CockroachDB feature, you can find the relevant license in the comments at the top of each file.
+
+For more information, see the [Licensing FAQs](https://www.cockroachlabs.com/docs/stable/licensing-faqs.html).
 
 ## Comparison with Other Databases
 

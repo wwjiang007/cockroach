@@ -222,6 +222,9 @@ func newLoopStats(
 	if err != nil {
 		return nil, err
 	}
+	if datums == nil {
+		return nil, errors.New("failed to read scheduler stats")
+	}
 	stats := &loopStats{}
 	stats.readyToRun = int64(tree.MustBeDInt(datums[0]))
 	stats.jobsRunning = int64(tree.MustBeDInt(datums[1]))
@@ -271,7 +274,7 @@ func withSavePoint(ctx context.Context, txn *kv.Txn, fn func() error) error {
 
 func (s *jobScheduler) executeSchedules(
 	ctx context.Context, maxSchedules int64, txn *kv.Txn,
-) error {
+) (retErr error) {
 	stats, err := newLoopStats(ctx, s.env, s.InternalExecutor, txn)
 	if err != nil {
 		return err
@@ -280,7 +283,7 @@ func (s *jobScheduler) executeSchedules(
 	defer stats.updateMetrics(&s.metrics)
 
 	findSchedulesStmt := getFindSchedulesStatement(s.env, maxSchedules)
-	rows, cols, err := s.InternalExecutor.QueryWithCols(
+	it, err := s.InternalExecutor.QueryIteratorEx(
 		ctx, "find-scheduled-jobs",
 		txn,
 		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
@@ -290,8 +293,16 @@ func (s *jobScheduler) executeSchedules(
 		return err
 	}
 
-	for _, row := range rows {
-		schedule, numRunning, err := s.unmarshalScheduledJob(row, cols)
+	// We have to make sure to close the iterator since we might return from the
+	// for loop early (before Next() returns false).
+	defer func() { retErr = errors.CombineErrors(retErr, it.Close()) }()
+
+	// The loop below might encounter an error after some schedules have been
+	// executed (i.e. previous iterations succeeded), and this is ok.
+	var ok bool
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+		row := it.Cur()
+		schedule, numRunning, err := s.unmarshalScheduledJob(row, it.Types())
 		if err != nil {
 			stats.malformed++
 			log.Errorf(ctx, "error parsing schedule: %+v", row)
@@ -340,11 +351,11 @@ func (s *jobScheduler) executeSchedules(
 		}
 	}
 
-	return nil
+	return err
 }
 
 func (s *jobScheduler) runDaemon(ctx context.Context, stopper *stop.Stopper) {
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "job-scheduler", func(ctx context.Context) {
 		initialDelay := getInitialScanDelay(s.TestingKnobs)
 		log.Infof(ctx, "waiting %v before scheduled jobs daemon start", initialDelay)
 

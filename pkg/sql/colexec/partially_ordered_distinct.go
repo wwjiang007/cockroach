@@ -14,8 +14,8 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -27,11 +27,11 @@ import (
 // columns.
 func newPartiallyOrderedDistinct(
 	allocator *colmem.Allocator,
-	input colexecbase.Operator,
+	input colexecop.Operator,
 	distinctCols []uint32,
 	orderedCols []uint32,
 	typs []*types.T,
-) (colexecbase.Operator, error) {
+) (colexecop.Operator, error) {
 	if len(orderedCols) == 0 || len(orderedCols) == len(distinctCols) {
 		return nil, errors.AssertionFailedf(
 			"partially ordered distinct wrongfully planned: numDistinctCols=%d "+
@@ -62,7 +62,7 @@ func newPartiallyOrderedDistinct(
 	distinct := NewUnorderedDistinct(allocator, chunkerOperator, distinctUnorderedCols, typs)
 	return &partiallyOrderedDistinct{
 		input:    chunkerOperator,
-		distinct: distinct.(ResettableOperator),
+		distinct: distinct.(colexecop.ResettableOperator),
 	}, nil
 }
 
@@ -72,10 +72,10 @@ func newPartiallyOrderedDistinct(
 // (where "chunk" is all tuples that are equal on the ordered columns).
 type partiallyOrderedDistinct struct {
 	input    *chunkerOperator
-	distinct ResettableOperator
+	distinct colexecop.ResettableOperator
 }
 
-var _ colexecbase.Operator = &partiallyOrderedDistinct{}
+var _ colexecop.Operator = &partiallyOrderedDistinct{}
 
 func (p *partiallyOrderedDistinct) ChildCount(bool) int {
 	return 1
@@ -102,8 +102,8 @@ func (p *partiallyOrderedDistinct) Next(ctx context.Context) coldata.Batch {
 				// We're done, so return a zero-length batch.
 				return coldata.ZeroBatch
 			}
-			// p.distinct will reset p.input.
-			p.distinct.reset(ctx)
+			// p.distinct will reset p.Input.
+			p.distinct.Reset(ctx)
 		} else {
 			return batch
 		}
@@ -152,7 +152,7 @@ type chunkerOperator struct {
 	windowedBatch coldata.Batch
 }
 
-var _ ResettableOperator = &chunkerOperator{}
+var _ colexecop.ResettableOperator = &chunkerOperator{}
 
 func (c *chunkerOperator) ChildCount(bool) int {
 	return 1
@@ -219,7 +219,7 @@ func (c *chunkerOperator) done() bool {
 	return c.input.done()
 }
 
-func (c *chunkerOperator) reset(_ context.Context) {
+func (c *chunkerOperator) Reset(_ context.Context) {
 	c.currentChunkFinished = false
 	if c.newChunksCol != nil {
 		if c.outputTupleStartIdx == c.numTuplesInChunks {

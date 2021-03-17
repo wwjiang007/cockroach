@@ -14,13 +14,13 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 )
 
 // offsetOp is an operator that implements offset, returning everything
 // after the first n tuples in its input.
 type offsetOp struct {
-	OneInputNode
+	colexecop.OneInputNode
 
 	offset uint64
 
@@ -28,24 +28,24 @@ type offsetOp struct {
 	seen uint64
 }
 
-var _ colexecbase.Operator = &offsetOp{}
+var _ colexecop.Operator = &offsetOp{}
 
 // NewOffsetOp returns a new offset operator with the given offset.
-func NewOffsetOp(input colexecbase.Operator, offset uint64) colexecbase.Operator {
+func NewOffsetOp(input colexecop.Operator, offset uint64) colexecop.Operator {
 	c := &offsetOp{
-		OneInputNode: NewOneInputNode(input),
+		OneInputNode: colexecop.NewOneInputNode(input),
 		offset:       offset,
 	}
 	return c
 }
 
 func (c *offsetOp) Init() {
-	c.input.Init()
+	c.Input.Init()
 }
 
 func (c *offsetOp) Next(ctx context.Context) coldata.Batch {
 	for {
-		bat := c.input.Next(ctx)
+		bat := c.Input.Next(ctx)
 		length := bat.Length()
 		if length == 0 {
 			return bat

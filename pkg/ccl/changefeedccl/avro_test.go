@@ -59,7 +59,7 @@ func parseTableDesc(createTableStmt string) (catalog.TableDescriptor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return mutDesc, mutDesc.ValidateTable(ctx)
+	return mutDesc, catalog.ValidateSelf(mutDesc)
 }
 
 func parseValues(tableDesc catalog.TableDescriptor, values string) ([]rowenc.EncDatumRow, error) {
@@ -84,9 +84,9 @@ func parseValues(tableDesc catalog.TableDescriptor, values string) ([]rowenc.Enc
 	for _, rowTuple := range valuesClause.Rows {
 		var row rowenc.EncDatumRow
 		for colIdx, expr := range rowTuple {
-			col := tableDesc.GetColumnAtIdx(colIdx)
+			col := tableDesc.PublicColumns()[colIdx]
 			typedExpr, err := schemaexpr.SanitizeVarFreeExpr(
-				ctx, expr, col.Type, "avro", &semaCtx, tree.VolatilityStable)
+				ctx, expr, col.GetType(), "avro", &semaCtx, tree.VolatilityStable)
 			if err != nil {
 				return nil, err
 			}
@@ -94,7 +94,7 @@ func parseValues(tableDesc catalog.TableDescriptor, values string) ([]rowenc.Enc
 			if err != nil {
 				return nil, errors.Wrapf(err, "evaluating %s", typedExpr)
 			}
-			row = append(row, rowenc.DatumToEncDatum(col.Type, datum))
+			row = append(row, rowenc.DatumToEncDatum(col.GetType(), datum))
 		}
 		rows = append(rows, row)
 	}
@@ -123,7 +123,7 @@ func parseAvroSchema(j string) (*avroDataRecord, error) {
 		}
 		tableDesc.Columns = append(tableDesc.Columns, *colDesc)
 	}
-	return tableToAvroSchema(tabledesc.NewImmutable(tableDesc), avroSchemaNoSuffix)
+	return tableToAvroSchema(tabledesc.NewBuilder(&tableDesc).BuildImmutableTable(), avroSchemaNoSuffix, "")
 }
 
 func avroFieldMetadataToColDesc(metadata string) (*descpb.ColumnDescriptor, error) {
@@ -244,7 +244,7 @@ func TestAvroSchema(t *testing.T) {
 			tableDesc, err := parseTableDesc(
 				fmt.Sprintf(`CREATE TABLE "%s" %s`, test.name, test.schema))
 			require.NoError(t, err)
-			origSchema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix)
+			origSchema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix, "")
 			require.NoError(t, err)
 			jsonSchema := origSchema.codec.Schema()
 			roundtrippedSchema, err := parseAvroSchema(jsonSchema)
@@ -278,14 +278,14 @@ func TestAvroSchema(t *testing.T) {
 	t.Run("escaping", func(t *testing.T) {
 		tableDesc, err := parseTableDesc(`CREATE TABLE "☃" (🍦 INT PRIMARY KEY)`)
 		require.NoError(t, err)
-		tableSchema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix)
+		tableSchema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix, "")
 		require.NoError(t, err)
 		require.Equal(t,
 			`{"type":"record","name":"_u2603_","fields":[`+
 				`{"type":["null","long"],"name":"_u0001f366_","default":null,`+
 				`"__crdb__":"🍦 INT8 NOT NULL"}]}`,
 			tableSchema.codec.Schema())
-		indexSchema, err := indexToAvroSchema(tableDesc, tableDesc.GetPrimaryIndex())
+		indexSchema, err := indexToAvroSchema(tableDesc, tableDesc.GetPrimaryIndex().IndexDesc(), tableDesc.GetName(), "")
 		require.NoError(t, err)
 		require.Equal(t,
 			`{"type":"record","name":"_u2603_","fields":[`+
@@ -328,7 +328,7 @@ func TestAvroSchema(t *testing.T) {
 			colType := typ.SQLString()
 			tableDesc, err := parseTableDesc(`CREATE TABLE foo (pk INT PRIMARY KEY, a ` + colType + `)`)
 			require.NoError(t, err)
-			field, err := columnDescToAvroSchema(tableDesc.GetColumnAtIdx(1))
+			field, err := columnDescToAvroSchema(tableDesc.PublicColumns()[1].ColumnDesc())
 			require.NoError(t, err)
 			schema, err := json.Marshal(field.SchemaType)
 			require.NoError(t, err)
@@ -450,7 +450,57 @@ func TestAvroSchema(t *testing.T) {
 			rows, err := parseValues(tableDesc, `VALUES (1, `+test.sql+`)`)
 			require.NoError(t, err)
 
-			schema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix)
+			schema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix, "")
+			require.NoError(t, err)
+			textual, err := schema.textualFromRow(rows[0])
+			require.NoError(t, err)
+			// Trim the outermost {}.
+			value := string(textual[1 : len(textual)-1])
+			// Strip out the pk field.
+			value = strings.Replace(value, `"pk":{"long":1}`, ``, -1)
+			// Trim the `,`, which could be on either side because of the avro library
+			// doesn't deterministically order the fields.
+			value = strings.Trim(value, `,`)
+			// Strip out the field name.
+			value = strings.Replace(value, `"a":`, ``, -1)
+			require.Equal(t, test.avro, value)
+		}
+	})
+
+	// These are values stored with less precision than the column definition allows,
+	// which is still roundtrippable
+	t.Run("lossless_truncations", func(t *testing.T) {
+		truncs := []struct {
+			sqlType string
+			sql     string
+			avro    string
+		}{
+
+			{sqlType: `DECIMAL(4,2)`,
+				sql:  `1.2`,
+				avro: `{"bytes.decimal":"x"}`},
+
+			{sqlType: `DECIMAL(12,2)`,
+				sql:  `1e2`,
+				avro: `{"bytes.decimal":"'\u0010"}`},
+
+			{sqlType: `DECIMAL(4,2)`,
+				sql:  `12e-1`,
+				avro: `{"bytes.decimal":"x"}`},
+
+			{sqlType: `DECIMAL(4,2)`,
+				sql:  `12e-2`,
+				avro: `{"bytes.decimal":"\f"}`},
+		}
+
+		for _, test := range truncs {
+			tableDesc, err := parseTableDesc(
+				`CREATE TABLE foo (pk INT PRIMARY KEY, a ` + test.sqlType + `)`)
+			require.NoError(t, err)
+			rows, err := parseValues(tableDesc, `VALUES (1, `+test.sql+`)`)
+			require.NoError(t, err)
+
+			schema, err := tableToAvroSchema(tableDesc, avroSchemaNoSuffix, "")
 			require.NoError(t, err)
 			textual, err := schema.textualFromRow(rows[0])
 			require.NoError(t, err)
@@ -553,12 +603,12 @@ func TestAvroMigration(t *testing.T) {
 			writerDesc, err := parseTableDesc(
 				fmt.Sprintf(`CREATE TABLE "%s" %s`, test.name, test.writerSchema))
 			require.NoError(t, err)
-			writerSchema, err := tableToAvroSchema(writerDesc, avroSchemaNoSuffix)
+			writerSchema, err := tableToAvroSchema(writerDesc, avroSchemaNoSuffix, "")
 			require.NoError(t, err)
 			readerDesc, err := parseTableDesc(
 				fmt.Sprintf(`CREATE TABLE "%s" %s`, test.name, test.readerSchema))
 			require.NoError(t, err)
-			readerSchema, err := tableToAvroSchema(readerDesc, avroSchemaNoSuffix)
+			readerSchema, err := tableToAvroSchema(readerDesc, avroSchemaNoSuffix, "")
 			require.NoError(t, err)
 
 			writerRows, err := parseValues(writerDesc, `VALUES `+test.writerValues)

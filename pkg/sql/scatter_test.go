@@ -33,6 +33,7 @@ func TestScatterRandomizeLeases(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderStressRace(t, "uses too many resources for stressrace")
+	skip.UnderShort(t, "takes 25s")
 
 	const numHosts = 3
 
@@ -136,7 +137,7 @@ func TestScatterResponse(t *testing.T) {
 		}
 		var expectedKey roachpb.Key
 		if i == 0 {
-			expectedKey = keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.ID))
+			expectedKey = keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.GetID()))
 		} else {
 			var err error
 			expectedKey, err = rowenc.TestingMakePrimaryIndexKey(tableDesc, i*10)

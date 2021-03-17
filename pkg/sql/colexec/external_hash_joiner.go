@@ -12,11 +12,12 @@ package colexec
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecjoin"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/marusama/semaphore"
@@ -40,7 +41,7 @@ const (
 	//   sorter emits its first batch, it must be the case that the input to it
 	//   has returned a zero batch, and thus the FD has been closed.
 	sortMergeNonSortMinFDsOpen = 2
-	externalHJMinPartitions    = sortMergeNonSortMinFDsOpen + (ExternalSorterMinPartitions * 2)
+	externalHJMinPartitions    = sortMergeNonSortMinFDsOpen + (colexecop.ExternalSorterMinPartitions * 2)
 )
 
 // externalHashJoiner is an operator that performs Grace hash join algorithm
@@ -84,53 +85,55 @@ const (
 func NewExternalHashJoiner(
 	unlimitedAllocator *colmem.Allocator,
 	flowCtx *execinfra.FlowCtx,
-	args *NewColOperatorArgs,
-	spec HashJoinerSpec,
-	leftInput, rightInput colexecbase.Operator,
+	args *colexecargs.NewColOperatorArgs,
+	spec colexecjoin.HashJoinerSpec,
+	leftInput, rightInput colexecop.Operator,
 	createDiskBackedSorter DiskBackedSorterConstructor,
 	diskAcc *mon.BoundAccount,
-) colexecbase.Operator {
-	inMemMainOpConstructor := func(partitionedInputs []*partitionerToOperator) ResettableOperator {
+) colexecop.Operator {
+	// This memory limit will restrict the size of the batches output by the
+	// in-memory hash joiner in the main strategy as well as by the merge joiner
+	// in the fallback strategy.
+	memoryLimit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
+	if memoryLimit == 1 {
+		// If memory limit is 1, we're likely in a "force disk spill"
+		// scenario, but we don't want to artificially limit batches when we
+		// have already spilled, so we'll use a larger limit.
+		memoryLimit = colexecop.DefaultMemoryLimit
+	}
+	inMemMainOpConstructor := func(partitionedInputs []*partitionerToOperator) colexecop.ResettableOperator {
 		// Note that the hash-based partitioner will make sure that partitions
 		// to join using in-memory hash joiner fit under the limit, so we use
 		// the same unlimited allocator for both buildSideAllocator and
 		// outputUnlimitedAllocator arguments.
-		return NewHashJoiner(
+		return colexecjoin.NewHashJoiner(
 			unlimitedAllocator, unlimitedAllocator, spec, partitionedInputs[0], partitionedInputs[1],
 			// We start with relatively large initial number of buckets since we
 			// expect each partition to be of significant size.
-			uint64(coldata.BatchSize()),
+			uint64(coldata.BatchSize()), memoryLimit,
 		)
 	}
 	diskBackedFallbackOpConstructor := func(
 		partitionedInputs []*partitionerToOperator,
 		maxNumberActivePartitions int,
 		fdSemaphore semaphore.Semaphore,
-	) ResettableOperator {
-		makeOrderingCols := func(eqCols []uint32) []execinfrapb.Ordering_Column {
-			res := make([]execinfrapb.Ordering_Column, len(eqCols))
-			for i, colIdx := range eqCols {
-				res[i].ColIdx = colIdx
-			}
-			return res
-		}
+	) colexecop.ResettableOperator {
 		// We need to allocate 2 FDs for reading the partitions (reused by the merge
 		// joiner) that we need to join using sort + merge join strategy, and all
 		// others are divided between the two inputs.
 		externalSorterMaxNumberPartitions := (maxNumberActivePartitions - sortMergeNonSortMinFDsOpen) / 2
-		leftOrdering := makeOrderingCols(spec.left.eqCols)
+		leftOrdering := makeOrdering(spec.Left.EqCols)
 		leftPartitionSorter := createDiskBackedSorter(
-			partitionedInputs[0], spec.left.sourceTypes, leftOrdering, externalSorterMaxNumberPartitions,
+			partitionedInputs[0], spec.Left.SourceTypes, leftOrdering, externalSorterMaxNumberPartitions,
 		)
-		rightOrdering := makeOrderingCols(spec.right.eqCols)
+		rightOrdering := makeOrdering(spec.Right.EqCols)
 		rightPartitionSorter := createDiskBackedSorter(
-			partitionedInputs[1], spec.right.sourceTypes, rightOrdering, externalSorterMaxNumberPartitions,
+			partitionedInputs[1], spec.Right.SourceTypes, rightOrdering, externalSorterMaxNumberPartitions,
 		)
-		diskBackedSortMerge, err := NewMergeJoinOp(
-			unlimitedAllocator, execinfra.GetWorkMemLimit(flowCtx.Cfg), args.DiskQueueCfg,
-			fdSemaphore, spec.joinType, leftPartitionSorter, rightPartitionSorter,
-			spec.left.sourceTypes, spec.right.sourceTypes, leftOrdering, rightOrdering,
-			diskAcc,
+		diskBackedSortMerge, err := colexecjoin.NewMergeJoinOp(
+			unlimitedAllocator, memoryLimit, args.DiskQueueCfg, fdSemaphore, spec.JoinType,
+			leftPartitionSorter, rightPartitionSorter, spec.Left.SourceTypes,
+			spec.Right.SourceTypes, leftOrdering, rightOrdering, diskAcc,
 		)
 		if err != nil {
 			colexecerror.InternalError(err)
@@ -142,9 +145,9 @@ func NewExternalHashJoiner(
 		flowCtx,
 		args,
 		"external hash joiner", /* name */
-		[]colexecbase.Operator{leftInput, rightInput},
-		[][]*types.T{spec.left.sourceTypes, spec.right.sourceTypes},
-		[][]uint32{spec.left.eqCols, spec.right.eqCols},
+		[]colexecop.Operator{leftInput, rightInput},
+		[][]*types.T{spec.Left.SourceTypes, spec.Right.SourceTypes},
+		[][]uint32{spec.Left.EqCols, spec.Right.EqCols},
 		inMemMainOpConstructor,
 		diskBackedFallbackOpConstructor,
 		diskAcc,

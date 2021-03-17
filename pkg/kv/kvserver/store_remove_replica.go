@@ -127,12 +127,12 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 	log.Infof(ctx, "removing replica r%d/%d", rep.RangeID, replicaID)
 
 	s.mu.Lock()
-	if placeholder := s.getOverlappingKeyRangeLocked(desc); placeholder != rep {
+	if it := s.getOverlappingKeyRangeLocked(desc); it.repl != rep {
 		// This is a fatal error because uninitialized replicas shouldn't make it
 		// this far. This method will need some changes when we introduce GC of
 		// uninitialized replicas.
 		s.mu.Unlock()
-		log.Fatalf(ctx, "replica %+v unexpectedly overlapped by %+v", rep, placeholder)
+		log.Fatalf(ctx, "replica %+v unexpectedly overlapped by %+v", rep, it.item)
 	}
 	// Adjust stats before calling Destroy. This can be called before or after
 	// Destroy, but this configuration helps avoid races in stat verification
@@ -160,14 +160,14 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.unlinkReplicaByRangeIDLocked(rep.RangeID)
-	if placeholder := s.mu.replicasByKey.Delete(rep); placeholder != rep {
+	s.unlinkReplicaByRangeIDLocked(ctx, rep.RangeID)
+	if it := s.mu.replicasByKey.DeleteReplica(ctx, rep); it.repl != rep {
 		// We already checked that our replica was present in replicasByKey
 		// above. Nothing should have been able to change that.
-		log.Fatalf(ctx, "replica %+v unexpectedly overlapped by %+v", rep, placeholder)
+		log.Fatalf(ctx, "replica %+v unexpectedly overlapped by %+v", rep, it.item)
 	}
-	if rep2 := s.getOverlappingKeyRangeLocked(desc); rep2 != nil {
-		log.Fatalf(ctx, "corrupted replicasByKey map: %s and %s overlapped", rep, rep2)
+	if it := s.getOverlappingKeyRangeLocked(desc); it.item != nil {
+		log.Fatalf(ctx, "corrupted replicasByKey map: %s and %s overlapped", rep, it.item)
 	}
 	delete(s.mu.replicaPlaceholders, rep.RangeID)
 	// TODO(peter): Could release s.mu.Lock() here.
@@ -239,7 +239,7 @@ func (s *Store) removeUninitializedReplicaRaftMuLocked(
 	if s.removePlaceholderLocked(ctx, rep.RangeID) {
 		atomic.AddInt32(&s.counts.droppedPlaceholders, 1)
 	}
-	s.unlinkReplicaByRangeIDLocked(rep.RangeID)
+	s.unlinkReplicaByRangeIDLocked(ctx, rep.RangeID)
 }
 
 // unlinkReplicaByRangeIDLocked removes all of the store's references to the
@@ -247,7 +247,7 @@ func (s *Store) removeUninitializedReplicaRaftMuLocked(
 // to be removed from the replicasByKey map.
 //
 // store.mu must be held.
-func (s *Store) unlinkReplicaByRangeIDLocked(rangeID roachpb.RangeID) {
+func (s *Store) unlinkReplicaByRangeIDLocked(ctx context.Context, rangeID roachpb.RangeID) {
 	s.mu.AssertHeld()
 	s.unquiescedReplicas.Lock()
 	delete(s.unquiescedReplicas.m, rangeID)
@@ -255,6 +255,7 @@ func (s *Store) unlinkReplicaByRangeIDLocked(rangeID roachpb.RangeID) {
 	delete(s.mu.uninitReplicas, rangeID)
 	s.replicaQueues.Delete(int64(rangeID))
 	s.mu.replicas.Delete(int64(rangeID))
+	s.unregisterLeaseholderByID(ctx, rangeID)
 }
 
 // removePlaceholder removes a placeholder for the specified range if it
@@ -274,17 +275,13 @@ func (s *Store) removePlaceholderLocked(ctx context.Context, rngID roachpb.Range
 	if !ok {
 		return false
 	}
-	switch exRng := s.mu.replicasByKey.Delete(placeholder).(type) {
-	case *ReplicaPlaceholder:
-		delete(s.mu.replicaPlaceholders, rngID)
-		if exRng2 := s.getOverlappingKeyRangeLocked(&exRng.rangeDesc); exRng2 != nil {
-			log.Fatalf(ctx, "corrupted replicasByKey map: %s and %s overlapped", exRng, exRng2)
-		}
-		return true
-	case nil:
-		log.Fatalf(ctx, "r%d: placeholder not found", rngID)
-	default:
-		log.Fatalf(ctx, "r%d: expected placeholder, got %T", rngID, exRng)
+	if it := s.mu.replicasByKey.DeletePlaceholder(ctx, placeholder); it.ph != placeholder {
+		log.Fatalf(ctx, "r%d: placeholder %v not found, got %+v", rngID, placeholder, it)
+		return true // unreachable
 	}
-	return false // appease the compiler
+	delete(s.mu.replicaPlaceholders, rngID)
+	if it := s.getOverlappingKeyRangeLocked(&placeholder.rangeDesc); it.item != nil {
+		log.Fatalf(ctx, "corrupted replicasByKey map: %s and %s overlapped", it.ph, it.item)
+	}
+	return true
 }

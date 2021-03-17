@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/stringarena"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -119,7 +118,7 @@ func newDistinct(
 		d, post, d.types, flowCtx, processorID, output, memMonitor, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{d.input},
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				d.close()
 				return nil
 			},
@@ -133,7 +132,7 @@ func newDistinct(
 	// So we have to set up the account here.
 	d.arena = stringarena.Make(&d.memAcc)
 
-	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(ctx, flowCtx) {
 		d.input = newInputStatCollector(d.input)
 		d.ExecStatsForTrace = d.execStatsForTrace
 	}
@@ -142,15 +141,15 @@ func newDistinct(
 }
 
 // Start is part of the RowSource interface.
-func (d *distinct) Start(ctx context.Context) context.Context {
+func (d *distinct) Start(ctx context.Context) {
+	ctx = d.StartInternal(ctx, distinctProcName)
 	d.input.Start(ctx)
-	return d.StartInternal(ctx, distinctProcName)
 }
 
 // Start is part of the RowSource interface.
-func (d *sortedDistinct) Start(ctx context.Context) context.Context {
+func (d *sortedDistinct) Start(ctx context.Context) {
+	ctx = d.StartInternal(ctx, sortedDistinctProcName)
 	d.input.Start(ctx)
-	return d.StartInternal(ctx, sortedDistinctProcName)
 }
 
 func (d *distinct) matchLastGroupKey(row rowenc.EncDatumRow) (bool, error) {

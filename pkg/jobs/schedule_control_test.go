@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
@@ -133,7 +132,7 @@ func TestJobsControlForSchedules(t *testing.T) {
 	// (e.g. pause-request -> paused).
 	RegisterConstructor(jobspb.TypeImport, func(job *Job, _ *cluster.Settings) Resumer {
 		return FakeResumer{
-			OnResume: func(_ context.Context, _ chan<- tree.Datums) error {
+			OnResume: func(_ context.Context) error {
 				<-blockResume
 				return nil
 			},
@@ -151,7 +150,7 @@ func TestJobsControlForSchedules(t *testing.T) {
 
 	// Create few jobs not started by any schedule.
 	for i := 0; i < numJobs; i++ {
-		require.NoError(t, registry.NewJob(record).Created(context.Background()))
+		require.NoError(t, registry.NewJob(record, registry.MakeJobID()).Created(context.Background()))
 	}
 
 	var scheduleID int64 = 123
@@ -180,7 +179,8 @@ func TestJobsControlForSchedules(t *testing.T) {
 					Name: CreatedByScheduledJobs,
 					ID:   scheduleID,
 				}
-				newJob := registry.NewJob(record)
+				jobID := registry.MakeJobID()
+				newJob := registry.NewJob(record, jobID)
 				require.NoError(t, newJob.Created(context.Background()))
 
 				if tc.command == "resume" {
@@ -189,7 +189,7 @@ func TestJobsControlForSchedules(t *testing.T) {
 					// We can't just pause the job (since it will stay in pause-requested state forever).
 					// So, just force set job status to paused.
 					th.sqlDB.Exec(t, "UPDATE system.jobs SET status=$1 WHERE id=$2", StatusPaused,
-						*newJob.ID())
+						jobID)
 				}
 			}
 		}
@@ -237,7 +237,7 @@ func TestFilterJobsControlForSchedules(t *testing.T) {
 	// Our resume never completes any jobs, until this test completes.
 	RegisterConstructor(jobspb.TypeImport, func(job *Job, _ *cluster.Settings) Resumer {
 		return FakeResumer{
-			OnResume: func(_ context.Context, _ chan<- tree.Datums) error {
+			OnResume: func(_ context.Context) error {
 				<-blockResume
 				return nil
 			},
@@ -270,9 +270,10 @@ func TestFilterJobsControlForSchedules(t *testing.T) {
 				Name: CreatedByScheduledJobs,
 				ID:   scheduleID,
 			}
-			newJob := registry.NewJob(record)
+			jobID := registry.MakeJobID()
+			newJob := registry.NewJob(record, jobID)
 			require.NoError(t, newJob.Created(context.Background()))
-			th.sqlDB.Exec(t, "UPDATE system.jobs SET status=$1 WHERE id=$2", status, *newJob.ID())
+			th.sqlDB.Exec(t, "UPDATE system.jobs SET status=$1 WHERE id=$2", status, jobID)
 		}
 
 		jobControl := fmt.Sprintf(tc.command+" JOBS FOR SCHEDULE %d", scheduleID)

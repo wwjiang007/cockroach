@@ -328,7 +328,7 @@ func TestHeartbeatHealth(t *testing.T) {
 			}
 
 			select {
-			case <-stopper.ShouldStop():
+			case <-stopper.ShouldQuiesce():
 				return
 			case heartbeat.ready <- err:
 			}
@@ -599,14 +599,14 @@ func TestHeartbeatHealthTransport(t *testing.T) {
 			}}
 	}()
 
-	stopper.RunWorker(ctx, func(context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "wait-quiesce", func(context.Context) {
 		<-stopper.ShouldQuiesce()
 		netutil.FatalIfUnexpected(ln.Close())
-		<-stopper.ShouldStop()
+		<-stopper.ShouldQuiesce()
 		s.Stop()
 	})
 
-	stopper.RunWorker(ctx, func(context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "serve", func(context.Context) {
 		netutil.FatalIfUnexpected(s.Serve(ln))
 	})
 
@@ -1178,7 +1178,6 @@ func grpcRunKeepaliveTestCase(testCtx context.Context, c grpcKeepaliveTestCase) 
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close() }()
 
 	// Create the heartbeat client.
 	log.Infof(ctx, "starting heartbeat client")
@@ -1792,7 +1791,8 @@ func TestRunHeartbeatSetsHeartbeatStateWhenExitingBeforeFirstHeartbeat(t *testin
 	if _, err = c.Connect(ctx); err != nil {
 		require.Regexp(t, "not yet heartbeated", err)
 	}
-	require.NoError(t, c.grpcConn.Close())
+	err = c.grpcConn.Close() // nolint:grpcconnclose
+	require.NoError(t, err)
 }
 
 func BenchmarkGRPCDial(b *testing.B) {

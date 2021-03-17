@@ -11,12 +11,15 @@
 package spanset
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/pebble"
 )
 
 // MVCCIterator wraps an storage.MVCCIterator and ensures that it can
@@ -82,6 +85,12 @@ func (i *MVCCIterator) Valid() (bool, error) {
 func (i *MVCCIterator) SeekGE(key storage.MVCCKey) {
 	i.i.SeekGE(key)
 	i.checkAllowed(roachpb.Span{Key: key.Key}, true)
+}
+
+// SeekIntentGE is part of the storage.MVCCIterator interface.
+func (i *MVCCIterator) SeekIntentGE(key roachpb.Key, txnUUID uuid.UUID) {
+	i.i.SeekIntentGE(key, txnUUID)
+	i.checkAllowed(roachpb.Span{Key: key}, true)
 }
 
 // SeekLT is part of the storage.MVCCIterator interface.
@@ -322,6 +331,11 @@ func (i *EngineIterator) SetUpperBound(key roachpb.Key) {
 	i.i.SetUpperBound(key)
 }
 
+// GetRawIter is part of the storage.EngineIterator interface.
+func (i *EngineIterator) GetRawIter() *pebble.Iterator {
+	return i.i.GetRawIter()
+}
+
 type spanSetReader struct {
 	r     storage.Reader
 	spans *SpanSet
@@ -416,6 +430,10 @@ func (s spanSetReader) NewEngineIterator(opts storage.IterOptions) storage.Engin
 	}
 }
 
+func (s spanSetReader) ConsistentIterators() bool {
+	return s.r.ConsistentIterators()
+}
+
 // GetDBEngine recursively searches for the underlying rocksDB engine.
 func GetDBEngine(reader storage.Reader, span roachpb.Span) storage.Reader {
 	switch v := reader.(type) {
@@ -482,9 +500,9 @@ func (s spanSetWriter) ClearUnversioned(key roachpb.Key) error {
 
 func (s spanSetWriter) ClearIntent(
 	key roachpb.Key, state storage.PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
-) error {
+) (int, error) {
 	if err := s.checkAllowed(key); err != nil {
-		return err
+		return 0, err
 	}
 	return s.w.ClearIntent(key, state, txnDidNotUpdateMeta, txnUUID)
 }
@@ -574,16 +592,17 @@ func (s spanSetWriter) PutUnversioned(key roachpb.Key, value []byte) error {
 }
 
 func (s spanSetWriter) PutIntent(
+	ctx context.Context,
 	key roachpb.Key,
 	value []byte,
 	state storage.PrecedingIntentState,
 	txnDidNotUpdateMeta bool,
 	txnUUID uuid.UUID,
-) error {
+) (int, error) {
 	if err := s.checkAllowed(key); err != nil {
-		return err
+		return 0, err
 	}
-	return s.w.PutIntent(key, value, state, txnDidNotUpdateMeta, txnUUID)
+	return s.w.PutIntent(ctx, key, value, state, txnDidNotUpdateMeta, txnUUID)
 }
 
 func (s spanSetWriter) PutEngineKey(key storage.EngineKey, value []byte) error {
@@ -594,6 +613,10 @@ func (s spanSetWriter) PutEngineKey(key storage.EngineKey, value []byte) error {
 		return err
 	}
 	return s.w.PutEngineKey(key, value)
+}
+
+func (s spanSetWriter) SafeToWriteSeparatedIntents(ctx context.Context) (bool, error) {
+	return s.w.SafeToWriteSeparatedIntents(ctx)
 }
 
 func (s spanSetWriter) LogData(data []byte) error {
@@ -628,12 +651,6 @@ func makeSpanSetReadWriterAt(rw storage.ReadWriter, spans *SpanSet, ts hlc.Times
 	}
 }
 
-// NewReadWriter returns an engine.ReadWriter that asserts access of the
-// underlying ReadWriter against the given SpanSet.
-func NewReadWriter(rw storage.ReadWriter, spans *SpanSet) storage.ReadWriter {
-	return makeSpanSetReadWriter(rw, spans)
-}
-
 // NewReadWriterAt returns an engine.ReadWriter that asserts access of the
 // underlying ReadWriter against the given SpanSet at a given timestamp.
 // If zero timestamp is provided, accesses are considered non-MVCC.
@@ -654,13 +671,6 @@ var _ storage.Batch = spanSetBatch{}
 
 func (s spanSetBatch) Commit(sync bool) error {
 	return s.b.Commit(sync)
-}
-
-func (s spanSetBatch) Distinct() storage.ReadWriter {
-	if s.spansOnly {
-		return NewReadWriter(s.b.Distinct(), s.spans)
-	}
-	return NewReadWriterAt(s.b.Distinct(), s.spans, s.ts)
 }
 
 func (s spanSetBatch) Empty() bool {

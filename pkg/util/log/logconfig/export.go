@@ -121,10 +121,10 @@ func (c *Config) Export(onlyChans ChannelList) (string, string) {
 		target := fileKey
 
 		var syncproc, synclink []string
-		if *fc.SyncWrites {
-			skey := fmt.Sprintf("sync%d", fileNum)
+		if *fc.BufferedWrites {
+			skey := fmt.Sprintf("buffer%d", fileNum)
 			fileNum++
-			syncproc = append(syncproc, fmt.Sprintf("card %s as \"sync\"", skey))
+			syncproc = append(syncproc, fmt.Sprintf("card %s as \"buffer\"", skey))
 			synclink = append(synclink, fmt.Sprintf("%s --> %s", skey, target))
 			fileNum++
 			target = skey
@@ -171,6 +171,33 @@ func (c *Config) Export(onlyChans ChannelList) (string, string) {
 		links = append(links, "stray --> stderr")
 	}
 
+	// Collect the network servers.
+	//
+	// servers maps each server to its box declaration.
+	servers := map[string]string{}
+	for _, fn := range c.Sinks.sortedServerNames {
+		fc := c.Sinks.FluentServers[fn]
+		if fc.Filter == logpb.Severity_NONE {
+			continue
+		}
+		skey := fmt.Sprintf("s__%s", fc.serverName)
+		target, thisprocs, thislinks := process(skey, fc.CommonSinkConfig)
+		hasLink := false
+		for _, ch := range fc.Channels.Channels {
+			if !chanSel.HasChannel(ch) {
+				continue
+			}
+			hasLink = true
+			links = append(links, fmt.Sprintf("%s --> %s", ch, target))
+		}
+		if hasLink {
+			processing = append(processing, thisprocs...)
+			links = append(links, thislinks...)
+			servers[fc.serverName] = fmt.Sprintf("queue %s as \"fluent: %s:%s\"",
+				skey, fc.Net, fc.Address)
+		}
+	}
+
 	// Export the stderr redirects.
 	if c.Sinks.Stderr.Filter != logpb.Severity_NONE {
 		target, thisprocs, thislinks := process("stderr", c.Sinks.Stderr.CommonSinkConfig)
@@ -206,6 +233,15 @@ func (c *Config) Export(onlyChans ChannelList) (string, string) {
 				fmt.Fprintf(&buf, "  %s\n", fdecl)
 			}
 			buf.WriteString(" }\n")
+		}
+		buf.WriteString("}\n")
+	}
+
+	// Represent the network servers, if any.
+	if len(c.Sinks.sortedServerNames) > 0 {
+		buf.WriteString("cloud network {\n")
+		for _, s := range c.Sinks.sortedServerNames {
+			fmt.Fprintf(&buf, " %s\n", servers[s])
 		}
 		buf.WriteString("}\n")
 	}

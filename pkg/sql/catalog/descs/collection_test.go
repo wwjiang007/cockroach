@@ -12,18 +12,22 @@ package descs_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -62,13 +66,38 @@ func TestCollectionWriteDescToBatch(t *testing.T) {
 		require.NotNil(t, mut)
 		// We want to create some descriptors and then ensure that writing them to a
 		// batch works as expected.
-		newTable := tabledesc.NewCreatedMutable(descpb.TableDescriptor{
-			ID:                      42,
+		newTable := tabledesc.NewBuilder(&descpb.TableDescriptor{
+			ID:                      142,
 			Name:                    "table2",
 			Version:                 1,
 			ParentID:                mut.GetParentID(),
 			UnexposedParentSchemaID: mut.GetParentSchemaID(),
-		})
+			Columns: []descpb.ColumnDescriptor{
+				{ID: 1, Name: "a", Type: types.Int},
+			},
+			Families: []descpb.ColumnFamilyDescriptor{
+				{
+					ID:              0,
+					Name:            "primary",
+					ColumnNames:     []string{"a"},
+					ColumnIDs:       []descpb.ColumnID{1},
+					DefaultColumnID: 1,
+				},
+			},
+			PrimaryIndex: descpb.IndexDescriptor{
+				ID:               1,
+				Name:             "pk",
+				ColumnIDs:        []descpb.ColumnID{1},
+				ColumnNames:      []string{"a"},
+				ColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+			},
+			Privileges:     descpb.NewDefaultPrivilegeDescriptor(security.AdminRoleName()),
+			NextColumnID:   2,
+			NextFamilyID:   1,
+			NextIndexID:    2,
+			NextMutationID: 1,
+			FormatVersion:  descpb.FamilyFormatVersion,
+		}).BuildCreatedMutableTable()
 		b := txn.NewBatch()
 
 		// Ensure that there are no errors and that the version is incremented.
@@ -200,7 +229,7 @@ func TestAddUncommittedDescriptorAndMutableResolution(t *testing.T) {
 
 			mut := db
 			mut.MaybeIncrementVersion()
-			mut.Schemas["foo"] = descpb.DatabaseDescriptor_SchemaInfo{ID: 2}
+			mut.Schemas["foo"] = descpb.DatabaseDescriptor_SchemaInfo{ID: 2, Dropped: true}
 
 			flags.RequireMutable = false
 
@@ -208,7 +237,7 @@ func TestAddUncommittedDescriptorAndMutableResolution(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, mut.OriginalVersion(), immByName.GetVersion())
 
-			immByID, err := descriptors.GetDatabaseVersionByID(ctx, txn, db.GetID(), flags)
+			_, immByID, err := descriptors.GetImmutableDatabaseByID(ctx, txn, db.GetID(), flags)
 			require.NoError(t, err)
 			require.Same(t, immByName, immByID)
 
@@ -236,7 +265,7 @@ func TestAddUncommittedDescriptorAndMutableResolution(t *testing.T) {
 			require.Equal(t, db.GetVersion(), immByNameAfter.GetVersion())
 			require.Equal(t, mut.ImmutableCopy(), immByNameAfter)
 
-			immByIDAfter, err := descriptors.GetDatabaseVersionByID(ctx, txn, db.GetID(), flags)
+			_, immByIDAfter, err := descriptors.GetImmutableDatabaseByID(ctx, txn, db.GetID(), flags)
 			require.NoError(t, err)
 			require.Same(t, immByNameAfter, immByIDAfter)
 
@@ -316,4 +345,64 @@ func TestAddUncommittedDescriptorAndMutableResolution(t *testing.T) {
 			return nil
 		}))
 	})
+}
+
+// TestSyntheticDescriptorResolution tests descriptor resolution when synthetic
+// descriptors are injected into the collection.
+func TestSyntheticDescriptorResolution(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+
+	s0 := tc.Server(0)
+
+	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb.Exec(t, `CREATE DATABASE db`)
+	tdb.Exec(t, `USE db`)
+	tdb.Exec(t, `CREATE TABLE tbl(foo INT)`)
+	row := tdb.QueryRow(t, `SELECT 'tbl'::regclass::int`)
+	var tableID descpb.ID
+	row.Scan(&tableID)
+
+	lm := s0.LeaseManager().(*lease.Manager)
+	ie := s0.InternalExecutor().(sqlutil.InternalExecutor)
+	require.NoError(t, descs.Txn(ctx, s0.ClusterSettings(), lm, ie, s0.DB(), func(
+		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+	) error {
+		// Resolve the descriptor so we can mutate it.
+		tn := tree.MakeTableNameWithSchema("db", tree.PublicSchemaName, "tbl")
+		found, desc, err := descriptors.GetImmutableTableByName(ctx, txn, &tn, tree.ObjectLookupFlags{})
+		require.True(t, found)
+		require.NoError(t, err)
+
+		// Modify the column name.
+		desc.TableDesc().Columns[0].Name = "bar"
+		descriptors.SetSyntheticDescriptors([]catalog.Descriptor{desc})
+
+		// Resolve the table by name again.
+		found, desc, err = descriptors.GetImmutableTableByName(ctx, txn, &tn, tree.ObjectLookupFlags{})
+		require.True(t, found)
+		require.NoError(t, err)
+		require.Equal(t, "bar", desc.PublicColumns()[0].GetName())
+
+		// Attempting to resolve the table mutably is not allowed.
+		_, _, err = descriptors.GetMutableTableByName(ctx, txn, &tn, tree.ObjectLookupFlags{})
+		require.EqualError(t, err, fmt.Sprintf("attempted mutable access of synthetic descriptor %d", tableID))
+
+		// Resolution by ID.
+
+		desc, err = descriptors.GetImmutableTableByID(ctx, txn, tableID, tree.ObjectLookupFlags{})
+		require.NoError(t, err)
+		require.Equal(t, "bar", desc.PublicColumns()[0].GetName())
+
+		// Attempting to resolve the table mutably is not allowed.
+		_, err = descriptors.GetMutableTableByID(ctx, txn, tableID, tree.ObjectLookupFlags{})
+		require.EqualError(t, err, fmt.Sprintf("attempted mutable access of synthetic descriptor %d", tableID))
+
+		return nil
+	}),
+	)
 }

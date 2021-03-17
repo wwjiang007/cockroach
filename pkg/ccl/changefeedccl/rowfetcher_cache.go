@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -69,8 +68,8 @@ func newRowFetcherCache(
 
 func (c *rowFetcherCache) TableDescForKey(
 	ctx context.Context, key roachpb.Key, ts hlc.Timestamp,
-) (*tabledesc.Immutable, error) {
-	var tableDesc *tabledesc.Immutable
+) (catalog.TableDescriptor, error) {
+	var tableDesc catalog.TableDescriptor
 	key, err := c.codec.StripTenantPrefix(key)
 	if err != nil {
 		return nil, err
@@ -94,7 +93,7 @@ func (c *rowFetcherCache) TableDescForKey(
 		if err := c.leaseMgr.Release(desc); err != nil {
 			return nil, err
 		}
-		tableDesc = desc.(*tabledesc.Immutable)
+		tableDesc = desc.(catalog.TableDescriptor)
 		if tableDesc.ContainsUserDefinedTypes() {
 			// If the table contains user defined types, then use the descs.Collection
 			// to retrieve a TableDescriptor with type metadata hydrated. We open a
@@ -108,7 +107,7 @@ func (c *rowFetcherCache) TableDescForKey(
 			if err := c.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 				txn.SetFixedTimestamp(ctx, ts)
 				var err error
-				tableDesc, err = c.collection.GetTableVersionByID(ctx, txn, tableID, tree.ObjectLookupFlagsWithRequired())
+				tableDesc, err = c.collection.GetImmutableTableByID(ctx, txn, tableID, tree.ObjectLookupFlags{})
 				return err
 			}); err != nil {
 				// Manager can return all kinds of errors during chaos, but based on
@@ -121,7 +120,7 @@ func (c *rowFetcherCache) TableDescForKey(
 		}
 
 		// Skip over the column data.
-		for ; skippedCols < len(tableDesc.GetPrimaryIndex().ColumnIDs); skippedCols++ {
+		for ; skippedCols < tableDesc.GetPrimaryIndex().NumColumns(); skippedCols++ {
 			l, err := encoding.PeekLength(remaining)
 			if err != nil {
 				return nil, err
@@ -140,27 +139,39 @@ func (c *rowFetcherCache) TableDescForKey(
 }
 
 func (c *rowFetcherCache) RowFetcherForTableDesc(
-	tableDesc *tabledesc.Immutable,
+	tableDesc catalog.TableDescriptor,
 ) (*row.Fetcher, error) {
-	idVer := idVersion{id: tableDesc.ID, version: tableDesc.Version}
+	idVer := idVersion{id: tableDesc.GetID(), version: tableDesc.GetVersion()}
 	// Ensure that all user defined types are up to date with the cached
 	// version and the desired version to use the cache. It is safe to use
 	// UserDefinedTypeColsHaveSameVersion if we have a hit because we are
 	// guaranteed that the tables have the same version. Additionally, these
 	// fetchers are always initialized with a single tabledesc.Immutable.
 	if rf, ok := c.fetchers[idVer]; ok &&
-		tableDesc.UserDefinedTypeColsHaveSameVersion(rf.GetTables()[0].(*tabledesc.Immutable)) {
+		catalog.UserDefinedTypeColsHaveSameVersion(tableDesc, rf.GetTables()[0].(catalog.TableDescriptor)) {
 		return rf, nil
 	}
 	// TODO(dan): Allow for decoding a subset of the columns.
 	var colIdxMap catalog.TableColMap
 	var valNeededForCol util.FastIntSet
-	for colIdx := range tableDesc.Columns {
-		colIdxMap.Set(tableDesc.Columns[colIdx].ID, colIdx)
-		valNeededForCol.Add(colIdx)
+	for _, col := range tableDesc.PublicColumns() {
+		colIdxMap.Set(col.GetID(), col.Ordinal())
+		valNeededForCol.Add(col.Ordinal())
 	}
 
 	var rf row.Fetcher
+	rfArgs := row.FetcherTableArgs{
+		Spans:            tableDesc.AllIndexSpans(c.codec),
+		Desc:             tableDesc,
+		Index:            tableDesc.GetPrimaryIndex().IndexDesc(),
+		ColIdxMap:        colIdxMap,
+		IsSecondaryIndex: false,
+		Cols:             make([]descpb.ColumnDescriptor, len(tableDesc.PublicColumns())),
+		ValNeededForCol:  valNeededForCol,
+	}
+	for i, col := range tableDesc.PublicColumns() {
+		rfArgs.Cols[i] = *col.ColumnDesc()
+	}
 	if err := rf.Init(
 		context.TODO(),
 		c.codec,
@@ -170,15 +181,7 @@ func (c *rowFetcherCache) RowFetcherForTableDesc(
 		false, /* isCheck */
 		&c.a,
 		nil, /* memMonitor */
-		row.FetcherTableArgs{
-			Spans:            tableDesc.AllIndexSpans(c.codec),
-			Desc:             tableDesc,
-			Index:            tableDesc.GetPrimaryIndex(),
-			ColIdxMap:        colIdxMap,
-			IsSecondaryIndex: false,
-			Cols:             tableDesc.Columns,
-			ValNeededForCol:  valNeededForCol,
-		},
+		rfArgs,
 	); err != nil {
 		return nil, err
 	}

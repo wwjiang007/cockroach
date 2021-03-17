@@ -14,9 +14,15 @@ go_library(
 
 go_test(
     name = "nocopy_test",
+    size = "small",
     srcs = ["nocopy_test.go"],
+    data = glob(["testdata/**"]) + [
+        "@go_sdk//:files",
+    ],
     deps = [
-        "//pkg/testutils/lint/passes/nocopy",
+        ":nocopy",
+        "//pkg/build/bazel",
+        "//pkg/testutils",
         "//pkg/testutils/skip",
         "@org_golang_x_tools//go/analysis/analysistest",
     ],

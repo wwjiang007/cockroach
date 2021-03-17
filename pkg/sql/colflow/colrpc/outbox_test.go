@@ -17,8 +17,8 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -33,11 +33,11 @@ func TestOutboxCatchesPanics(t *testing.T) {
 	ctx := context.Background()
 
 	var (
-		input    = colexecbase.NewBatchBuffer()
+		input    = colexecop.NewBatchBuffer()
 		typs     = []*types.T{types.Int}
 		rpcLayer = makeMockFlowStreamRPCLayer()
 	)
-	outbox, err := NewOutbox(testAllocator, input, typs, nil /* metadataSources */, nil /* toClose */)
+	outbox, err := NewOutbox(testAllocator, input, typs, nil /* metadataSources */, nil /* toClose */, nil /* getStats */)
 	require.NoError(t, err)
 
 	// This test relies on the fact that BatchBuffer panics when there are no
@@ -83,7 +83,7 @@ func TestOutboxDrainsMetadataSources(t *testing.T) {
 	ctx := context.Background()
 
 	var (
-		input = colexecbase.NewBatchBuffer()
+		input = colexecop.NewBatchBuffer()
 		typs  = []*types.T{types.Int}
 	)
 
@@ -98,7 +98,7 @@ func TestOutboxDrainsMetadataSources(t *testing.T) {
 					return nil
 				},
 			},
-		}, nil /* toClose */)
+		}, nil /* toClose */, nil /* getStats */)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -115,7 +115,6 @@ func TestOutboxDrainsMetadataSources(t *testing.T) {
 		require.NoError(t, err)
 
 		b := testAllocator.NewMemBatchWithMaxCapacity(typs)
-		b.SetLength(0)
 		input.Add(b, typs)
 
 		// Close the csChan to unblock the Recv goroutine (we don't need it for this

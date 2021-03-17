@@ -20,10 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	otlog "github.com/opentracing/opentracing-go/log"
 	"golang.org/x/net/trace"
 )
 
@@ -94,7 +92,7 @@ func FinishEventLog(ctx context.Context) {
 // false.
 func getSpanOrEventLog(ctx context.Context) (*tracing.Span, *ctxEventLog, bool) {
 	if sp := tracing.SpanFromContext(ctx); sp != nil {
-		if sp.IsBlackHole() {
+		if !sp.IsVerbose() && !sp.Tracer().HasExternalSink() {
 			return nil, nil, false
 		}
 		return sp, nil, true
@@ -147,9 +145,7 @@ func eventInternal(sp *tracing.Span, el *ctxEventLog, isErr bool, entry logpb.En
 	}
 
 	if sp != nil {
-		// TODO(radu): pass tags directly to sp.LogKV when LightStep supports
-		// that.
-		sp.LogFields(otlog.String(tracingpb.LogMessageField, msg))
+		sp.Record(msg)
 		// if isErr {
 		// 	// TODO(radu): figure out a way to signal that this is an error. We
 		// 	// could use a different "error" key (provided it shows up in

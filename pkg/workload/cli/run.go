@@ -57,6 +57,8 @@ var sharedFlags = pflag.NewFlagSet(`shared`, pflag.ContinueOnError)
 var pprofport = sharedFlags.Int("pprofport", 33333, "Port for pprof endpoint.")
 var dataLoader = sharedFlags.String("data-loader", `INSERT`,
 	"How to load initial table data. Options are INSERT and IMPORT")
+var initConns = sharedFlags.Int("init-conns", 16,
+	"The number of connections to use during INSERT init")
 
 var displayEvery = runFlags.Duration("display-every", time.Second, "How much time between every one-line activity reports.")
 
@@ -70,6 +72,9 @@ var histogramsMaxLatency = runFlags.Duration(
 	"Expected maximum latency of running a query")
 
 func init() {
+
+	_ = sharedFlags.MarkHidden("pprofport")
+
 	AddSubCmd(func(userFacing bool) *cobra.Command {
 		var initCmd = SetCmdDefaults(&cobra.Command{
 			Use:   `init`,
@@ -277,10 +282,7 @@ func runInitImpl(
 	switch strings.ToLower(*dataLoader) {
 	case `insert`, `inserts`:
 		l = workloadsql.InsertsDataLoader{
-			// TODO(dan): Don't hardcode this. Similar to dbOverride, this should be
-			// hooked up to a flag directly once once more of run.go moves inside
-			// workload.
-			Concurrency: 16,
+			Concurrency: *initConns,
 		}
 	case `import`, `imports`:
 		l = workload.ImportDataLoader

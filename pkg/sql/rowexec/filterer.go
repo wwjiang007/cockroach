@@ -16,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -63,7 +62,7 @@ func newFiltererProcessor(
 	}
 
 	ctx := flowCtx.EvalCtx.Ctx()
-	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(ctx, flowCtx) {
 		f.input = newInputStatCollector(f.input)
 		f.ExecStatsForTrace = f.execStatsForTrace
 	}
@@ -71,9 +70,9 @@ func newFiltererProcessor(
 }
 
 // Start is part of the RowSource interface.
-func (f *filtererProcessor) Start(ctx context.Context) context.Context {
+func (f *filtererProcessor) Start(ctx context.Context) {
+	ctx = f.StartInternal(ctx, filtererProcName)
 	f.input.Start(ctx)
-	return f.StartInternal(ctx, filtererProcName)
 }
 
 // Next is part of the RowSource interface.
@@ -105,12 +104,6 @@ func (f *filtererProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMet
 		}
 	}
 	return nil, f.DrainHelper()
-}
-
-// ConsumerClosed is part of the RowSource interface.
-func (f *filtererProcessor) ConsumerClosed() {
-	// The consumer is done, Next() will not be called again.
-	f.InternalClose()
 }
 
 // execStatsForTrace implements ProcessorBase.ExecStatsForTrace.

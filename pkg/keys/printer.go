@@ -70,8 +70,8 @@ var (
 
 	// KeyDict drives the pretty-printing and pretty-scanning of the key space.
 	KeyDict = KeyComprehensionTable{
-		{Name: "/Local", start: localPrefix, end: LocalMax, Entries: []DictEntry{
-			{Name: "/Store", prefix: roachpb.Key(localStorePrefix),
+		{Name: "/Local", start: LocalPrefix, end: LocalMax, Entries: []DictEntry{
+			{Name: "/Store", prefix: roachpb.Key(LocalStorePrefix),
 				ppFunc: localStoreKeyPrint, PSFunc: localStoreKeyParse},
 			{Name: "/RangeID", prefix: roachpb.Key(LocalRangeIDPrefix),
 				ppFunc: localRangeIDKeyPrint, PSFunc: localRangeIDKeyParse},
@@ -169,8 +169,10 @@ var (
 		{name: "RaftTruncatedState", suffix: LocalRaftTruncatedStateLegacySuffix},
 		{name: "RangeLastReplicaGCTimestamp", suffix: LocalRangeLastReplicaGCTimestampSuffix},
 		{name: "RangeLease", suffix: LocalRangeLeaseSuffix},
+		{name: "RangePriorReadSummary", suffix: LocalRangePriorReadSummarySuffix},
 		{name: "RangeStats", suffix: LocalRangeStatsLegacySuffix},
 		{name: "RangeLastGC", suffix: LocalRangeLastGCSuffix},
+		{name: "RangeVersion", suffix: LocalRangeVersionSuffix},
 	}
 
 	rangeSuffixDict = []struct {
@@ -217,11 +219,11 @@ func localStoreKeyPrint(_ []encoding.Direction, key roachpb.Key) string {
 		if bytes.HasPrefix(key, v.key) {
 			if v.key.Equal(localStoreNodeTombstoneSuffix) {
 				return v.name + "/" + nodeTombstoneKeyPrint(
-					append(roachpb.Key(nil), append(localStorePrefix, key...)...),
+					append(roachpb.Key(nil), append(LocalStorePrefix, key...)...),
 				)
 			} else if v.key.Equal(localStoreCachedSettingsSuffix) {
 				return v.name + "/" + cachedSettingsKeyPrint(
-					append(roachpb.Key(nil), append(localStorePrefix, key...)...),
+					append(roachpb.Key(nil), append(LocalStorePrefix, key...)...),
 				)
 			}
 			return v.name

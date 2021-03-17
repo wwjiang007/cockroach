@@ -12,6 +12,7 @@ package tree
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
@@ -679,6 +680,7 @@ func (d *DInt) Compare(ctx *EvalContext, other Datum) int {
 		// NULL is less than any non-NULL value.
 		return 1
 	}
+	thisInt := *d
 	var v DInt
 	switch t := UnwrapDatum(ctx, other).(type) {
 	case *DInt:
@@ -686,14 +688,18 @@ func (d *DInt) Compare(ctx *EvalContext, other Datum) int {
 	case *DFloat, *DDecimal:
 		return -t.Compare(ctx, d)
 	case *DOid:
+		// OIDs are always unsigned 32-bit integers. Some languages, like Java,
+		// compare OIDs to signed 32-bit integers, so we implement the comparison
+		// by converting to a uint32 first. This matches Postgres behavior.
+		thisInt = DInt(uint32(thisInt))
 		v = t.DInt
 	default:
 		panic(makeUnsupportedComparisonMessage(d, other))
 	}
-	if *d < v {
+	if thisInt < v {
 		return -1
 	}
-	if *d > v {
+	if thisInt > v {
 		return 1
 	}
 	return 0
@@ -1438,12 +1444,14 @@ func (d *DBytes) Format(ctx *FmtCtx) {
 		ctx.WriteString(`"\\x`)
 		writeAsHexString(ctx, d)
 		ctx.WriteString(`"`)
+	} else if f.HasFlags(fmtFormatByteLiterals) {
+		ctx.WriteByte('x')
+		ctx.WriteByte('\'')
+		_, _ = hex.NewEncoder(ctx).Write([]byte(*d))
+		ctx.WriteByte('\'')
 	} else {
 		withQuotes := !f.HasFlags(FmtFlags(lexbase.EncBareStrings))
 		if withQuotes {
-			if f.HasFlags(fmtFormatByteLiterals) {
-				ctx.WriteByte('b')
-			}
 			ctx.WriteByte('\'')
 		}
 		ctx.WriteString("\\x")
@@ -3125,6 +3133,7 @@ func MustBeDJSON(e Expr) DJSON {
 
 // AsJSON converts a datum into our standard json representation.
 func AsJSON(d Datum, loc *time.Location) (json.JSON, error) {
+	d = UnwrapDatum(nil /* evalCtx */, d)
 	switch t := d.(type) {
 	case *DBool:
 		return json.FromBool(bool(*t)), nil
@@ -3491,6 +3500,7 @@ func (d *DTuple) Format(ctx *FmtCtx) {
 	}
 
 	typ := d.ResolvedType()
+	tupleContents := typ.TupleContents()
 	showLabels := len(typ.TupleLabels()) > 0
 	if showLabels {
 		ctx.WriteByte('(')
@@ -3501,14 +3511,20 @@ func (d *DTuple) Format(ctx *FmtCtx) {
 	for i, v := range d.D {
 		ctx.WriteString(comma)
 		ctx.FormatNode(v)
-		if parsable && (v == DNull) && len(typ.TupleContents()) > i {
+		if parsable && (v == DNull) && len(tupleContents) > i {
 			// If Tuple has types.Unknown for this slot, then we can't determine
 			// the column type to write this annotation. Somebody else will provide
 			// an error message in this case, if necessary, so just skip the
 			// annotation and continue.
-			if typ.TupleContents()[i].Family() != types.UnknownFamily {
-				ctx.WriteString("::")
-				ctx.WriteString(typ.TupleContents()[i].SQLString())
+			if tupleContents[i].Family() != types.UnknownFamily {
+				nullType := tupleContents[i]
+				if ctx.HasFlags(fmtDisambiguateDatumTypes) {
+					ctx.WriteString(":::")
+					ctx.FormatTypeReference(nullType)
+				} else {
+					ctx.WriteString("::")
+					ctx.WriteString(nullType.SQLString())
+				}
 			}
 		}
 		comma = ", "
@@ -4007,7 +4023,7 @@ func MakeDEnumFromLogicalRepresentation(typ *types.T, rep string) (*DEnum, error
 	// representation. This is to ensure that it will not be written until all
 	// nodes in the cluster are able to decode the physical representation.
 	if typ.TypeMeta.EnumData.IsMemberReadOnly[idx] {
-		return nil, errors.Newf("enum label %q is not yet public", rep)
+		return nil, errors.Newf("enum value %q is not yet public", rep)
 	}
 	return &DEnum{
 		EnumTyp:     typ,
@@ -4192,7 +4208,10 @@ func (d *DEnum) MinWriteable() (Datum, bool) {
 }
 
 // DOid is the Postgres OID datum. It can represent either an OID type or any
-// of the reg* types, such as regproc or regclass.
+// of the reg* types, such as regproc or regclass. An OID must only be
+// 32 bits, since this width encoding is enforced in the pgwire protocol.
+// OIDs are not guaranteed to be globally unique.
+// TODO(rafi): make this use a uint32 instead of a DInt.
 type DOid struct {
 	// A DOid embeds a DInt, the underlying integer OID for this OID datum.
 	DInt
@@ -4256,7 +4275,16 @@ func ParseDOid(ctx *EvalContext, s string, t *types.T) (*DOid, error) {
 		if err != nil {
 			return nil, err
 		}
-		return queryOid(ctx, t, NewDString(funcDef.Name))
+		if len(funcDef.Definition) > 1 {
+			return nil, pgerror.Newf(pgcode.AmbiguousAlias,
+				"more than one function named '%s'", funcDef.Name)
+		}
+		def := funcDef.Definition[0]
+		overload, ok := def.(*Overload)
+		if !ok {
+			return nil, errors.AssertionFailedf("invalid non-overload regproc %s", funcDef.Name)
+		}
+		return &DOid{semanticType: t, DInt: DInt(overload.Oid), name: funcDef.Name}, nil
 	case oid.T_regtype:
 		parsedTyp, err := ctx.Planner.GetTypeFromValidSQLSyntax(s)
 		if err == nil {
@@ -4493,7 +4521,10 @@ func (d *DOid) Compare(ctx *EvalContext, other Datum) int {
 	case *DOid:
 		v = t.DInt
 	case *DInt:
-		v = *t
+		// OIDs are always unsigned 32-bit integers. Some languages, like Java,
+		// compare OIDs to signed 32-bit integers, so we implement the comparison
+		// by converting to a uint32 first. This matches Postgres behavior.
+		v = DInt(uint32(*t))
 	default:
 		panic(makeUnsupportedComparisonMessage(d, other))
 	}

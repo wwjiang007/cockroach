@@ -27,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slstorage"
@@ -55,17 +54,18 @@ func TestRoundtripJob(t *testing.T) {
 	registry := s.JobRegistry().(*jobs.Registry)
 	defer s.Stopper().Stop(ctx)
 
+	jobID := registry.MakeJobID()
 	storedJob := registry.NewJob(jobs.Record{
 		Description:   "beep boop",
 		Username:      security.MakeSQLUsernameFromPreNormalizedString("robot"),
 		DescriptorIDs: descpb.IDs{42},
 		Details:       jobspb.RestoreDetails{},
 		Progress:      jobspb.RestoreProgress{},
-	})
+	}, jobID)
 	if err := storedJob.Created(ctx); err != nil {
 		t.Fatal(err)
 	}
-	retrievedJob, err := registry.LoadJob(ctx, *storedJob.ID())
+	retrievedJob, err := registry.LoadJob(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,10 +137,10 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 	}
 
 	// jobMap maps node IDs to job IDs.
-	jobMap := make(map[roachpb.NodeID]int64)
+	jobMap := make(map[roachpb.NodeID]jobspb.JobID)
 	hookCallCount := 0
 	// resumeCounts maps jobs IDs to number of start/resumes.
-	resumeCounts := make(map[int64]int)
+	resumeCounts := make(map[jobspb.JobID]int)
 	// done prevents jobs from finishing.
 	done := make(chan struct{})
 	// resumeCalled does a locked, blocking send when a job is started/resumed. A
@@ -152,7 +152,7 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 		hookCallCount++
 		lock.Unlock()
 		return jobs.FakeResumer{
-			OnResume: func(ctx context.Context, _ chan<- tree.Datums) error {
+			OnResume: func(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -160,7 +160,7 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 				case <-done:
 				}
 				lock.Lock()
-				resumeCounts[*job.ID()]++
+				resumeCounts[job.ID()]++
 				lock.Unlock()
 				select {
 				case <-ctx.Done():
@@ -178,14 +178,14 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 			Details:  jobspb.BackupDetails{},
 			Progress: jobspb.BackupProgress{},
 		}
-		job, _, err := newRegistry(nodeid).CreateAndStartJob(ctx, nil, rec)
+		job, err := jobs.TestingCreateAndStartJob(ctx, newRegistry(nodeid), db, rec)
 		if err != nil {
 			t.Fatal(err)
 		}
 		// Wait until the job is running.
 		<-resumeCalled
 		lock.Lock()
-		jobMap[nodeid] = *job.ID()
+		jobMap[nodeid] = job.ID()
 		lock.Unlock()
 	}
 
@@ -264,15 +264,15 @@ func TestRegistryResumeActiveLease(t *testing.T) {
 
 	defer jobs.TestingSetAdoptAndCancelIntervals(10*time.Millisecond, 10*time.Millisecond)()
 
-	resumeCh := make(chan int64)
+	resumeCh := make(chan jobspb.JobID)
 	defer jobs.ResetConstructors()()
 	jobs.RegisterConstructor(jobspb.TypeBackup, func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 		return jobs.FakeResumer{
-			OnResume: func(ctx context.Context, _ chan<- tree.Datums) error {
+			OnResume: func(ctx context.Context) error {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
-				case resumeCh <- *job.ID():
+				case resumeCh <- job.ID():
 					return nil
 				}
 			},
@@ -298,7 +298,7 @@ func TestRegistryResumeActiveLease(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var id int64
+	var id jobspb.JobID
 	sqlutils.MakeSQLRunner(sqlDB).QueryRow(t,
 		`INSERT INTO system.jobs (status, payload, progress) VALUES ($1, $2, $3) RETURNING id`,
 		jobs.StatusRunning, payload, progress).Scan(&id)
@@ -350,18 +350,18 @@ func TestExpiringSessionsAndClaimJobsDoesNotTouchTerminalJobs(t *testing.T) {
 RETURNING id;
 `
 	terminalStatuses := []jobs.Status{jobs.StatusSucceeded, jobs.StatusCanceled, jobs.StatusFailed}
-	terminalIDs := make([]int64, len(terminalStatuses))
+	terminalIDs := make([]jobspb.JobID, len(terminalStatuses))
 	terminalClaims := make([][]byte, len(terminalStatuses))
 	for i, s := range terminalStatuses {
 		terminalClaims[i] = uuid.MakeV4().GetBytes() // bogus claim
 		tdb.QueryRow(t, insertQuery, s, payload, progress, terminalClaims[i], 42).
 			Scan(&terminalIDs[i])
 	}
-	var nonTerminalID int64
+	var nonTerminalID jobspb.JobID
 	tdb.QueryRow(t, insertQuery, jobs.StatusRunning, payload, progress, uuid.MakeV4().GetBytes(), 42).
 		Scan(&nonTerminalID)
 
-	checkClaimEqual := func(id int64, exp []byte) error {
+	checkClaimEqual := func(id jobspb.JobID, exp []byte) error {
 		const getClaimQuery = `SELECT claim_session_id FROM system.jobs WHERE id = $1`
 		var claim []byte
 		tdb.QueryRow(t, getClaimQuery, id).Scan(&claim)

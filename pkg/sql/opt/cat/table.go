@@ -91,6 +91,8 @@ type Table interface {
 	StatisticCount() int
 
 	// Statistic returns the ith statistic, where i < StatisticCount.
+	// The statistics must be ordered from new to old, according to the
+	// CreatedAt() times.
 	Statistic(i int) TableStatistic
 
 	// CheckCount returns the number of check constraints present on the table.
@@ -130,7 +132,7 @@ type Table interface {
 
 	// Unique returns the ith unique constraint defined on this table, where
 	// i < UniqueCount.
-	Unique(i int) UniqueConstraint
+	Unique(i UniqueOrdinal) UniqueConstraint
 }
 
 // CheckConstraint contains the SQL text and the validity status for a check
@@ -268,6 +270,11 @@ type UniqueConstraint interface {
 	// constraint.
 	ColumnOrdinal(tab Table, i int) int
 
+	// Predicate returns the partial predicate expression and true if the
+	// constraint is a partial unique constraint. If it is not, the empty string
+	// and false are returned.
+	Predicate() (string, bool)
+
 	// WithoutIndex is true if this unique constraint is not enforced by an index.
 	WithoutIndex() bool
 
@@ -278,3 +285,10 @@ type UniqueConstraint interface {
 	// needs to be enforced on new mutations.
 	Validated() bool
 }
+
+// UniqueOrdinal identifies a unique constraint (in the context of a Table).
+type UniqueOrdinal = int
+
+// UniqueOrdinals identifies a list of unique constraints (in the context of
+// a Table).
+type UniqueOrdinals = []UniqueOrdinal

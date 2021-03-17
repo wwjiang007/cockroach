@@ -12,7 +12,6 @@ package row
 
 import (
 	"context"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -20,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
 // KVFetcher wraps kvBatchFetcher, providing a NextKV interface that returns the
@@ -34,13 +34,10 @@ type KVFetcher struct {
 	newSpan       bool
 
 	// Observability fields.
-	bytesRead int64
-	// testingGenerateMockContentionEvents is a field that specifies whether the
-	// KVFetcher should generate mock contention events. See
-	// TestingEnableMockContentionEventGeneration.
-	// TODO(asubiotto): Remove once KV layer produces real contention events.
-	testingGenerateMockContentionEvents bool
-	contentionEvents                    []roachpb.ContentionEvent
+	mu struct {
+		syncutil.Mutex
+		bytesRead int64
+	}
 }
 
 // NewKVFetcher creates a new KVFetcher.
@@ -54,9 +51,11 @@ func NewKVFetcher(
 	lockStrength descpb.ScanLockingStrength,
 	lockWaitPolicy descpb.ScanLockingWaitPolicy,
 	mon *mon.BytesMonitor,
+	forceProductionKVBatchSize bool,
 ) (*KVFetcher, error) {
 	kvBatchFetcher, err := makeKVBatchFetcher(
-		txn, spans, reverse, useBatchLimit, firstBatchLimit, lockStrength, lockWaitPolicy, mon,
+		txn, spans, reverse, useBatchLimit, firstBatchLimit, lockStrength,
+		lockWaitPolicy, mon, forceProductionKVBatchSize,
 	)
 	return newKVFetcher(&kvBatchFetcher), err
 }
@@ -68,29 +67,15 @@ func newKVFetcher(batchFetcher kvBatchFetcher) *KVFetcher {
 	return ret
 }
 
-// GetBytesRead returns the number of bytes read by this fetcher.
+// GetBytesRead returns the number of bytes read by this fetcher. It is safe for
+// concurrent use and is able to handle a case of uninitialized fetcher.
 func (f *KVFetcher) GetBytesRead() int64 {
 	if f == nil {
 		return 0
 	}
-	return f.bytesRead
-}
-
-// TestingEnableMockContentionEventGeneration will enable kv fetcher testing
-// behavior that generates a roachpb.ContentionEvent with a duration of 1ns of
-// contention for each kv pair returned.
-func (f *KVFetcher) TestingEnableMockContentionEventGeneration() {
-	f.testingGenerateMockContentionEvents = true
-}
-
-// GetContentionEvents returns a slice of contention events that occurred during
-// the lifetime of this KVFetcher. A nil slice indicates that no contention
-// events occurred.
-func (f *KVFetcher) GetContentionEvents() []roachpb.ContentionEvent {
-	if f == nil {
-		return nil
-	}
-	return f.contentionEvents
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mu.bytesRead
 }
 
 // MVCCDecodingStrategy controls if and how the fetcher should decode MVCC
@@ -132,18 +117,6 @@ func (f *KVFetcher) NextKV(
 			if err != nil {
 				return false, kv, false, err
 			}
-			if f.testingGenerateMockContentionEvents {
-				// Note: contention events are only generated for the "new" nextBatch
-				// API which only returns batchResponses (i.e. the f.kvs path above is
-				// ignored).
-				f.contentionEvents = append(
-					f.contentionEvents,
-					roachpb.ContentionEvent{
-						Key:      key,
-						Duration: time.Nanosecond,
-					},
-				)
-			}
 			return true, roachpb.KeyValue{
 				Key: key,
 				Value: roachpb.Value{
@@ -161,7 +134,9 @@ func (f *KVFetcher) NextKV(
 			return false, kv, false, nil
 		}
 		f.newSpan = true
-		f.bytesRead += int64(len(f.batchResponse))
+		f.mu.Lock()
+		f.mu.bytesRead += int64(len(f.batchResponse))
+		f.mu.Unlock()
 	}
 }
 

@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -74,6 +75,9 @@ func TestInternalExecutor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if row == nil {
+		t.Fatal("empty result")
+	}
 	r, ok = row[0].(*tree.DInt)
 	if !ok || *r != 99 {
 		t.Fatalf("expected a DInt == 99, got: %T:%s", r, r)
@@ -99,6 +103,9 @@ func TestInternalExecutor(t *testing.T) {
 		}
 		if err != nil {
 			return err
+		}
+		if row == nil {
+			return errors.New("empty result")
 		}
 		r, ok = row[0].(*tree.DInt)
 		if !ok || *r != 99 {
@@ -161,7 +168,7 @@ func TestInternalFullTableScan(t *testing.T) {
 
 	// Internal queries that perform full table scans shouldn't fail because of
 	// the setting above.
-	_, err = ie.Query(ctx, "full-table-scan-select", nil, "SELECT * FROM db.t")
+	_, err = ie.Exec(ctx, "full-table-scan-select", nil, "SELECT * FROM db.t")
 	require.NoError(t, err)
 }
 
@@ -191,16 +198,20 @@ func TestQueryIsAdminWithNoTxn(t *testing.T) {
 
 	for _, tc := range testData {
 		t.Run(tc.user.Normalized(), func(t *testing.T) {
-			rows, cols, err := ie.QueryWithCols(ctx, "test", nil, /* txn */
+			row, cols, err := ie.QueryRowExWithCols(ctx, "test", nil, /* txn */
 				sessiondata.InternalExecutorOverride{User: tc.user},
 				"SELECT crdb_internal.is_admin()")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(rows) != 1 || len(cols) != 1 {
-				t.Fatalf("unexpected result shape %d, %d", len(rows), len(cols))
+			if row == nil || len(cols) != 1 {
+				numRows := 0
+				if row != nil {
+					numRows = 1
+				}
+				t.Fatalf("unexpected result shape %d, %d", numRows, len(cols))
 			}
-			isAdmin := bool(*rows[0][0].(*tree.DBool))
+			isAdmin := bool(*row[0].(*tree.DBool))
 			if isAdmin != tc.expAdmin {
 				t.Fatalf("expected %q admin %v, got %v", tc.user, tc.expAdmin, isAdmin)
 			}
@@ -240,7 +251,7 @@ GRANT admin TO testadmin`
 		{"testadmin", "nonexistent", false, "unrecognized role option"},
 	} {
 		username := security.MakeSQLUsernameFromPreNormalizedString(tc.user)
-		rows, cols, err := ie.QueryWithCols(ctx, "test", nil, /* txn */
+		row, cols, err := ie.QueryRowExWithCols(ctx, "test", nil, /* txn */
 			sessiondata.InternalExecutorOverride{User: username},
 			"SELECT crdb_internal.has_role_option($1)", tc.option)
 		if tc.expectedErr != "" {
@@ -249,10 +260,14 @@ GRANT admin TO testadmin`
 			}
 			continue
 		}
-		if len(rows) != 1 || len(cols) != 1 {
-			t.Fatalf("unexpected result shape %d, %d", len(rows), len(cols))
+		if row == nil || len(cols) != 1 {
+			numRows := 0
+			if row != nil {
+				numRows = 1
+			}
+			t.Fatalf("unexpected result shape %d, %d", numRows, len(cols))
 		}
-		hasRoleOption := bool(*rows[0][0].(*tree.DBool))
+		hasRoleOption := bool(*row[0].(*tree.DBool))
 		if hasRoleOption != tc.expected {
 			t.Fatalf(
 				"expected %q has_role_option('%s') %v, got %v", tc.user, tc.option, tc.expected,
@@ -368,9 +383,9 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 }
 
 type testInternalExecutor interface {
-	Query(
+	QueryRow(
 		ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
-	) ([]tree.Datums, error)
+	) (tree.Datums, error)
 	Exec(
 		ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
 	) (int, error)
@@ -383,12 +398,12 @@ func testInternalExecutorAppNameInitialization(
 	ie testInternalExecutor,
 ) {
 	// Check that the application_name is set properly in the executor.
-	if rows, err := ie.Query(context.Background(), "test-query", nil,
+	if row, err := ie.QueryRow(context.Background(), "test-query", nil,
 		"SHOW application_name"); err != nil {
 		t.Fatal(err)
-	} else if len(rows) != 1 {
-		t.Fatalf("expected 1 row, got: %+v", rows)
-	} else if appName := string(*rows[0][0].(*tree.DString)); appName != expectedAppName {
+	} else if row == nil {
+		t.Fatalf("expected 1 row, got 0")
+	} else if appName := string(*row[0].(*tree.DString)); appName != expectedAppName {
 		t.Fatalf("unexpected app name: expected %q, got %q", expectedAppName, appName)
 	}
 
@@ -396,7 +411,7 @@ func testInternalExecutorAppNameInitialization(
 	// have this keep running until we cancel it below.
 	errChan := make(chan error)
 	go func() {
-		_, err := ie.Query(context.Background(),
+		_, err := ie.Exec(context.Background(),
 			"test-query",
 			nil, /* txn */
 			"SELECT pg_sleep(1337666)")
@@ -412,7 +427,7 @@ func testInternalExecutorAppNameInitialization(
 	// When it does, we capture the query ID.
 	var queryID string
 	testutils.SucceedsSoon(t, func() error {
-		rows, err := ie.Query(context.Background(),
+		row, err := ie.QueryRow(context.Background(),
 			"find-query",
 			nil, /* txn */
 			// We need to assemble the magic string so that this SELECT
@@ -421,37 +436,34 @@ func testInternalExecutorAppNameInitialization(
 		if err != nil {
 			return err
 		}
-		switch len(rows) {
-		case 0:
+		if row == nil {
 			// The SucceedsSoon test may find this a couple of times before
 			// this succeeds.
 			return fmt.Errorf("query not started yet")
-		case 1:
-			appName := string(*rows[0][1].(*tree.DString))
+		} else {
+			appName := string(*row[1].(*tree.DString))
 			if appName != expectedAppName {
 				return fmt.Errorf("unexpected app name: expected %q, got %q", expectedAppName, appName)
 			}
 
 			// Good app name, retrieve query ID for later cancellation.
-			queryID = string(*rows[0][0].(*tree.DString))
+			queryID = string(*row[0].(*tree.DString))
 			return nil
-		default:
-			return fmt.Errorf("unexpected results: %+v", rows)
 		}
 	})
 
 	// Check that the query shows up in the internal tables without error.
-	if rows, err := ie.Query(context.Background(), "find-query", nil,
+	if row, err := ie.QueryRow(context.Background(), "find-query", nil,
 		"SELECT application_name FROM crdb_internal.node_queries WHERE query LIKE '%337' || '666%'"); err != nil {
 		t.Fatal(err)
-	} else if len(rows) != 1 {
-		t.Fatalf("expected 1 query, got: %+v", rows)
-	} else if appName := string(*rows[0][0].(*tree.DString)); appName != expectedAppName {
+	} else if row == nil {
+		t.Fatalf("expected 1 query, got 0")
+	} else if appName := string(*row[0].(*tree.DString)); appName != expectedAppName {
 		t.Fatalf("unexpected app name: expected %q, got %q", expectedAppName, appName)
 	}
 
 	// We'll want to look at statistics below, and finish the test with
-	// no goroutine leakage. To achieve this, cancel the query. and
+	// no goroutine leakage. To achieve this, cancel the query and
 	// drain the goroutine.
 	if _, err := ie.Exec(context.Background(), "cancel-query", nil, "CANCEL QUERY $1", queryID); err != nil {
 		t.Fatal(err)
@@ -466,12 +478,12 @@ func testInternalExecutorAppNameInitialization(
 	}
 
 	// Now check that it was properly registered in statistics.
-	if rows, err := ie.Query(context.Background(), "find-query", nil,
+	if row, err := ie.QueryRow(context.Background(), "find-query", nil,
 		"SELECT application_name FROM crdb_internal.node_statement_statistics WHERE key LIKE 'SELECT' || ' pg_sleep(%'"); err != nil {
 		t.Fatal(err)
-	} else if len(rows) != 1 {
-		t.Fatalf("expected 1 query, got: %+v", rows)
-	} else if appName := string(*rows[0][0].(*tree.DString)); appName != expectedAppNameInStats {
+	} else if row == nil {
+		t.Fatalf("expected 1 query, got 0")
+	} else if appName := string(*row[0].(*tree.DString)); appName != expectedAppNameInStats {
 		t.Fatalf("unexpected app name: expected %q, got %q", expectedAppNameInStats, appName)
 	}
 }
@@ -504,7 +516,8 @@ func TestInternalExecutorPushDetectionInTxn(t *testing.T) {
 	txn.CommitTimestamp()
 	require.True(t, txn.IsSerializablePushAndRefreshNotPossible())
 
-	execCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, "test-recording")
+	tr := s.Tracer().(*tracing.Tracer)
+	execCtx, collect, cancel := tracing.ContextWithRecordingSpan(ctx, tr, "test-recording")
 	defer cancel()
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
 	_, err = ie.Exec(execCtx, "test", txn, "select 42")
@@ -530,7 +543,7 @@ func TestInternalExecutorInLeafTxnDoesNotPanic(t *testing.T) {
 	leafTxn := kv.NewLeafTxn(ctx, kvDB, roachpb.NodeID(1), &ltis)
 
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
-	_, err := ie.QueryEx(
+	_, err := ie.ExecEx(
 		ctx, "leaf-query", leafTxn, sessiondata.InternalExecutorOverride{User: security.RootUserName()}, "SELECT 1",
 	)
 	require.NoError(t, err)

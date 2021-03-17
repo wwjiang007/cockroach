@@ -16,8 +16,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -40,10 +40,10 @@ type deleteRangeNode struct {
 	// spans are the spans to delete.
 	spans roachpb.Spans
 	// desc is the table descriptor the delete is operating on.
-	desc *tabledesc.Immutable
+	desc catalog.TableDescriptor
 	// interleavedDesc are the table descriptors of any child interleaved tables
 	// the delete is operating on.
-	interleavedDesc []*tabledesc.Immutable
+	interleavedDesc []catalog.TableDescriptor
 	// fetcher is around to decode the returned keys from the DeleteRange, so that
 	// we can count the number of rows deleted.
 	fetcher row.Fetcher
@@ -96,13 +96,13 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 	allTables := make([]row.FetcherTableArgs, len(d.interleavedDesc)+1)
 	allTables[0] = row.FetcherTableArgs{
 		Desc:  d.desc,
-		Index: d.desc.GetPrimaryIndex(),
+		Index: d.desc.GetPrimaryIndex().IndexDesc(),
 		Spans: d.spans,
 	}
 	for i, interleaved := range d.interleavedDesc {
 		allTables[i+1] = row.FetcherTableArgs{
 			Desc:  interleaved,
-			Index: interleaved.GetPrimaryIndex(),
+			Index: interleaved.GetPrimaryIndex().IndexDesc(),
 			Spans: d.spans,
 		}
 	}
@@ -167,7 +167,7 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 	}
 
 	// Possibly initiate a run of CREATE STATISTICS.
-	params.ExecCfg().StatsRefresher.NotifyMutation(d.desc.ID, d.rowCount)
+	params.ExecCfg().StatsRefresher.NotifyMutation(d.desc.GetID(), d.rowCount)
 
 	return nil
 }

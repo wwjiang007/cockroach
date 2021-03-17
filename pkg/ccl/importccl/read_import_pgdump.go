@@ -11,26 +11,28 @@ package importccl
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"regexp"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -43,16 +45,20 @@ import (
 )
 
 type postgreStream struct {
-	s    *bufio.Scanner
-	copy *postgreStreamCopy
+	ctx                   context.Context
+	s                     *bufio.Scanner
+	copy                  *postgreStreamCopy
+	unsupportedStmtLogger *unsupportedStmtLogger
 }
 
 // newPostgreStream returns a struct that can stream statements from an
 // io.Reader.
-func newPostgreStream(r io.Reader, max int) *postgreStream {
+func newPostgreStream(
+	ctx context.Context, r io.Reader, max int, unsupportedStmtLogger *unsupportedStmtLogger,
+) *postgreStream {
 	s := bufio.NewScanner(r)
 	s.Buffer(nil, max)
-	p := &postgreStream{s: s}
+	p := &postgreStream{ctx: ctx, s: s, unsupportedStmtLogger: unsupportedStmtLogger}
 	s.Split(p.split)
 	return p
 }
@@ -96,14 +102,19 @@ func (p *postgreStream) Next() (interface{}, error) {
 
 	for p.s.Scan() {
 		t := p.s.Text()
-		// Regardless if we can parse the statement, check that it's not something
-		// we want to ignore.
-		if isIgnoredStatement(t) {
-			continue
-		}
+		skipOverComments(t)
 
 		stmts, err := parser.Parse(t)
 		if err != nil {
+			// There are some statements that CRDB is unable to parse. If the user has
+			// indicated that they want to skip these stmts during the IMPORT, then do
+			// so here.
+			if p.unsupportedStmtLogger.ignoreUnsupported && errors.HasType(err, (*tree.UnsupportedError)(nil)) {
+				if unsupportedErr := (*tree.UnsupportedError)(nil); errors.As(err, &unsupportedErr) {
+					p.unsupportedStmtLogger.log(unsupportedErr.FeatureName, true /* isParseError */)
+				}
+				continue
+			}
 			return nil, err
 		}
 		switch len(stmts) {
@@ -146,20 +157,10 @@ func (p *postgreStream) Next() (interface{}, error) {
 }
 
 var (
-	ignoreComments   = regexp.MustCompile(`^\s*(--.*)`)
-	ignoreStatements = []*regexp.Regexp{
-		regexp.MustCompile("(?i)^alter function"),
-		regexp.MustCompile("(?i)^alter sequence .* owned by"),
-		regexp.MustCompile("(?i)^comment on"),
-		regexp.MustCompile("(?i)^create extension"),
-		regexp.MustCompile("(?i)^create function"),
-		regexp.MustCompile("(?i)^create trigger"),
-		regexp.MustCompile("(?i)^grant .* on sequence"),
-		regexp.MustCompile("(?i)^revoke .* on sequence"),
-	}
+	ignoreComments = regexp.MustCompile(`^\s*(--.*)`)
 )
 
-func isIgnoredStatement(s string) bool {
+func skipOverComments(s string) {
 	// Look for the first line with no whitespace or comments.
 	for {
 		m := ignoreComments.FindStringIndex(s)
@@ -168,13 +169,6 @@ func isIgnoredStatement(s string) bool {
 		}
 		s = s[m[1]:]
 	}
-	s = strings.TrimSpace(s)
-	for _, re := range ignoreStatements {
-		if re.MatchString(s) {
-			return true
-		}
-	}
-	return false
 }
 
 type regclassRewriter struct{}
@@ -217,6 +211,207 @@ func removeDefaultRegclass(create *tree.CreateTable) {
 	}
 }
 
+type schemaAndTableName struct {
+	schema string
+	table  string
+}
+
+func (s *schemaAndTableName) String() string {
+	var ret string
+	if s.schema != "" {
+		ret += s.schema + "."
+	}
+	ret += s.table
+	return ret
+}
+
+type schemaParsingObjects struct {
+	createSchema map[string]*tree.CreateSchema
+	createTbl    map[schemaAndTableName]*tree.CreateTable
+	createSeq    map[schemaAndTableName]*tree.CreateSequence
+	tableFKs     map[schemaAndTableName][]*tree.ForeignKeyConstraintTableDef
+}
+
+func createPostgresSchemas(
+	ctx context.Context,
+	parentID descpb.ID,
+	createSchema map[string]*tree.CreateSchema,
+	execCfg *sql.ExecutorConfig,
+	user security.SQLUsername,
+) ([]*schemadesc.Mutable, error) {
+	var dbDesc *dbdesc.Immutable
+	if err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		var err error
+		dbDesc, err = catalogkv.MustGetDatabaseDescByID(ctx, txn, execCfg.Codec, parentID)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	schemaDescs := make([]*schemadesc.Mutable, 0)
+	for _, schema := range createSchema {
+		if err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			desc, _, err := sql.CreateUserDefinedSchemaDescriptor(ctx, user, schema, txn, execCfg,
+				dbDesc, false /* allocateID */)
+			if err != nil {
+				return err
+			}
+
+			// This is true when the schema exists and we are processing a
+			// CREATE SCHEMA IF NOT EXISTS statement.
+			if desc == nil {
+				return nil
+			}
+
+			// We didn't allocate an ID above, so we must assign it a mock ID until it
+			// is assigned an actual ID later in the import.
+			desc.ID = getNextPlaceholderDescID()
+			desc.State = descpb.DescriptorState_OFFLINE
+			desc.OfflineReason = "importing"
+			schemaDescs = append(schemaDescs, desc)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return schemaDescs, nil
+}
+
+func createPostgresSequences(
+	ctx context.Context,
+	parentID descpb.ID,
+	createSeq map[schemaAndTableName]*tree.CreateSequence,
+	fks fkHandler,
+	walltime int64,
+	owner security.SQLUsername,
+	schemaNameToDesc map[string]*schemadesc.Mutable,
+) ([]*tabledesc.Mutable, error) {
+	ret := make([]*tabledesc.Mutable, 0)
+	for schemaAndTableName, seq := range createSeq {
+		schemaID := descpb.ID(keys.PublicSchemaID)
+		if schemaAndTableName.schema != "" && schemaAndTableName.schema != "public" {
+			var desc *schemadesc.Mutable
+			var ok bool
+			if desc, ok = schemaNameToDesc[schemaAndTableName.schema]; !ok {
+				return nil, errors.Newf("schema %s not found in the schemas created from the pgdump",
+					schemaAndTableName.schema)
+			}
+			schemaID = desc.ID
+		}
+		desc, err := sql.NewSequenceTableDesc(
+			ctx,
+			schemaAndTableName.table,
+			seq.Options,
+			parentID,
+			schemaID,
+			getNextPlaceholderDescID(),
+			hlc.Timestamp{WallTime: walltime},
+			descpb.NewDefaultPrivilegeDescriptor(owner),
+			tree.PersistencePermanent,
+			nil, /* params */
+		)
+		if err != nil {
+			return nil, err
+		}
+		fks.resolver.tableNameToDesc[schemaAndTableName.String()] = desc
+		ret = append(ret, desc)
+	}
+
+	return ret, nil
+}
+
+func createPostgresTables(
+	evalCtx *tree.EvalContext,
+	p sql.JobExecContext,
+	createTbl map[schemaAndTableName]*tree.CreateTable,
+	fks fkHandler,
+	backrefs map[descpb.ID]*tabledesc.Mutable,
+	parentID descpb.ID,
+	walltime int64,
+	schemaNameToDesc map[string]*schemadesc.Mutable,
+) ([]*tabledesc.Mutable, error) {
+	ret := make([]*tabledesc.Mutable, 0)
+	for schemaAndTableName, create := range createTbl {
+		if create == nil {
+			continue
+		}
+		schemaID := descpb.ID(keys.PublicSchemaID)
+		if schemaAndTableName.schema != "" && schemaAndTableName.schema != tree.PublicSchema {
+			var desc *schemadesc.Mutable
+			var ok bool
+			if desc, ok = schemaNameToDesc[schemaAndTableName.schema]; !ok {
+				return nil, errors.Newf("schema %s not found in the schemas created from the pgdump",
+					schemaAndTableName.schema)
+			}
+			schemaID = desc.ID
+		}
+		removeDefaultRegclass(create)
+		desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), p.SemaCtx(), p.ExecCfg().Settings,
+			create, parentID, schemaID, getNextPlaceholderDescID(), fks, walltime)
+		if err != nil {
+			return nil, err
+		}
+		fks.resolver.tableNameToDesc[schemaAndTableName.String()] = desc
+		backrefs[desc.ID] = desc
+		ret = append(ret, desc)
+	}
+
+	return ret, nil
+}
+
+func resolvePostgresFKs(
+	evalCtx *tree.EvalContext,
+	tableFKs map[schemaAndTableName][]*tree.ForeignKeyConstraintTableDef,
+	fks fkHandler,
+	backrefs map[descpb.ID]*tabledesc.Mutable,
+) error {
+	for schemaAndTableName, constraints := range tableFKs {
+		desc := fks.resolver.tableNameToDesc[schemaAndTableName.String()]
+		if desc == nil {
+			continue
+		}
+		for _, constraint := range constraints {
+			if constraint.Table.Schema() == "" {
+				return errors.Errorf("schema expected to be non-empty when resolving postgres FK %s",
+					constraint.Name.String())
+			}
+			constraint.Table.ExplicitSchema = true
+			// Add a dummy catalog name to aid in object resolution.
+			if constraint.Table.Catalog() == "" {
+				constraint.Table.ExplicitCatalog = true
+				constraint.Table.CatalogName = "defaultdb"
+			}
+			if err := sql.ResolveFK(
+				evalCtx.Ctx(), nil /* txn */, &fks.resolver, desc, constraint, backrefs, sql.NewTable,
+				tree.ValidationDefault, evalCtx,
+			); err != nil {
+				return err
+			}
+		}
+		if err := fixDescriptorFKState(desc); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+var placeholderDescID = defaultCSVTableID
+
+// getNextPlaceholderDescID returns a monotonically increasing placeholder ID
+// that is used when creating table, sequence and schema descriptors during the
+// schema parsing phase of a PGDUMP import.
+// We assign these descriptors "fake" IDs because it is early in the IMPORT
+// execution and we do not want to blow through GenerateUniqueDescID calls only
+// to fail during the verification phase before we actually begin ingesting
+// data. Thus, we pessimistically wait till all the verification steps in the
+// IMPORT have been completed after which we rewrite the descriptor IDs with
+// "real" unique IDs.
+func getNextPlaceholderDescID() descpb.ID {
+	ret := placeholderDescID
+	placeholderDescID++
+	return ret
+}
+
 // readPostgresCreateTable returns table descriptors for all tables or the
 // matching table from SQL statements.
 func readPostgresCreateTable(
@@ -230,89 +425,77 @@ func readPostgresCreateTable(
 	fks fkHandler,
 	max int,
 	owner security.SQLUsername,
-) ([]*tabledesc.Mutable, error) {
+	unsupportedStmtLogger *unsupportedStmtLogger,
+) ([]*tabledesc.Mutable, []*schemadesc.Mutable, error) {
 	// Modify the CreateTable stmt with the various index additions. We do this
 	// instead of creating a full table descriptor first and adding indexes
 	// later because MakeSimpleTableDescriptor calls the sql package which calls
 	// AllocateIDs which adds the hidden rowid and default primary key. This means
 	// we'd have to delete the index and row and modify the column family. This
 	// is much easier and probably safer too.
-	createTbl := make(map[string]*tree.CreateTable)
-	createSeq := make(map[string]*tree.CreateSequence)
-	tableFKs := make(map[string][]*tree.ForeignKeyConstraintTableDef)
-	ps := newPostgreStream(input, max)
+	schemaObjects := schemaParsingObjects{
+		createSchema: make(map[string]*tree.CreateSchema),
+		createTbl:    make(map[schemaAndTableName]*tree.CreateTable),
+		createSeq:    make(map[schemaAndTableName]*tree.CreateSequence),
+		tableFKs:     make(map[schemaAndTableName][]*tree.ForeignKeyConstraintTableDef),
+	}
+	ps := newPostgreStream(ctx, input, max, unsupportedStmtLogger)
 	for {
 		stmt, err := ps.Next()
 		if err == io.EOF {
-			ret := make([]*tabledesc.Mutable, 0, len(createTbl))
-			for name, seq := range createSeq {
-				id := descpb.ID(int(defaultCSVTableID) + len(ret))
-				desc, err := sql.NewSequenceTableDesc(
-					ctx,
-					name,
-					seq.Options,
-					parentID,
-					keys.PublicSchemaID,
-					id,
-					hlc.Timestamp{WallTime: walltime},
-					descpb.NewDefaultPrivilegeDescriptor(owner),
-					tree.PersistencePermanent,
-					nil, /* params */
-				)
-				if err != nil {
-					return nil, err
-				}
-				fks.resolver[desc.Name] = desc
-				ret = append(ret, desc)
+			tables := make([]*tabledesc.Mutable, 0, len(schemaObjects.createTbl))
+			schemaNameToDesc := make(map[string]*schemadesc.Mutable)
+			schemaDescs, err := createPostgresSchemas(ctx, parentID, schemaObjects.createSchema,
+				p.ExecCfg(), p.User())
+			if err != nil {
+				return nil, nil, err
 			}
+
+			for _, schemaDesc := range schemaDescs {
+				schemaNameToDesc[schemaDesc.GetName()] = schemaDesc
+			}
+
+			// Construct sequence descriptors.
+			seqs, err := createPostgresSequences(ctx, parentID, schemaObjects.createSeq, fks,
+				walltime, owner, schemaNameToDesc)
+			if err != nil {
+				return nil, nil, err
+			}
+			tables = append(tables, seqs...)
+
+			// Construct table descriptors.
 			backrefs := make(map[descpb.ID]*tabledesc.Mutable)
-			for _, create := range createTbl {
-				if create == nil {
-					continue
-				}
-				removeDefaultRegclass(create)
-				id := descpb.ID(int(defaultCSVTableID) + len(ret))
-				desc, err := MakeSimpleTableDescriptor(evalCtx.Ctx(), p.SemaCtx(), p.ExecCfg().Settings, create, parentID, keys.PublicSchemaID, id, fks, walltime)
-				if err != nil {
-					return nil, err
-				}
-				fks.resolver[desc.Name] = desc
-				backrefs[desc.ID] = desc
-				ret = append(ret, desc)
+			tableDescs, err := createPostgresTables(evalCtx, p, schemaObjects.createTbl, fks, backrefs,
+				parentID, walltime, schemaNameToDesc)
+			if err != nil {
+				return nil, nil, err
 			}
-			for name, constraints := range tableFKs {
-				desc := fks.resolver[name]
-				if desc == nil {
-					continue
-				}
-				for _, constraint := range constraints {
-					if err := sql.ResolveFK(
-						evalCtx.Ctx(), nil /* txn */, fks.resolver, desc, constraint, backrefs, sql.NewTable, tree.ValidationDefault, evalCtx,
-					); err != nil {
-						return nil, err
-					}
-				}
-				if err := fixDescriptorFKState(desc); err != nil {
-					return nil, err
-				}
+			tables = append(tables, tableDescs...)
+
+			// Resolve FKs.
+			err = resolvePostgresFKs(evalCtx, schemaObjects.tableFKs, fks, backrefs)
+			if err != nil {
+				return nil, nil, err
 			}
-			if match != "" && len(ret) != 1 {
-				found := make([]string, 0, len(createTbl))
-				for name := range createTbl {
-					found = append(found, name)
+			if match != "" && len(tables) != 1 {
+				found := make([]string, 0, len(schemaObjects.createTbl))
+				for schemaAndTableName := range schemaObjects.createTbl {
+					found = append(found, schemaAndTableName.String())
 				}
-				return nil, errors.Errorf("table %q not found in file (found tables: %s)", match, strings.Join(found, ", "))
+				return nil, nil, errors.Errorf("table %q not found in file (found tables: %s)", match,
+					strings.Join(found, ", "))
 			}
-			if len(ret) == 0 {
-				return nil, errors.Errorf("no table definition found")
+			if len(tables) == 0 {
+				return nil, nil, errors.Errorf("no table definition found")
 			}
-			return ret, nil
+			return tables, schemaDescs, nil
 		}
 		if err != nil {
-			return nil, errors.Wrap(err, "postgres parse error")
+			return nil, nil, errors.Wrap(err, "postgres parse error")
 		}
-		if err := readPostgresStmt(ctx, evalCtx, match, fks, createTbl, createSeq, tableFKs, stmt, p, parentID); err != nil {
-			return nil, err
+		if err := readPostgresStmt(ctx, evalCtx, match, fks, &schemaObjects, stmt, p,
+			parentID, unsupportedStmtLogger); err != nil {
+			return nil, nil, err
 		}
 	}
 }
@@ -322,54 +505,71 @@ func readPostgresStmt(
 	evalCtx *tree.EvalContext,
 	match string,
 	fks fkHandler,
-	createTbl map[string]*tree.CreateTable,
-	createSeq map[string]*tree.CreateSequence,
-	tableFKs map[string][]*tree.ForeignKeyConstraintTableDef,
+	schemaObjects *schemaParsingObjects,
 	stmt interface{},
 	p sql.JobExecContext,
 	parentID descpb.ID,
+	unsupportedStmtLogger *unsupportedStmtLogger,
 ) error {
+	ignoreUnsupportedStmts := unsupportedStmtLogger.ignoreUnsupported
 	switch stmt := stmt.(type) {
-	case *tree.CreateTable:
-		name, err := getTableName(&stmt.Table)
+	case *tree.CreateSchema:
+		name, err := getSchemaName(&stmt.Schema)
 		if err != nil {
 			return err
 		}
-		if match != "" && match != name {
-			createTbl[name] = nil
+		// If a target table is specified we do not want to create any user defined
+		// schemas. This is because we only allow specifying target table's in the
+		// public schema.
+		if match != "" {
+			break
+		}
+		schemaObjects.createSchema[name] = stmt
+	case *tree.CreateTable:
+		schemaQualifiedName, err := getSchemaAndTableName(&stmt.Table)
+		if err != nil {
+			return err
+		}
+		isMatch := match == "" || match == schemaQualifiedName.String()
+		if isMatch {
+			schemaObjects.createTbl[schemaQualifiedName] = stmt
 		} else {
-			createTbl[name] = stmt
+			schemaObjects.createTbl[schemaQualifiedName] = nil
 		}
 	case *tree.CreateIndex:
 		if stmt.Predicate != nil {
 			return unimplemented.NewWithIssue(50225, "cannot import a table with partial indexes")
 		}
-		name, err := getTableName(&stmt.Table)
+		schemaQualifiedTableName, err := getSchemaAndTableName(&stmt.Table)
 		if err != nil {
 			return err
 		}
-		create := createTbl[name]
+		create := schemaObjects.createTbl[schemaQualifiedTableName]
 		if create == nil {
 			break
 		}
 		var idx tree.TableDef = &tree.IndexTableDef{
-			Name:        stmt.Name,
-			Columns:     stmt.Columns,
-			Storing:     stmt.Storing,
-			Inverted:    stmt.Inverted,
-			Interleave:  stmt.Interleave,
-			PartitionBy: stmt.PartitionBy,
+			Name:             stmt.Name,
+			Columns:          stmt.Columns,
+			Storing:          stmt.Storing,
+			Inverted:         stmt.Inverted,
+			Interleave:       stmt.Interleave,
+			PartitionByIndex: stmt.PartitionByIndex,
 		}
 		if stmt.Unique {
 			idx = &tree.UniqueConstraintTableDef{IndexTableDef: *idx.(*tree.IndexTableDef)}
 		}
 		create.Defs = append(create.Defs, idx)
+	case *tree.AlterSchema:
+		switch stmt.Cmd {
+		default:
+		}
 	case *tree.AlterTable:
-		name, err := getTableName2(stmt.Table)
+		schemaQualifiedTableName, err := getSchemaAndTableName2(stmt.Table)
 		if err != nil {
 			return err
 		}
-		create := createTbl[name]
+		create := schemaObjects.createTbl[schemaQualifiedTableName]
 		if create == nil {
 			break
 		}
@@ -379,7 +579,10 @@ func readPostgresStmt(
 				switch con := cmd.ConstraintDef.(type) {
 				case *tree.ForeignKeyConstraintTableDef:
 					if !fks.skip {
-						tableFKs[name] = append(tableFKs[name], con)
+						if con.Table.Schema() == "" {
+							con.Table.SchemaName = tree.PublicSchemaName
+						}
+						schemaObjects.tableFKs[schemaQualifiedTableName] = append(schemaObjects.tableFKs[schemaQualifiedTableName], con)
 					}
 				default:
 					create.Defs = append(create.Defs, cmd.ConstraintDef)
@@ -403,6 +606,10 @@ func readPostgresStmt(
 				}
 			case *tree.AlterTableAddColumn:
 				if cmd.IfNotExists {
+					if ignoreUnsupportedStmts {
+						unsupportedStmtLogger.log(stmt.String(), false /* isParseError */)
+						continue
+					}
 					return errors.Errorf("unsupported statement: %s", stmt)
 				}
 				create.Defs = append(create.Defs, cmd.ColumnDef)
@@ -423,22 +630,34 @@ func readPostgresStmt(
 				if !found {
 					return colinfo.NewUndefinedColumnError(cmd.Column.String())
 				}
-			case *tree.AlterTableValidateConstraint:
-				// ignore
-			case *tree.AlterTableOwner:
-				// ignore
 			default:
+				if ignoreUnsupportedStmts {
+					unsupportedStmtLogger.log(stmt.String(), false /* isParseError */)
+					continue
+				}
 				return errors.Errorf("unsupported statement: %s", stmt)
 			}
 		}
+	case *tree.AlterTableOwner:
+		if ignoreUnsupportedStmts {
+			unsupportedStmtLogger.log(stmt.String(), false /* isParseError */)
+			return nil
+		}
+		return errors.Errorf("unsupported statement: %s", stmt)
 	case *tree.CreateSequence:
-		name, err := getTableName(&stmt.Name)
+		schemaQualifiedTableName, err := getSchemaAndTableName(&stmt.Name)
 		if err != nil {
 			return err
 		}
-		if match == "" || match == name {
-			createSeq[name] = stmt
+		if match == "" || match == schemaQualifiedTableName.String() {
+			schemaObjects.createSeq[schemaQualifiedTableName] = stmt
 		}
+	case *tree.AlterSequence:
+		if ignoreUnsupportedStmts {
+			unsupportedStmtLogger.log(stmt.String(), false /* isParseError */)
+			return nil
+		}
+		return errors.Errorf("unsupported %T statement: %s", stmt, stmt)
 	// Some SELECT statements mutate schema. Search for those here.
 	case *tree.Select:
 		switch sel := stmt.Select.(type) {
@@ -462,12 +681,13 @@ func readPostgresStmt(
 					// Search for a SQLFn, which returns a SQL string to execute.
 					fn := ov.SQLFn
 					if fn == nil {
-						switch f := expr.Func.String(); f {
-						case "set_config", "setval":
+						err := errors.Errorf("unsupported function call: %s in stmt: %s",
+							expr.Func.String(), stmt.String())
+						if ignoreUnsupportedStmts {
+							unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
 							continue
-						default:
-							return errors.Errorf("unsupported function call: %s", expr.Func.String())
 						}
+						return err
 					}
 					// Attempt to convert all func exprs to datums.
 					datums := make(tree.Datums, len(expr.Exprs))
@@ -494,7 +714,8 @@ func readPostgresStmt(
 					for _, fnStmt := range fnStmts {
 						switch ast := fnStmt.AST.(type) {
 						case *tree.AlterTable:
-							if err := readPostgresStmt(ctx, evalCtx, match, fks, createTbl, createSeq, tableFKs, ast, p, parentID); err != nil {
+							if err := readPostgresStmt(ctx, evalCtx, match, fks, schemaObjects, ast, p,
+								parentID, unsupportedStmtLogger); err != nil {
 								return err
 							}
 						default:
@@ -503,11 +724,21 @@ func readPostgresStmt(
 						}
 					}
 				default:
-					return errors.Errorf("unsupported %T SELECT expr: %s", expr, expr)
+					err := errors.Errorf("unsupported %T SELECT expr: %s", expr, expr)
+					if ignoreUnsupportedStmts {
+						unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+						continue
+					}
+					return err
 				}
 			}
 		default:
-			return errors.Errorf("unsupported %T SELECT: %s", sel, sel)
+			err := errors.Errorf("unsupported %T SELECT %s", sel, sel)
+			if ignoreUnsupportedStmts {
+				unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+				return nil
+			}
+			return err
 		}
 	case *tree.DropTable:
 		names := stmt.Names
@@ -519,13 +750,13 @@ func readPostgresStmt(
 		for _, name := range names {
 			tableName := name.ToUnresolvedObjectName().String()
 			if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				err := backupccl.CheckObjectExists(
+				err := catalogkv.CheckObjectCollision(
 					ctx,
 					txn,
 					p.ExecCfg().Codec,
 					parentID,
 					keys.PublicSchemaID,
-					tableName,
+					tree.NewUnqualifiedTableName(tree.Name(tableName)),
 				)
 				if err != nil {
 					return errors.Wrapf(err, `drop table "%s" and then retry the import`, tableName)
@@ -536,54 +767,77 @@ func readPostgresStmt(
 			}
 		}
 	case *tree.BeginTransaction, *tree.CommitTransaction:
-		// ignore txns.
-	case *tree.SetVar, *tree.Insert, *tree.CopyFrom, copyData, *tree.Delete:
-		// ignore SETs and DMLs.
-	case *tree.Analyze:
-		// ANALYZE is syntatictic sugar for CreateStatistics. It can be ignored because
-		// the auto stats stuff will pick up the changes and run if needed.
+		// Ignore transaction statements as they have no meaning during an IMPORT.
+		// TODO(during review): Should we guard these statements under the
+		// ignore_unsupported flag as well?
+	case *tree.Insert, *tree.CopyFrom, *tree.Delete, copyData:
+		// handled during the data ingestion pass.
+	case *tree.CreateExtension, *tree.CommentOnDatabase, *tree.CommentOnTable,
+		*tree.CommentOnIndex, *tree.CommentOnColumn, *tree.SetVar, *tree.Analyze:
+		// These are the statements that can be parsed by CRDB but are not
+		// supported, or are not required to be processed, during an IMPORT.
+		// - ignore txns.
+		// - ignore SETs and DMLs.
+		// - ANALYZE is syntactic sugar for CreateStatistics. It can be ignored
+		// because the auto stats stuff will pick up the changes and run if needed.
+		if ignoreUnsupportedStmts {
+			unsupportedStmtLogger.log(fmt.Sprintf("%s", stmt), false /* isParseError */)
+			return nil
+		}
+		return errors.Errorf("unsupported %T statement: %s", stmt, stmt)
 	case error:
 		if !errors.Is(stmt, errCopyDone) {
 			return stmt
 		}
 	default:
+		if ignoreUnsupportedStmts {
+			unsupportedStmtLogger.log(fmt.Sprintf("%s", stmt), false /* isParseError */)
+			return nil
+		}
 		return errors.Errorf("unsupported %T statement: %s", stmt, stmt)
 	}
 	return nil
 }
 
-func getTableName(tn *tree.TableName) (string, error) {
-	if sc := tn.Schema(); sc != "" && sc != "public" {
-		return "", unimplemented.NewWithIssueDetailf(
-			26443,
-			"import non-public schema",
-			"non-public schemas unsupported: %s", sc,
-		)
+func getSchemaName(sc *tree.ObjectNamePrefix) (string, error) {
+	if sc.ExplicitCatalog {
+		return "", unimplemented.Newf("import into database specified in dump file",
+			"explicit catalog schemas unsupported: %s", sc.CatalogName.String()+sc.SchemaName.String())
 	}
-	return tn.Table(), nil
+	return sc.SchemaName.String(), nil
+}
+
+func getSchemaAndTableName(tn *tree.TableName) (schemaAndTableName, error) {
+	var ret schemaAndTableName
+	ret.schema = tree.PublicSchema
+	if tn.Schema() != "" {
+		ret.schema = tn.Schema()
+	}
+	ret.table = tn.Table()
+	return ret, nil
 }
 
 // getTableName variant for UnresolvedObjectName.
-func getTableName2(u *tree.UnresolvedObjectName) (string, error) {
-	if u.NumParts >= 2 && u.Parts[1] != "public" {
-		return "", unimplemented.NewWithIssueDetailf(
-			26443,
-			"import non-public schema",
-			"non-public schemas unsupported: %s", u.Parts[1],
-		)
+func getSchemaAndTableName2(u *tree.UnresolvedObjectName) (schemaAndTableName, error) {
+	var ret schemaAndTableName
+	ret.schema = tree.PublicSchema
+	if u.NumParts >= 2 && u.Parts[1] != "" {
+		ret.schema = u.Parts[1]
 	}
-	return u.Parts[0], nil
+	ret.table = u.Parts[0]
+	return ret, nil
 }
 
 type pgDumpReader struct {
-	tableDescs map[string]catalog.TableDescriptor
-	tables     map[string]*row.DatumRowConverter
-	descs      map[string]*execinfrapb.ReadImportDataSpec_ImportTable
-	kvCh       chan row.KVBatch
-	opts       roachpb.PgDumpOptions
-	walltime   int64
-	colMap     map[*row.DatumRowConverter](map[string]int)
-	evalCtx    *tree.EvalContext
+	tableDescs            map[string]catalog.TableDescriptor
+	tables                map[string]*row.DatumRowConverter
+	descs                 map[string]*execinfrapb.ReadImportDataSpec_ImportTable
+	kvCh                  chan row.KVBatch
+	opts                  roachpb.PgDumpOptions
+	walltime              int64
+	colMap                map[*row.DatumRowConverter](map[string]int)
+	unsupportedStmtLogger *unsupportedStmtLogger
+	evalCtx               *tree.EvalContext
 }
 
 var _ inputConverter = &pgDumpReader{}
@@ -602,14 +856,14 @@ func newPgDumpReader(
 	colMap := make(map[*row.DatumRowConverter](map[string]int))
 	for name, table := range descs {
 		if table.Desc.IsTable() {
-			tableDesc := tabledesc.NewImmutable(*table.Desc)
+			tableDesc := tabledesc.NewBuilder(table.Desc).BuildImmutableTable()
 			colSubMap := make(map[string]int, len(table.TargetCols))
 			targetCols := make(tree.NameList, len(table.TargetCols))
 			for i, colName := range table.TargetCols {
 				targetCols[i] = tree.Name(colName)
 			}
 			for i, col := range tableDesc.VisibleColumns() {
-				colSubMap[col.Name] = i
+				colSubMap[col.GetName()] = i
 			}
 			conv, err := row.NewDatumRowConverter(ctx, tableDesc, targetCols, evalCtx, kvCh,
 				nil /* seqChunkProvider */)
@@ -620,7 +874,7 @@ func newPgDumpReader(
 			colMap[conv] = colSubMap
 			tableDescs[name] = tableDesc
 		} else if table.Desc.IsSequence() {
-			seqDesc := tabledesc.NewImmutable(*table.Desc)
+			seqDesc := tabledesc.NewBuilder(table.Desc).BuildImmutableTable()
 			tableDescs[name] = seqDesc
 		}
 	}
@@ -647,7 +901,16 @@ func (m *pgDumpReader) readFiles(
 	makeExternalStorage cloud.ExternalStorageFactory,
 	user security.SQLUsername,
 ) error {
-	return readInputFiles(ctx, dataFiles, resumePos, format, m.readFile, makeExternalStorage, user)
+	// Setup logger to handle unsupported DML statements seen in the PGDUMP file.
+	m.unsupportedStmtLogger = makeUnsupportedStmtLogger(format.PgDump.IgnoreUnsupported,
+		format.PgDump.IgnoreUnsupportedLog, dataIngestion, makeExternalStorage)
+
+	err := readInputFiles(ctx, dataFiles, resumePos, format, m.readFile, makeExternalStorage, user)
+	if err != nil {
+		return err
+	}
+
+	return m.unsupportedStmtLogger.flush(ctx, user)
 }
 
 func (m *pgDumpReader) readFile(
@@ -656,7 +919,7 @@ func (m *pgDumpReader) readFile(
 	tableNameToRowsProcessed := make(map[string]int64)
 	var inserts, count int64
 	rowLimit := m.opts.RowLimit
-	ps := newPostgreStream(input, int(m.opts.MaxRowSize))
+	ps := newPostgreStream(ctx, input, int(m.opts.MaxRowSize), m.unsupportedStmtLogger)
 	semaCtx := tree.MakeSemaContext()
 	for _, conv := range m.tables {
 		conv.KvBatch.Source = inputIdx
@@ -680,11 +943,11 @@ func (m *pgDumpReader) readFile(
 			if !ok {
 				return errors.Errorf("unexpected: %T", i.Table)
 			}
-			name, err := getTableName(n)
+			name, err := getSchemaAndTableName(n)
 			if err != nil {
 				return errors.Wrapf(err, "%s", i)
 			}
-			conv, ok := m.tables[name]
+			conv, ok := m.tables[name.String()]
 			if !ok {
 				// not importing this table.
 				continue
@@ -701,6 +964,12 @@ func (m *pgDumpReader) readFile(
 			timestamp := timestampAfterEpoch(m.walltime)
 			values, ok := i.Rows.Select.(*tree.ValuesClause)
 			if !ok {
+				if m.unsupportedStmtLogger.ignoreUnsupported {
+					logLine := fmt.Sprintf("%s: unsupported by IMPORT\n",
+						i.Rows.Select.String())
+					m.unsupportedStmtLogger.log(logLine, false /* isParseError */)
+					continue
+				}
 				return errors.Errorf("unsupported: %s", i.Rows.Select)
 			}
 			inserts++
@@ -729,11 +998,11 @@ func (m *pgDumpReader) readFile(
 			}
 			for _, tuple := range values.Rows {
 				count++
-				tableNameToRowsProcessed[name]++
+				tableNameToRowsProcessed[name.String()]++
 				if count <= resumePos {
 					continue
 				}
-				if rowLimit != 0 && tableNameToRowsProcessed[name] > rowLimit {
+				if rowLimit != 0 && tableNameToRowsProcessed[name.String()] > rowLimit {
 					break
 				}
 				if got := len(tuple); expectedColLen != got {
@@ -764,11 +1033,11 @@ func (m *pgDumpReader) readFile(
 			if !i.Stdin {
 				return errors.New("expected STDIN option on COPY FROM")
 			}
-			name, err := getTableName(&i.Table)
+			name, err := getSchemaAndTableName(&i.Table)
 			if err != nil {
 				return errors.Wrapf(err, "%s", i)
 			}
-			conv, importing := m.tables[name]
+			conv, importing := m.tables[name.String()]
 			if importing && conv == nil {
 				return errors.Errorf("missing schema info for requested table %q", name)
 			}
@@ -797,7 +1066,7 @@ func (m *pgDumpReader) readFile(
 					break
 				}
 				count++
-				tableNameToRowsProcessed[name]++
+				tableNameToRowsProcessed[name.String()]++
 				if err != nil {
 					return wrapRowErr(err, "", count, pgcode.Uncategorized, "")
 				}
@@ -813,7 +1082,7 @@ func (m *pgDumpReader) readFile(
 						return makeRowErr("", count, pgcode.Syntax,
 							"expected %d values, got %d", expected, got)
 					}
-					if rowLimit != 0 && tableNameToRowsProcessed[name] > rowLimit {
+					if rowLimit != 0 && tableNameToRowsProcessed[name.String()] > rowLimit {
 						break
 					}
 					for i, s := range row {
@@ -821,7 +1090,10 @@ func (m *pgDumpReader) readFile(
 						if s == nil {
 							conv.Datums[idx] = tree.DNull
 						} else {
-							conv.Datums[idx], err = rowenc.ParseDatumStringAs(conv.VisibleColTypes[idx], *s, conv.EvalCtx)
+							// We use ParseAndRequireString instead of ParseDatumStringAs
+							// because postgres dumps arrays in COPY statements using their
+							// internal string representation.
+							conv.Datums[idx], _, err = tree.ParseAndRequireString(conv.VisibleColTypes[idx], *s, conv.EvalCtx)
 							if err != nil {
 								col := conv.VisibleCols[idx]
 								return wrapRowErr(err, "", count, pgcode.Syntax,
@@ -844,22 +1116,47 @@ func (m *pgDumpReader) readFile(
 			// by pg_dump, and thus if it isn't, we don't try to figure out what to do.
 			sc, ok := i.Select.(*tree.SelectClause)
 			if !ok {
-				return errors.Errorf("unsupported %T Select: %v", i.Select, i.Select)
+				err := errors.Errorf("unsupported %T Select: %v", i.Select, i.Select)
+				if m.unsupportedStmtLogger.ignoreUnsupported {
+					m.unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+					continue
+				}
+				return err
 			}
 			if len(sc.Exprs) != 1 {
-				return errors.Errorf("unsupported %d select args: %v", len(sc.Exprs), sc.Exprs)
+				err := errors.Errorf("unsupported %d select args: %v", len(sc.Exprs), sc.Exprs)
+				if m.unsupportedStmtLogger.ignoreUnsupported {
+					m.unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+					continue
+				}
+				return err
 			}
 			fn, ok := sc.Exprs[0].Expr.(*tree.FuncExpr)
 			if !ok {
-				return errors.Errorf("unsupported select arg %T: %v", sc.Exprs[0].Expr, sc.Exprs[0].Expr)
+				err := errors.Errorf("unsupported select arg %T: %v", sc.Exprs[0].Expr, sc.Exprs[0].Expr)
+				if m.unsupportedStmtLogger.ignoreUnsupported {
+					m.unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+					continue
+				}
+				return err
 			}
 
 			switch funcName := strings.ToLower(fn.Func.String()); funcName {
 			case "search_path", "pg_catalog.set_config":
-				continue
+				err := errors.Errorf("unsupported %d fn args in select: %v", len(fn.Exprs), fn.Exprs)
+				if m.unsupportedStmtLogger.ignoreUnsupported {
+					m.unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+					continue
+				}
+				return err
 			case "setval", "pg_catalog.setval":
 				if args := len(fn.Exprs); args < 2 || args > 3 {
-					return errors.Errorf("unsupported %d fn args: %v", len(fn.Exprs), fn.Exprs)
+					err := errors.Errorf("unsupported %d fn args in select: %v", len(fn.Exprs), fn.Exprs)
+					if m.unsupportedStmtLogger.ignoreUnsupported {
+						m.unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+						continue
+					}
+					return err
 				}
 				seqname, ok := fn.Exprs[0].(*tree.StrVal)
 				if !ok {
@@ -875,7 +1172,12 @@ func (m *pgDumpReader) readFile(
 				}
 				seqval, ok := fn.Exprs[1].(*tree.NumVal)
 				if !ok {
-					return errors.Errorf("unsupported setval %T arg: %v", fn.Exprs[1], fn.Exprs[1])
+					err := errors.Errorf("unsupported setval %T arg: %v", fn.Exprs[1], fn.Exprs[1])
+					if m.unsupportedStmtLogger.ignoreUnsupported {
+						m.unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+						continue
+					}
+					return err
 				}
 				val, err := seqval.AsInt64()
 				if err != nil {
@@ -885,7 +1187,12 @@ func (m *pgDumpReader) readFile(
 				if len(fn.Exprs) == 3 {
 					called, ok := fn.Exprs[2].(*tree.DBool)
 					if !ok {
-						return errors.Errorf("unsupported setval %T arg: %v", fn.Exprs[2], fn.Exprs[2])
+						err := errors.Errorf("unsupported setval %T arg: %v", fn.Exprs[2], fn.Exprs[2])
+						if m.unsupportedStmtLogger.ignoreUnsupported {
+							m.unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+							continue
+						}
+						return err
 					}
 					isCalled = bool(*called)
 				}
@@ -893,7 +1200,12 @@ func (m *pgDumpReader) readFile(
 				if err != nil {
 					break
 				}
-				seq := m.tableDescs[name.Parts[0]]
+
+				seqName := name.Parts[0]
+				if name.Schema() != "" {
+					seqName = fmt.Sprintf("%s.%s", name.Schema(), name.Object())
+				}
+				seq := m.tableDescs[seqName]
 				if seq == nil {
 					break
 				}
@@ -909,25 +1221,28 @@ func (m *pgDumpReader) readFile(
 			case "addgeometrycolumn":
 				// handled during schema extraction.
 			default:
-				return errors.Errorf("unsupported function: %s", funcName)
-			}
-		case *tree.SetVar, *tree.BeginTransaction, *tree.CommitTransaction, *tree.Analyze:
-			// ignored.
-		case *tree.CreateTable, *tree.AlterTable, *tree.CreateIndex, *tree.CreateSequence, *tree.DropTable:
-			// handled during schema extraction.
-		case *tree.Delete:
-			switch stmt := i.Table.(type) {
-			case *tree.AliasedTableExpr:
-				// ogr2ogr has `DELETE FROM geometry_columns / geography_columns ...` statements.
-				// We're not planning to support this functionality in CRDB, so it is safe to ignore it when countered in PGDUMP.
-				if tn, ok := stmt.Expr.(*tree.TableName); !(ok && (tn.Table() == "geometry_columns" || tn.Table() == "geography_columns")) {
-					return errors.Errorf("unsupported DELETE FROM %T statement: %s", stmt, stmt)
+				err := errors.Errorf("unsupported function %s in stmt %s", funcName, i.Select.String())
+				if m.unsupportedStmtLogger.ignoreUnsupported {
+					m.unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+					continue
 				}
-			default:
-				return errors.Errorf("unsupported %T statement: %s", i, i)
+				return err
 			}
+		case *tree.CreateExtension, *tree.CommentOnDatabase, *tree.CommentOnTable,
+			*tree.CommentOnIndex, *tree.CommentOnColumn, *tree.AlterSequence:
+			// handled during schema extraction.
+		case *tree.SetVar, *tree.BeginTransaction, *tree.CommitTransaction, *tree.Analyze:
+			// handled during schema extraction.
+		case *tree.CreateTable, *tree.CreateSchema, *tree.AlterTable, *tree.AlterTableOwner,
+			*tree.CreateIndex, *tree.CreateSequence, *tree.DropTable:
+			// handled during schema extraction.
 		default:
-			return errors.Errorf("unsupported %T statement: %v", i, i)
+			err := errors.Errorf("unsupported %T statement: %v", i, i)
+			if m.unsupportedStmtLogger.ignoreUnsupported {
+				m.unsupportedStmtLogger.log(err.Error(), false /* isParseError */)
+				continue
+			}
+			return err
 		}
 	}
 	for _, conv := range m.tables {

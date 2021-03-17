@@ -14,34 +14,68 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
-// invariantsChecker is a helper Operator that will check that invariants that
+// InvariantsChecker is a helper Operator that will check that invariants that
 // are present in the vectorized engine are maintained on all batches. It
 // should be planned between other Operators in tests.
-type invariantsChecker struct {
-	OneInputNode
+type InvariantsChecker struct {
+	colexecop.OneInputNode
+	colexecop.NonExplainable
+
+	initStatus     colexecop.OperatorInitStatus
+	metadataSource execinfrapb.MetadataSource
 }
 
-var _ colexecbase.Operator = invariantsChecker{}
+var _ colexecop.Operator = &InvariantsChecker{}
+var _ execinfrapb.MetadataSource
 
-// NewInvariantsChecker creates a new invariantsChecker.
-func NewInvariantsChecker(input colexecbase.Operator) colexecbase.Operator {
-	return &invariantsChecker{
-		OneInputNode: OneInputNode{input: input},
+// NewInvariantsChecker creates a new InvariantsChecker.
+func NewInvariantsChecker(input colexecop.Operator) *InvariantsChecker {
+	c := &InvariantsChecker{
+		OneInputNode: colexecop.OneInputNode{Input: input},
 	}
+	if ms, ok := input.(execinfrapb.MetadataSource); ok {
+		c.metadataSource = ms
+	}
+	return c
 }
 
-func (i invariantsChecker) Init() {
-	i.input.Init()
+// Init implements the colexecop.Operator interface.
+func (i *InvariantsChecker) Init() {
+	i.initStatus = colexecop.OperatorInitialized
+	i.Input.Init()
 }
 
-func (i invariantsChecker) Next(ctx context.Context) coldata.Batch {
-	b := i.input.Next(ctx)
+// assertInitWasCalled asserts that Init() has been called on the invariants
+// checker and returns a boolean indicating whether the execution should be
+// short-circuited (true means that the caller should just return right away).
+func (i *InvariantsChecker) assertInitWasCalled() bool {
+	if i.initStatus != colexecop.OperatorInitialized {
+		if c, ok := i.Input.(*Columnarizer); ok {
+			if c.removedFromFlow {
+				// This is a special case in which we allow for the operator to
+				// not be initialized. Next and DrainMeta calls are noops in
+				// this case, so the caller should short-circuit.
+				return true
+			}
+		}
+		colexecerror.InternalError(errors.AssertionFailedf("Init hasn't been called, input is %T", i.Input))
+	}
+	return false
+}
+
+// Next implements the colexecop.Operator interface.
+func (i *InvariantsChecker) Next(ctx context.Context) coldata.Batch {
+	if shortCircuit := i.assertInitWasCalled(); shortCircuit {
+		return coldata.ZeroBatch
+	}
+	b := i.Input.Next(ctx)
 	n := b.Length()
 	if n == 0 {
 		return b
@@ -63,4 +97,15 @@ func (i invariantsChecker) Next(ctx context.Context) coldata.Batch {
 		}
 	}
 	return b
+}
+
+// DrainMeta implements the execinfrapb.MetadataSource interface.
+func (i *InvariantsChecker) DrainMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
+	if shortCircuit := i.assertInitWasCalled(); shortCircuit {
+		return nil
+	}
+	if i.metadataSource == nil {
+		return nil
+	}
+	return i.metadataSource.DrainMeta(ctx)
 }

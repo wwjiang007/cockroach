@@ -20,9 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -61,6 +61,8 @@ func TestRevertTable(t *testing.T) {
 	targetTime, err := sql.ParseHLC(ts)
 	require.NoError(t, err)
 
+	const ignoreGC = false
+
 	t.Run("simple", func(t *testing.T) {
 		// Make some more edits: delete some rows and edit others, insert into some of
 		// the gaps made between previous rows, edit a large swath of rows and add a
@@ -79,8 +81,8 @@ func TestRevertTable(t *testing.T) {
 
 		// Revert the table to ts.
 		desc := catalogkv.TestingGetTableDescriptor(kv, keys.SystemSQLCodec, "test", "test")
-		desc.State = descpb.DescriptorState_OFFLINE // bypass the offline check.
-		require.NoError(t, sql.RevertTables(context.Background(), kv, &execCfg, []*tabledesc.Immutable{desc}, targetTime, 10))
+		desc.TableDesc().State = descpb.DescriptorState_OFFLINE // bypass the offline check.
+		require.NoError(t, sql.RevertTables(context.Background(), kv, &execCfg, []catalog.TableDescriptor{desc}, targetTime, ignoreGC, 10))
 
 		var reverted int
 		db.QueryRow(t, `SELECT xor_agg(k # rev) FROM test`).Scan(&reverted)
@@ -105,18 +107,18 @@ func TestRevertTable(t *testing.T) {
 
 		// Revert the table to ts.
 		desc := catalogkv.TestingGetTableDescriptor(kv, keys.SystemSQLCodec, "test", "test")
-		desc.State = descpb.DescriptorState_OFFLINE
+		desc.TableDesc().State = descpb.DescriptorState_OFFLINE
 		child := catalogkv.TestingGetTableDescriptor(kv, keys.SystemSQLCodec, "test", "child")
-		child.State = descpb.DescriptorState_OFFLINE
+		child.TableDesc().State = descpb.DescriptorState_OFFLINE
 		t.Run("reject only parent", func(t *testing.T) {
-			require.Error(t, sql.RevertTables(ctx, kv, &execCfg, []*tabledesc.Immutable{desc}, targetTime, 10))
+			require.Error(t, sql.RevertTables(ctx, kv, &execCfg, []catalog.TableDescriptor{desc}, targetTime, ignoreGC, 10))
 		})
 		t.Run("reject only child", func(t *testing.T) {
-			require.Error(t, sql.RevertTables(ctx, kv, &execCfg, []*tabledesc.Immutable{child}, targetTime, 10))
+			require.Error(t, sql.RevertTables(ctx, kv, &execCfg, []catalog.TableDescriptor{child}, targetTime, ignoreGC, 10))
 		})
 
 		t.Run("rollback parent and child", func(t *testing.T) {
-			require.NoError(t, sql.RevertTables(ctx, kv, &execCfg, []*tabledesc.Immutable{desc, child}, targetTime, sql.RevertTableDefaultBatchSize))
+			require.NoError(t, sql.RevertTables(ctx, kv, &execCfg, []catalog.TableDescriptor{desc, child}, targetTime, ignoreGC, sql.RevertTableDefaultBatchSize))
 
 			var reverted, revertedChild int
 			db.QueryRow(t, `SELECT xor_agg(k # rev) FROM test`).Scan(&reverted)
@@ -129,6 +131,7 @@ func TestRevertTable(t *testing.T) {
 
 func TestRevertGCThreshold(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
@@ -143,4 +146,7 @@ func TestRevertGCThreshold(t *testing.T) {
 	if !testutils.IsPError(pErr, "must be after replica GC threshold") {
 		t.Fatalf(`expected "must be after replica GC threshold" error got: %+v`, pErr)
 	}
+	req.IgnoreGcThreshold = true
+	_, pErr = kv.SendWrapped(ctx, kvDB.NonTransactionalSender(), req)
+	require.Nil(t, pErr)
 }

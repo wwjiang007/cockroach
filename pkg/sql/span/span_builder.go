@@ -17,10 +17,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -34,7 +33,7 @@ import (
 type Builder struct {
 	evalCtx       *tree.EvalContext
 	codec         keys.SQLCodec
-	table         *tabledesc.Immutable
+	table         catalog.TableDescriptor
 	index         *descpb.IndexDescriptor
 	indexColTypes []*types.T
 	indexColDirs  []descpb.IndexDescriptor_Direction
@@ -60,7 +59,7 @@ var _ = (*Builder).UnsetNeededFamilies
 func MakeBuilder(
 	evalCtx *tree.EvalContext,
 	codec keys.SQLCodec,
-	table *tabledesc.Immutable,
+	table catalog.TableDescriptor,
 	index *descpb.IndexDescriptor,
 ) *Builder {
 	s := &Builder{
@@ -77,12 +76,10 @@ func MakeBuilder(
 	columnIDs, s.indexColDirs = index.FullColumnIDs()
 	s.indexColTypes = make([]*types.T, len(columnIDs))
 	for i, colID := range columnIDs {
+		col, _ := table.FindColumnWithID(colID)
 		// TODO (rohany): do I need to look at table columns with mutations here as well?
-		for _, col := range table.Columns {
-			if col.ID == colID {
-				s.indexColTypes[i] = col.Type
-				break
-			}
+		if col != nil && col.Public() {
+			s.indexColTypes[i] = col.GetType()
 		}
 	}
 
@@ -102,7 +99,7 @@ func MakeBuilder(
 				s.interstices[sharedPrefixLen])
 		}
 		s.interstices[sharedPrefixLen] = rowenc.EncodePartialTableIDIndexID(
-			s.interstices[sharedPrefixLen], table.ID, index.ID)
+			s.interstices[sharedPrefixLen], table.GetID(), index.ID)
 	}
 
 	return s
@@ -134,10 +131,12 @@ func (s *Builder) UnsetNeededFamilies() {
 	s.neededFamilies = nil
 }
 
-// SpanFromEncDatums encodes a span with prefixLen constraint columns from the index.
-// SpanFromEncDatums assumes that the EncDatums in values are in the order of the index columns.
-// It also returns whether or not the input values contain a null value or not, which can be
-// used as input for CanSplitSpanIntoSeparateFamilies.
+// SpanFromEncDatums encodes a span with prefixLen constraint columns from the
+// index prefixed with the index key prefix that includes the table and index
+// ID. SpanFromEncDatums assumes that the EncDatums in values are in the order
+// of the index columns. It also returns whether or not the input values contain
+// a null value or not, which can be used as input for
+// CanSplitSpanIntoSeparateFamilies.
 func (s *Builder) SpanFromEncDatums(
 	values rowenc.EncDatumRow, prefixLen int,
 ) (_ roachpb.Span, containsNull bool, _ error) {
@@ -193,7 +192,11 @@ func (s *Builder) CanSplitSpanIntoSeparateFamilies(
 	//   and it cannot be an inverted index.
 	// * We have all of the lookup columns of the index.
 	// * We don't need all of the families.
-	return s.index.Unique && len(s.table.Families) > 1 &&
+	// * The table is not a special system table. (System tables claim to have
+	//   column families, but actually do not, since they're written to with
+	//   raw KV puts in a "legacy" way.)
+	isSystemTable := s.table.GetID() > 0 && s.table.GetID() < keys.MaxReservedDescID
+	return !isSystemTable && s.index.Unique && len(s.table.GetFamilies()) > 1 &&
 		(s.index.ID == s.table.GetPrimaryIndexID() ||
 			// Secondary index specific checks.
 			(s.index.Version >= descpb.SecondaryIndexFamilyFormatVersion &&
@@ -201,7 +204,7 @@ func (s *Builder) CanSplitSpanIntoSeparateFamilies(
 				len(s.index.StoreColumnIDs) > 0 &&
 				s.index.Type == descpb.IndexDescriptor_FORWARD)) &&
 		prefixLen == len(s.index.ColumnIDs) &&
-		numNeededFamilies < len(s.table.Families)
+		numNeededFamilies < len(s.table.GetFamilies())
 }
 
 // Functions for optimizer related span generation are below.
@@ -313,25 +316,9 @@ func (s *Builder) encodeConstraintKey(
 			}
 		}
 
-		if s.index.Type == descpb.IndexDescriptor_INVERTED {
-			keys, err := rowenc.EncodeInvertedIndexTableKeys(val, key, s.index.Version)
-			if err != nil {
-				return nil, false, err
-			}
-			if len(keys) == 0 {
-				err := errors.AssertionFailedf("trying to use null key in index lookup")
-				return nil, false, err
-			}
-			if len(keys) > 1 {
-				err := errors.AssertionFailedf("trying to use multiple keys in index lookup")
-				return nil, false, err
-			}
-			key = keys[0]
-		} else {
-			key, err = rowenc.EncodeTableKey(key, val, dir)
-			if err != nil {
-				return nil, false, err
-			}
+		key, err = rowenc.EncodeTableKey(key, val, dir)
+		if err != nil {
+			return nil, false, err
 		}
 	}
 	return key, containsNull, nil
@@ -350,8 +337,8 @@ type InvertedSpans interface {
 	End(i int) []byte
 }
 
-var _ InvertedSpans = invertedexpr.InvertedSpans{}
-var _ InvertedSpans = invertedexpr.SpanExpressionProtoSpans{}
+var _ InvertedSpans = inverted.Spans{}
+var _ InvertedSpans = inverted.SpanExpressionProtoSpans{}
 
 // SpansFromInvertedSpans constructs spans to scan an inverted index.
 //

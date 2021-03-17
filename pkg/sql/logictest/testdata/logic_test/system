@@ -10,35 +10,36 @@ test       root  NULL  {}  NULL
 query TTTTIT
 SHOW TABLES FROM system
 ----
-public  comments                         table  NULL  NULL  NULL
-public  descriptor                       table  NULL  NULL  NULL
-public  eventlog                         table  NULL  NULL  NULL
-public  jobs                             table  NULL  NULL  NULL
-public  lease                            table  NULL  NULL  NULL
-public  locations                        table  NULL  NULL  NULL
-public  namespace                        table  NULL  NULL  NULL
-public  namespace2                       table  NULL  NULL  NULL
-public  protected_ts_meta                table  NULL  NULL  NULL
-public  protected_ts_records             table  NULL  NULL  NULL
-public  rangelog                         table  NULL  NULL  NULL
-public  replication_constraint_stats     table  NULL  NULL  NULL
-public  replication_critical_localities  table  NULL  NULL  NULL
-public  replication_stats                table  NULL  NULL  NULL
-public  reports_meta                     table  NULL  NULL  NULL
-public  role_members                     table  NULL  NULL  NULL
-public  role_options                     table  NULL  NULL  NULL
-public  scheduled_jobs                   table  NULL  NULL  NULL
-public  settings                         table  NULL  NULL  NULL
-public  sqlliveness                      table  NULL  NULL  NULL
-public  statement_bundle_chunks          table  NULL  NULL  NULL
-public  statement_diagnostics            table  NULL  NULL  NULL
-public  statement_diagnostics_requests   table  NULL  NULL  NULL
-public  table_statistics                 table  NULL  NULL  NULL
-public  tenants                          table  NULL  NULL  NULL
-public  ui                               table  NULL  NULL  NULL
-public  users                            table  NULL  NULL  NULL
-public  web_sessions                     table  NULL  NULL  NULL
-public  zones                            table  NULL  NULL  NULL
+public  comments                         table  NULL  0  NULL
+public  descriptor                       table  NULL  0  NULL
+public  eventlog                         table  NULL  0  NULL
+public  jobs                             table  NULL  0  NULL
+public  lease                            table  NULL  0  NULL
+public  locations                        table  NULL  0  NULL
+public  migrations                       table  NULL  0  NULL
+public  namespace                        table  NULL  0  NULL
+public  namespace2                       table  NULL  0  NULL
+public  protected_ts_meta                table  NULL  0  NULL
+public  protected_ts_records             table  NULL  0  NULL
+public  rangelog                         table  NULL  0  NULL
+public  replication_constraint_stats     table  NULL  0  NULL
+public  replication_critical_localities  table  NULL  0  NULL
+public  replication_stats                table  NULL  0  NULL
+public  reports_meta                     table  NULL  0  NULL
+public  role_members                     table  NULL  0  NULL
+public  role_options                     table  NULL  0  NULL
+public  scheduled_jobs                   table  NULL  0  NULL
+public  settings                         table  NULL  0  NULL
+public  sqlliveness                      table  NULL  0  NULL
+public  statement_bundle_chunks          table  NULL  0  NULL
+public  statement_diagnostics            table  NULL  0  NULL
+public  statement_diagnostics_requests   table  NULL  0  NULL
+public  table_statistics                 table  NULL  0  NULL
+public  tenants                          table  NULL  0  NULL
+public  ui                               table  NULL  0  NULL
+public  users                            table  NULL  0  NULL
+public  web_sessions                     table  NULL  0  NULL
+public  zones                            table  NULL  0  NULL
 
 query I rowsort
 SELECT id FROM system.descriptor
@@ -73,9 +74,21 @@ SELECT id FROM system.descriptor
 36
 37
 39
+40
 50
 51
 52
+
+# Verify we can read ID on its own (see #58614).
+query I
+SELECT id FROM system.descriptor WHERE id=1
+----
+1
+
+query I
+SELECT id FROM (VALUES(1)) AS v(a) INNER LOOKUP JOIN system.descriptor on id=a
+----
+1
 
 # Verify we can read "protobuf" columns.
 query I
@@ -235,6 +248,16 @@ system  public  locations                        root    GRANT
 system  public  locations                        root    INSERT
 system  public  locations                        root    SELECT
 system  public  locations                        root    UPDATE
+system  public  migrations                       admin   DELETE
+system  public  migrations                       admin   GRANT
+system  public  migrations                       admin   INSERT
+system  public  migrations                       admin   SELECT
+system  public  migrations                       admin   UPDATE
+system  public  migrations                       root    DELETE
+system  public  migrations                       root    GRANT
+system  public  migrations                       root    INSERT
+system  public  migrations                       root    SELECT
+system  public  migrations                       root    UPDATE
 system  public  namespace                        admin   GRANT
 system  public  namespace                        admin   SELECT
 system  public  namespace                        root    GRANT
@@ -445,110 +468,110 @@ DROP DATABASE system
 statement error user root does not have DROP privilege on relation users
 DROP TABLE system.users
 
-statement error user root does not have ALL privilege on database system
+statement error pq: cannot GRANT on system object
 GRANT ALL ON DATABASE system TO testuser
 
-statement error user root does not have INSERT privilege on database system
+statement error pq: cannot GRANT on system object
 GRANT GRANT, SELECT, INSERT ON DATABASE system TO testuser
 
-statement ok
+statement error pq: cannot GRANT on system object
 GRANT GRANT, SELECT ON DATABASE system TO testuser
 
-statement error user root does not have ALL privilege on relation namespace
+statement error pq: cannot GRANT on system object
 GRANT ALL ON system.namespace TO testuser
 
-statement error user root does not have INSERT privilege on relation namespace
+statement error pq: cannot GRANT on system object
 GRANT GRANT, SELECT, INSERT ON system.namespace TO testuser
 
-statement ok
+statement error pq: cannot GRANT on system object
 GRANT GRANT, SELECT ON system.namespace TO testuser
 
-statement ok
+statement error pq: cannot GRANT on system object
 GRANT SELECT ON system.descriptor TO testuser
 
 # Superusers must have exactly the allowed privileges.
-statement error user root does not have ALL privilege on database system
+statement error pq: cannot GRANT on system object
 GRANT ALL ON DATABASE system TO root
 
-statement error user root does not have DELETE privilege on database system
+statement error pq: cannot GRANT on system object
 GRANT DELETE, INSERT ON DATABASE system TO root
 
-statement error user root does not have ALL privilege on relation namespace
+statement error pq: cannot GRANT on system object
 GRANT ALL ON system.namespace TO root
 
-statement error user root does not have DELETE privilege on relation descriptor
+statement error pq: cannot GRANT on system object
 GRANT DELETE, INSERT ON system.descriptor TO root
 
-statement error user root does not have ALL privilege on relation descriptor
+statement error pq: cannot GRANT on system object
 GRANT ALL ON system.descriptor TO root
 
-statement error user root must have exactly GRANT, SELECT privileges on system database with ID=.*
+statement error pq: cannot REVOKE on system object
 REVOKE GRANT ON DATABASE system FROM root
 
-statement error user root must have exactly GRANT, SELECT privileges on system table with ID=.*
+statement error pq: cannot REVOKE on system object
 REVOKE GRANT ON system.namespace FROM root
 
-statement error user root does not have ALL privilege on relation namespace
+statement error pq: cannot REVOKE on system object
 REVOKE ALL ON system.namespace FROM root
 
-statement error user root does not have privileges over system table with ID=.*
+statement error pq: cannot REVOKE on system object
 REVOKE GRANT,SELECT ON system.namespace FROM root
 
-statement error user root does not have ALL privilege on database system
+statement error pq: cannot GRANT on system object
 GRANT ALL ON DATABASE system TO admin
 
-statement error user root does not have DELETE privilege on database system
+statement error pq: cannot GRANT on system object
 GRANT DELETE, INSERT ON DATABASE system TO admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system database with ID=.*
+statement error pq: cannot REVOKE on system object
 REVOKE GRANT ON DATABASE system FROM admin
 
-statement error user root does not have ALL privilege on relation namespace
+statement error pq: cannot GRANT on system object
 GRANT ALL ON system.namespace TO admin
 
-statement error user root does not have DELETE privilege on relation descriptor
+statement error pq: cannot GRANT on system object
 GRANT DELETE, INSERT ON system.descriptor TO admin
 
-statement error user root does not have ALL privilege on relation descriptor
+statement error pq: cannot GRANT on system object
 GRANT ALL ON system.descriptor TO admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system table with ID=.*
+statement error pq: cannot REVOKE on system object
 REVOKE GRANT ON system.descriptor FROM admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system database with ID=.*
+statement error pq: cannot REVOKE on system object
 REVOKE GRANT ON DATABASE system FROM admin
 
-statement error user admin must have exactly GRANT, SELECT privileges on system table with ID=.*
+statement error pq: cannot REVOKE on system object
 REVOKE GRANT ON system.namespace FROM admin
 
-statement error user root does not have ALL privilege on relation namespace
+statement error pq: cannot REVOKE on system object
 REVOKE ALL ON system.namespace FROM admin
 
-statement error user admin does not have privileges over system table with ID=.*
+statement error pq: cannot REVOKE on system object
 REVOKE GRANT,SELECT ON system.namespace FROM admin
 
 # Some tables (we test system.lease here) used to allow multiple privilege sets for
 # backwards compatibility, and superusers were allowed very wide privileges.
 # We make sure this is no longer the case.
-statement error user root does not have ALL privilege on relation lease
+statement error pq: cannot GRANT on system object
 GRANT ALL ON system.lease TO testuser
 
-statement error user root does not have CREATE privilege on relation lease
+statement error pq: cannot GRANT on system object
 GRANT CREATE on system.lease to root
 
-statement error user root does not have CREATE privilege on relation lease
+statement error pq: cannot GRANT on system object
 GRANT CREATE on system.lease to admin
 
-statement error user root does not have CREATE privilege on relation lease
+statement error pq: cannot GRANT on system object
 GRANT CREATE on system.lease to testuser
 
-statement error user root does not have ALL privilege on relation lease
+statement error pq: cannot GRANT on system object
 GRANT ALL ON system.lease TO root
 
-statement error user root does not have ALL privilege on relation lease
+statement error pq: cannot GRANT on system object
 GRANT ALL ON system.lease TO admin
 
-statement error user root does not have ALL privilege on relation lease
+statement error pq: cannot GRANT on system object
 GRANT ALL ON system.lease TO testuser
 
 # NB: the "order by" is necessary or this test is flaky under DistSQL.
@@ -566,6 +589,8 @@ ORDER BY name
 cluster.secret
 diagnostics.reporting.enabled
 kv.range_merge.queue_enabled
+sql.crdb_internal.table_row_statistics.as_of_time
+sql.defaults.interleaved_tables.enabled
 sql.stats.automatic_collection.min_stale_rows
 version
 
@@ -581,10 +606,12 @@ WHERE name NOT IN ('version', 'sql.defaults.distsql', 'cluster.secret',
   'sql.defaults.experimental_distsql_planning')
 ORDER BY name
 ----
-diagnostics.reporting.enabled                  true
-kv.range_merge.queue_enabled                   false
-somesetting                                    somevalue
-sql.stats.automatic_collection.min_stale_rows  5
+diagnostics.reporting.enabled                      true
+kv.range_merge.queue_enabled                       false
+somesetting                                        somevalue
+sql.crdb_internal.table_row_statistics.as_of_time  -1µs
+sql.defaults.interleaved_tables.enabled            true
+sql.stats.automatic_collection.min_stale_rows      5
 
 user testuser
 
@@ -600,3 +627,18 @@ query TTB
 SELECT * from system.role_members
 ----
 admin  root  true
+
+statement ok
+SET DATABASE = "";
+
+query T
+SELECT username FROM system.users WHERE username = 'root'
+----
+root
+
+statement ok
+SET DATABASE = test
+
+# system is a database, not a schema.
+query error relation ".system.users" does not exist
+SELECT username FROM "".system.users WHERE username = 'root'

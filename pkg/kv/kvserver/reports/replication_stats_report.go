@@ -111,15 +111,17 @@ func (r *replicationStatsReportSaver) loadPreviousVersion(
 	const prevViolations = "select zone_id, subzone_id, total_ranges, " +
 		"unavailable_ranges, under_replicated_ranges, over_replicated_ranges " +
 		"from system.replication_stats"
-	rows, err := ex.Query(
+	it, err := ex.QueryIterator(
 		ctx, "get-previous-replication-stats", txn, prevViolations,
 	)
 	if err != nil {
 		return err
 	}
 
-	r.previousVersion = make(RangeReport, len(rows))
-	for _, row := range rows {
+	r.previousVersion = make(RangeReport)
+	var ok bool
+	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+		row := it.Cur()
 		key := ZoneKey{}
 		key.ZoneID = (config.SystemTenantObjectID)(*row[0].(*tree.DInt))
 		key.SubzoneID = base.SubzoneID(*row[1].(*tree.DInt))
@@ -130,8 +132,7 @@ func (r *replicationStatsReportSaver) loadPreviousVersion(
 			(int32)(*row[5].(*tree.DInt)),
 		}
 	}
-
-	return nil
+	return err
 }
 
 func (r *replicationStatsReportSaver) updateTimestamp(
@@ -388,9 +389,9 @@ func (v *replicationStatsVisitor) visitSameZone(ctx context.Context, r *roachpb.
 func (v *replicationStatsVisitor) countRange(
 	key ZoneKey, replicationFactor int, r *roachpb.RangeDescriptor,
 ) {
-	voters := len(r.Replicas().Voters())
+	voters := len(r.Replicas().VoterDescriptors())
 	var liveVoters int
-	for _, rep := range r.Replicas().Voters() {
+	for _, rep := range r.Replicas().VoterDescriptors() {
 		if v.nodeChecker(rep.NodeID) {
 			liveVoters++
 		}

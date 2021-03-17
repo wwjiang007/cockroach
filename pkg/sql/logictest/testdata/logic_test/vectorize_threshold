@@ -66,9 +66,10 @@ distribution: full
 vectorized: false
 ·
 • group (scalar)
+│ estimated row count: 1
 │
 └── • scan
-      estimated row count: 100
+      estimated row count: 100 (100% of the table; stats collected <hidden> ago)
       table: small@primary
       spans: FULL SCAN
 
@@ -84,9 +85,10 @@ distribution: full
 vectorized: true
 ·
 • group (scalar)
+│ estimated row count: 1
 │
 └── • scan
-      estimated row count: 100
+      estimated row count: 100 (100% of the table; stats collected <hidden> ago)
       table: small@primary
       spans: FULL SCAN
 
@@ -114,9 +116,10 @@ distribution: full
 vectorized: true
 ·
 • group (scalar)
+│ estimated row count: 1
 │
 └── • scan
-      estimated row count: 100,000
+      estimated row count: 100,000 (100% of the table; stats collected <hidden> ago)
       table: large@primary
       spans: FULL SCAN
 
@@ -132,9 +135,10 @@ distribution: full
 vectorized: false
 ·
 • group (scalar)
+│ estimated row count: 1
 │
 └── • scan
-      estimated row count: 100,000
+      estimated row count: 100,000 (100% of the table; stats collected <hidden> ago)
       table: large@primary
       spans: FULL SCAN
 
@@ -150,16 +154,17 @@ distribution: full
 vectorized: true
 ·
 • merge join
+│ estimated row count: 100
 │ equality: (a) = (a)
 │ left cols are key
 │ right cols are key
 │
 ├── • scan
-│     estimated row count: 100
+│     estimated row count: 100 (100% of the table; stats collected <hidden> ago)
 │     table: small@primary
 │     spans: FULL SCAN
 │
 └── • scan
-      estimated row count: 100,000
+      estimated row count: 100,000 (100% of the table; stats collected <hidden> ago)
       table: large@primary
       spans: FULL SCAN

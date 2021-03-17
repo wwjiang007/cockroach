@@ -37,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -186,7 +185,7 @@ func backup(
 	g := ctxgroup.WithContext(ctx)
 	pkIDs := make(map[uint64]bool)
 	for i := range backupManifest.Descriptors {
-		if t := descpb.TableFromDescriptor(&backupManifest.Descriptors[i], hlc.Timestamp{}); t != nil {
+		if t, _, _, _ := descpb.FromDescriptor(&backupManifest.Descriptors[i]); t != nil {
 			pkIDs[roachpb.BulkOpSummaryID(uint64(t.ID), uint64(t.PrimaryIndex.ID))] = true
 		}
 	}
@@ -327,11 +326,19 @@ func backup(
 	}
 	var tableStatistics []*stats.TableStatisticProto
 	for i := range backupManifest.Descriptors {
-		if tableDesc := descpb.TableFromDescriptor(&backupManifest.Descriptors[i], hlc.Timestamp{}); tableDesc != nil {
+		if tableDesc, _, _, _ := descpb.FromDescriptor(&backupManifest.Descriptors[i]); tableDesc != nil {
 			// Collect all the table stats for this table.
 			tableStatisticsAcc, err := statsCache.GetTableStats(ctx, tableDesc.GetID())
 			if err != nil {
-				return RowCount{}, err
+				// Successfully backed up data is more valuable than table stats that can
+				// be recomputed after restore, and so if we fail to collect the stats of a
+				// table we do not want to mark the job as failed.
+				// The lack of stats on restore could lead to suboptimal performance when
+				// reading/writing to this table until the stats have been recomputed.
+				log.Warningf(ctx, "failed to collect stats for table: %s, "+
+					"table ID: %d during a backup: %s", tableDesc.GetName(), tableDesc.GetID(),
+					err.Error())
+				continue
 			}
 			for _, stat := range tableStatisticsAcc {
 				tableStatistics = append(tableStatistics, &stat.TableStatisticProto)
@@ -369,7 +376,8 @@ func (b *backupResumer) releaseProtectedTimestamp(
 }
 
 type backupResumer struct {
-	job *jobs.Job
+	job         *jobs.Job
+	backupStats RowCount
 
 	testingKnobs struct {
 		ignoreProtectedTimestamps bool
@@ -377,9 +385,7 @@ type backupResumer struct {
 }
 
 // Resume is part of the jobs.Resumer interface.
-func (b *backupResumer) Resume(
-	ctx context.Context, execCtx interface{}, resultsCh chan<- tree.Datums,
-) error {
+func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	details := b.job.Details().(jobspb.BackupDetails)
 	p := execCtx.(sql.JobExecContext)
 
@@ -430,15 +436,6 @@ func (b *backupResumer) Resume(
 	backupManifest, err := b.readManifestOnResume(ctx, p.ExecCfg(), defaultStore, details)
 	if err != nil {
 		return err
-	}
-
-	numClusterNodes, err := clusterNodeCount(p.ExecCfg().Gossip)
-	if err != nil {
-		if !build.IsRelease() && p.ExecCfg().Codec.ForSystemTenant() {
-			return err
-		}
-		log.Warningf(ctx, "unable to determine cluster node count: %v", err)
-		numClusterNodes = 1
 	}
 
 	statsCache := p.ExecCfg().TableStatsCache
@@ -501,17 +498,19 @@ func (b *backupResumer) Resume(
 		}
 	}
 
-	resultsCh <- tree.Datums{
-		tree.NewDInt(tree.DInt(*b.job.ID())),
-		tree.NewDString(string(jobs.StatusSucceeded)),
-		tree.NewDFloat(tree.DFloat(1.0)),
-		tree.NewDInt(tree.DInt(res.Rows)),
-		tree.NewDInt(tree.DInt(res.IndexEntries)),
-		tree.NewDInt(tree.DInt(res.DataSize)),
-	}
+	b.backupStats = res
 
 	// Collect telemetry.
 	{
+		numClusterNodes, err := clusterNodeCount(p.ExecCfg().Gossip)
+		if err != nil {
+			if !build.IsRelease() && p.ExecCfg().Codec.ForSystemTenant() {
+				return err
+			}
+			log.Warningf(ctx, "unable to determine cluster node count: %v", err)
+			numClusterNodes = 1
+		}
+
 		telemetry.Count("backup.total.succeeded")
 		const mb = 1 << 20
 		sizeMb := res.DataSize / mb
@@ -537,6 +536,23 @@ func (b *backupResumer) Resume(
 	return nil
 }
 
+// ReportResults implements JobResultsReporter interface.
+func (b *backupResumer) ReportResults(ctx context.Context, resultsCh chan<- tree.Datums) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case resultsCh <- tree.Datums{
+		tree.NewDInt(tree.DInt(b.job.ID())),
+		tree.NewDString(string(jobs.StatusSucceeded)),
+		tree.NewDFloat(tree.DFloat(1.0)),
+		tree.NewDInt(tree.DInt(b.backupStats.Rows)),
+		tree.NewDInt(tree.DInt(b.backupStats.IndexEntries)),
+		tree.NewDInt(tree.DInt(b.backupStats.DataSize)),
+	}:
+		return nil
+	}
+}
+
 func (b *backupResumer) readManifestOnResume(
 	ctx context.Context,
 	cfg *sql.ExecutorConfig,
@@ -555,7 +571,7 @@ func (b *backupResumer) readManifestOnResume(
 			return nil, errors.Wrapf(err, "reading backup checkpoint")
 		}
 		// Try reading temp checkpoint.
-		tmpCheckpoint := tempCheckpointFileNameForJob(*b.job.ID())
+		tmpCheckpoint := tempCheckpointFileNameForJob(b.job.ID())
 		desc, err = readBackupManifest(ctx, defaultStore, tmpCheckpoint, details.EncryptionOptions)
 		if err != nil {
 			return nil, err
@@ -601,7 +617,7 @@ func (b *backupResumer) maybeNotifyScheduledJobCompletion(
 			fmt.Sprintf(
 				"SELECT created_by_id FROM %s WHERE id=$1 AND created_by_type=$2",
 				env.SystemJobsTableName()),
-			*b.job.ID(), jobs.CreatedByScheduledJobs)
+			b.job.ID(), jobs.CreatedByScheduledJobs)
 
 		if err != nil {
 			return errors.Wrap(err, "schedule info lookup")
@@ -613,10 +629,10 @@ func (b *backupResumer) maybeNotifyScheduledJobCompletion(
 
 		scheduleID := int64(tree.MustBeDInt(datums[0]))
 		if err := jobs.NotifyJobTermination(
-			ctx, env, *b.job.ID(), jobStatus, b.job.Details(), scheduleID, exec.InternalExecutor, txn); err != nil {
+			ctx, env, b.job.ID(), jobStatus, b.job.Details(), scheduleID, exec.InternalExecutor, txn); err != nil {
 			log.Warningf(ctx,
 				"failed to notify schedule %d of completion of job %d; err=%s",
-				scheduleID, *b.job.ID(), err)
+				scheduleID, b.job.ID(), err)
 		}
 		return nil
 	}); err != nil {

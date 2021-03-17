@@ -165,14 +165,13 @@ func (m *Manager) PublishMultiple(
 			for _, id := range ids {
 				// Re-read the current versions of the descriptor, this time
 				// transactionally.
-				desc, err := catalogkv.GetDescriptorByID(ctx, txn, m.storage.codec, id, catalogkv.Mutable,
-					catalogkv.AnyDescriptorKind, true /* required */)
+				desc, err := catalogkv.MustGetMutableDescriptorByID(ctx, txn, m.storage.codec, id)
 				// Due to details in #51417, it is possible for a user to request a
 				// descriptor which no longer exists. In that case, just return an error.
 				if err != nil {
 					return err
 				}
-				descsToUpdate[id] = desc.(catalog.MutableDescriptor)
+				descsToUpdate[id] = desc
 				if expectedVersions[id] != desc.GetVersion() {
 					// The version changed out from under us. Someone else must be
 					// performing a schema change operation.
@@ -270,7 +269,8 @@ func (m *Manager) Publish(
 	updates := func(_ *kv.Txn, descs map[descpb.ID]catalog.MutableDescriptor) error {
 		desc, ok := descs[id]
 		if !ok {
-			return errors.AssertionFailedf("required descriptor with ID %d not provided to update closure", id)
+			return errors.AssertionFailedf(
+				"required descriptor with ID %d not provided to update closure", id)
 		}
 		return update(desc)
 	}

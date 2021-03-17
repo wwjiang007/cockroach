@@ -13,6 +13,7 @@ package typedesc_test
 import (
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
@@ -27,7 +28,7 @@ func TestSafeMessage(t *testing.T) {
 		exp  string
 	}{
 		{
-			desc: typedesc.NewImmutable(descpb.TypeDescriptor{
+			desc: typedesc.NewBuilder(&descpb.TypeDescriptor{
 				Name:    "foo",
 				ID:      21,
 				Version: 3,
@@ -38,20 +39,20 @@ func TestSafeMessage(t *testing.T) {
 						Name:           "bar",
 					},
 				},
-				Privileges:               &descpb.PrivilegeDescriptor{},
+				Privileges:               descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
 				ParentID:                 2,
 				ParentSchemaID:           29,
 				ArrayTypeID:              117,
 				State:                    descpb.DescriptorState_PUBLIC,
 				Kind:                     descpb.TypeDescriptor_ALIAS,
 				ReferencingDescriptorIDs: []descpb.ID{73, 37},
-			}),
+			}).BuildImmutableType(),
 			exp: `typedesc.Immutable: {ID: 21, Version: 3, ModificationTime: "0,0", ` +
 				`ParentID: 2, ParentSchemaID: 29, State: PUBLIC, NumDrainingNames: 1, ` +
 				`Kind: ALIAS, ArrayTypeID: 117, ReferencingDescriptorIDs: [73, 37]}`,
 		},
 		{
-			desc: typedesc.NewImmutable(descpb.TypeDescriptor{
+			desc: typedesc.NewBuilder(&descpb.TypeDescriptor{
 				Name:    "foo",
 				ID:      21,
 				Version: 3,
@@ -62,7 +63,7 @@ func TestSafeMessage(t *testing.T) {
 						Name:           "bar",
 					},
 				},
-				Privileges:               &descpb.PrivilegeDescriptor{},
+				Privileges:               descpb.NewDefaultPrivilegeDescriptor(security.RootUserName()),
 				ParentID:                 2,
 				ParentSchemaID:           29,
 				ArrayTypeID:              117,
@@ -72,7 +73,7 @@ func TestSafeMessage(t *testing.T) {
 				EnumMembers: []descpb.TypeDescriptor_EnumMember{
 					{},
 				},
-			}),
+			}).BuildImmutableType(),
 			exp: `typedesc.Immutable: {ID: 21, Version: 3, ModificationTime: "0,0", ` +
 				`ParentID: 2, ParentSchemaID: 29, State: PUBLIC, NumDrainingNames: 1, ` +
 				`Kind: ENUM, NumEnumMembers: 1, ArrayTypeID: 117, ReferencingDescriptorIDs: [73, 37]}`,

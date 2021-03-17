@@ -15,13 +15,15 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/stretchr/testify/require"
 )
 
 // TestTxnRecoveryFromStaging tests the recovery process for a transaction that
@@ -46,6 +48,10 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 		// both pushes by the timestamp cache, and by deferred write-too-old
 		// conditions.
 		writeTooOld bool
+		// futureWrites dictates whether the transaction has been writing at the
+		// present time or whether it has been writing into the future with a
+		// synthetic timestamp.
+		futureWrites bool
 	}{
 		{
 			implicitCommit: true,
@@ -58,14 +64,44 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 			implicitCommit: false,
 			writeTooOld:    true,
 		},
+		{
+			implicitCommit: true,
+			futureWrites:   true,
+		},
+		{
+			implicitCommit: false,
+			writeTooOld:    false,
+			futureWrites:   true,
+		},
+		{
+			implicitCommit: false,
+			writeTooOld:    true,
+			futureWrites:   true,
+		},
 	} {
-		t.Run(fmt.Sprintf("%d-commit:%t,writeTooOld:%t", i, tc.writeTooOld, tc.implicitCommit), func(t *testing.T) {
+		name := fmt.Sprintf("%d-commit:%t,writeTooOld:%t,futureWrites:%t", i, tc.implicitCommit, tc.writeTooOld, tc.futureWrites)
+		t.Run(name, func(t *testing.T) {
 			stopper := stop.NewStopper()
 			defer stopper.Stop(ctx)
-			store, manual := createTestStore(t, testStoreOpts{createSystemRanges: true}, stopper)
+			manual := hlc.NewManualClock(123)
+			cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+			// Set the RecoverIndeterminateCommitsOnFailedPushes flag to true so
+			// that a push on a STAGING transaction record immediately launches
+			// the transaction recovery process.
+			cfg.TestingKnobs.EvalKnobs.RecoverIndeterminateCommitsOnFailedPushes = true
+			store := createTestStoreWithConfig(t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 
 			// Create a transaction that will get stuck performing a parallel commit.
 			txn := newTransaction("txn", keyA, 1, store.Clock())
+
+			// If the transaction is writing into the future, bump its write
+			// timestamp. Also, bump its read timestamp to simulate a situation
+			// where it has refreshed up to its write timestamp in preparation
+			// to commit.
+			if tc.futureWrites {
+				txn.WriteTimestamp = txn.ReadTimestamp.Add(50, 0).WithSynthetic(true)
+				txn.ReadTimestamp = txn.WriteTimestamp // simulate refresh
+			}
 
 			// Issue two writes, which will be considered in-flight at the time of
 			// the transaction's EndTxn request.
@@ -78,17 +114,19 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 			}
 
 			// If we don't want this transaction to commit successfully, perform a
-			// read on keyB to prevent the transaction's write to keyB from writing
-			// at its desired timestamp. This prevents an implicit commit state.
+			// conflicting operation on keyB to prevent the transaction's write to
+			// keyB from writing at its desired timestamp. This prevents an implicit
+			// commit state.
+			conflictH := roachpb.Header{Timestamp: txn.WriteTimestamp.Next()}
 			if !tc.implicitCommit {
 				if !tc.writeTooOld {
 					gArgs := getArgs(keyB)
-					if _, pErr := kv.SendWrapped(ctx, store.TestSender(), &gArgs); pErr != nil {
+					if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), conflictH, &gArgs); pErr != nil {
 						t.Fatal(pErr)
 					}
 				} else {
 					pArgs = putArgs(keyB, []byte("pusher val"))
-					if _, pErr := kv.SendWrapped(ctx, store.TestSender(), &pArgs); pErr != nil {
+					if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), conflictH, &pArgs); pErr != nil {
 						t.Fatal(pErr)
 					}
 				}
@@ -115,15 +153,15 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 				t.Fatalf("expected STAGING txn, found %v", replyTxn)
 			}
 
-			// Pretend the transaction coordinator for the parallel commit died at this point.
-			// Wait for longer than the TxnLivenessThreshold and then issue a read on one of
-			// the keys that the transaction wrote. This will result in a transaction push and
-			// eventually a full transaction recovery in order to resolve the indeterminate
-			// commit.
-			manual.Increment(txnwait.TxnLivenessThreshold.Nanoseconds() + 1)
+			// Pretend the transaction coordinator for the parallel commit died at this
+			// point. Typically, we would have to wait out the TxnLivenessThreshold. But
+			// since we set RecoverIndeterminateCommitsOnFailedPushes, we don't need to
+			// wait. So issue a read on one of the keys that the transaction wrote. This
+			// will result in a transaction push and eventually a full transaction
+			// recovery in order to resolve the indeterminate commit.
 
 			gArgs := getArgs(keyA)
-			gReply, pErr := kv.SendWrapped(ctx, store.TestSender(), &gArgs)
+			gReply, pErr := kv.SendWrappedWith(ctx, store.TestSender(), conflictH, &gArgs)
 			if pErr != nil {
 				t.Fatal(pErr)
 			}
@@ -157,4 +195,91 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTxnClearRangeIntents tests whether a ClearRange call over a range
+// containing a write intent from an implicitly committed txn can cause the
+// intent to be removed such that txn recovery ends up rolling back a committed
+// txn. 😱 This isn't strictly a bug, since ClearRange documents this and
+// requires the caller to ensure there are no intents in the cleared range. This
+// test verifies the behavior.
+//
+// This is a footgun, ClearRange should make sure txn invariants are never
+// violated. For ideas, see:
+// https://github.com/cockroachdb/cockroach/issues/46764
+func TestTxnClearRangeIntents(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	cfg := TestStoreConfig(nil)
+	// Immediately launch transaction recovery when pushing a STAGING txn.
+	cfg.TestingKnobs.EvalKnobs.RecoverIndeterminateCommitsOnFailedPushes = true
+	store := createTestStoreWithConfig(t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
+
+	// Set up a couple of keys to write, and a range to clear that covers
+	// B and its intent.
+	keyA, valueA := roachpb.Key("a"), []byte("value1")
+	keyB, valueB := roachpb.Key("b"), []byte("value2")
+	clearFrom, clearTo := roachpb.Key("aa"), roachpb.Key("x")
+
+	// Create a transaction that will get stuck performing a parallel commit.
+	txn := newTransaction("txn", keyA, 1, store.Clock())
+	txnHeader := roachpb.Header{Txn: txn}
+
+	// Issue two writes, which will be considered in-flight at the time of the
+	// transaction's EndTxn request.
+	put := putArgs(keyA, valueA)
+	put.Sequence = 1
+	_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), txnHeader, &put)
+	require.Nil(t, pErr, "error: %s", pErr)
+
+	put = putArgs(keyB, valueB)
+	put.Sequence = 2
+	_, pErr = kv.SendWrappedWith(ctx, store.TestSender(), txnHeader, &put)
+	require.Nil(t, pErr, "error: %s", pErr)
+
+	// Issue a parallel commit, which will put the transaction into a STAGING
+	// state. Include both writes as the EndTxn's in-flight writes.
+	endTxn, endTxnHeader := endTxnArgs(txn, true)
+	endTxn.InFlightWrites = []roachpb.SequencedWrite{
+		{Key: keyA, Sequence: 1},
+		{Key: keyB, Sequence: 2},
+	}
+	reply, pErr := kv.SendWrappedWith(ctx, store.TestSender(), endTxnHeader, &endTxn)
+	require.Nil(t, pErr, pErr)
+	require.Equal(t, roachpb.STAGING, reply.Header().Txn.Status, "expected STAGING txn")
+
+	// Make sure intents exists for keys A and B.
+	queryIntent := queryIntentArgs(keyA, txn.TxnMeta, false)
+	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &queryIntent)
+	require.Nil(t, pErr, "error: %s", pErr)
+	require.True(t, reply.(*roachpb.QueryIntentResponse).FoundIntent, "intent missing for %q", keyA)
+
+	queryIntent = queryIntentArgs(keyB, txn.TxnMeta, false)
+	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &queryIntent)
+	require.Nil(t, pErr, "error: %s", pErr)
+	require.True(t, reply.(*roachpb.QueryIntentResponse).FoundIntent, "intent missing for %q", keyB)
+
+	// Call ClearRange covering key B and its intent.
+	clearRange := clearRangeArgs(clearFrom, clearTo)
+	_, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &clearRange)
+	require.Nil(t, pErr, "error: %s", pErr)
+
+	// Try to read A. This should have been committed, but because we cleared
+	// B's intent above txn recovery will fail to find an in-flight write for B
+	// and thus roll back the entire txn (including A) even though it has been
+	// implicitly committed above. 😱
+	get := getArgs(keyA)
+	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &get)
+	require.Nil(t, pErr, "error: %s", pErr)
+	require.Nil(t, reply.(*roachpb.GetResponse).Value, "unexpected value for key %q", keyA)
+
+	// Query the original transaction, which should now be aborted.
+	queryTxn := queryTxnArgs(txn.TxnMeta, false)
+	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, &queryTxn)
+	require.Nil(t, pErr, "error: %s", pErr)
+	require.Equal(t, roachpb.ABORTED, reply.(*roachpb.QueryTxnResponse).QueriedTxn.Status)
 }

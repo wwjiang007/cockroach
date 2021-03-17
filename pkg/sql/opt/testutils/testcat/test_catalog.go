@@ -597,6 +597,10 @@ type Table struct {
 	inboundFKs  []ForeignKeyConstraint
 
 	uniqueConstraints []UniqueConstraint
+
+	// partitionBy is the partitioning clause that corresponds to the primary
+	// index. Used to initialize the partitioning for the primary index.
+	partitionBy *tree.PartitionBy
 }
 
 var _ cat.Table = &Table{}
@@ -732,7 +736,7 @@ func (tt *Table) UniqueCount() int {
 }
 
 // Unique is part of the cat.Table interface.
-func (tt *Table) Unique(i int) cat.UniqueConstraint {
+func (tt *Table) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
 	return &tt.uniqueConstraints[i]
 }
 
@@ -781,9 +785,9 @@ type Index struct {
 	// table is a back reference to the table this index is on.
 	table *Table
 
-	// partitionBy is the partitioning clause that corresponds to this index. Used
-	// to implement PartitionByListPrefixes.
-	partitionBy *tree.PartitionBy
+	// partitions stores zone information and datums for PARTITION BY LIST
+	// partitions.
+	partitions []Partition
 
 	// predicate is the partial index predicate expression, if it exists.
 	predicate string
@@ -883,65 +887,9 @@ func (ti *Index) Predicate() (string, bool) {
 	return ti.predicate, ti.predicate != ""
 }
 
-// PartitionByListPrefixes is part of the cat.Index interface.
-func (ti *Index) PartitionByListPrefixes() []tree.Datums {
-	ctx := context.Background()
-	p := ti.partitionBy
-	if p == nil {
-		return nil
-	}
-	if len(p.List) == 0 {
-		return nil
-	}
-	var res []tree.Datums
-	semaCtx := tree.MakeSemaContext()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-	for i := range p.Fields {
-		if i >= len(ti.Columns) || p.Fields[i] != ti.Columns[i].ColName() {
-			panic("partition by columns must be a prefix of the index columns")
-		}
-	}
-	for i := range p.List {
-		// Exprs contains a list of values.
-		for _, e := range p.List[i].Exprs {
-			var vals []tree.Expr
-			switch t := e.(type) {
-			case *tree.Tuple:
-				vals = t.Exprs
-			default:
-				vals = []tree.Expr{e}
-			}
-
-			// Cut off at DEFAULT, if present.
-			for i := range vals {
-				if _, ok := vals[i].(tree.DefaultVal); ok {
-					vals = vals[:i]
-				}
-			}
-			if len(vals) == 0 {
-				continue
-			}
-			d := make(tree.Datums, len(vals))
-			for i := range vals {
-				c := tree.CastExpr{Expr: vals[i], Type: ti.Columns[i].DatumType()}
-				cTyped, err := c.TypeCheck(ctx, &semaCtx, types.Any)
-				if err != nil {
-					panic(err)
-				}
-				d[i], err = cTyped.Eval(&evalCtx)
-				if err != nil {
-					panic(err)
-				}
-			}
-
-			// TODO(radu): split into multiple prefixes if Subpartition is also by list.
-			// Note that this functionality should be kept in sync with the real catalog
-			// implementation (opt_catalog.go).
-
-			res = append(res, d)
-		}
-	}
-	return res
+// ImplicitPartitioningColumnCount is part of the cat.Index interface.
+func (ti *Index) ImplicitPartitioningColumnCount() int {
+	return 0
 }
 
 // InterleaveAncestorCount is part of the cat.Index interface.
@@ -972,6 +920,40 @@ func (ti *Index) GeoConfig() *geoindex.Config {
 // Version is part of the cat.Index interface.
 func (ti *Index) Version() descpb.IndexDescriptorVersion {
 	return ti.version
+}
+
+// PartitionCount is part of the cat.Index interface.
+func (ti *Index) PartitionCount() int {
+	return len(ti.partitions)
+}
+
+// Partition is part of the cat.Index interface.
+func (ti *Index) Partition(i int) cat.Partition {
+	return &ti.partitions[i]
+}
+
+// Partition implements the cat.Partition interface for testing purposes.
+type Partition struct {
+	name   string
+	zone   *zonepb.ZoneConfig
+	datums []tree.Datums
+}
+
+var _ cat.Partition = &Partition{}
+
+// Name is part of the cat.Partition interface.
+func (p *Partition) Name() string {
+	return p.name
+}
+
+// Zone is part of the cat.Partition interface.
+func (p *Partition) Zone() cat.Zone {
+	return p.zone
+}
+
+// PartitionByListPrefixes is part of the cat.Partition interface.
+func (p *Partition) PartitionByListPrefixes() []tree.Datums {
+	return p.datums
 }
 
 // TableStat implements the cat.TableStatistic interface for testing purposes.
@@ -1148,6 +1130,7 @@ type UniqueConstraint struct {
 	name           string
 	tabID          cat.StableID
 	columnOrdinals []int
+	predicate      string
 	withoutIndex   bool
 	validated      bool
 }
@@ -1178,6 +1161,11 @@ func (u *UniqueConstraint) ColumnOrdinal(tab cat.Table, i int) int {
 		))
 	}
 	return u.columnOrdinals[i]
+}
+
+// Predicate is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) Predicate() (string, bool) {
+	return u.predicate, u.predicate != ""
 }
 
 // WithoutIndex is part of the cat.UniqueConstraint interface.

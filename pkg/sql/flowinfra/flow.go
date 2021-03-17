@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
@@ -293,7 +294,7 @@ func (f *FlowBase) startInternal(
 ) error {
 	f.doneFn = doneFn
 	log.VEventf(
-		ctx, 1, "starting (%d processors, %d startables)", len(processors), len(f.startables),
+		ctx, 1, "starting (%d processors, %d startables) asynchronously", len(processors), len(f.startables),
 	)
 
 	// Only register the flow if there will be inbound stream connections that
@@ -377,6 +378,7 @@ func (f *FlowBase) Run(ctx context.Context, doneFn func()) error {
 		}
 		return err
 	}
+	log.VEventf(ctx, 1, "running %T in the flow's goroutine", headProc)
 	headProc.Run(ctx)
 	return nil
 }
@@ -426,6 +428,26 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 		f.TypeResolverFactory.CleanupFunc(ctx)
 	}
 
+	sp := tracing.SpanFromContext(ctx)
+	if sp != nil {
+		defer sp.Finish()
+		if f.Gateway && f.CollectStats {
+			// If this is the gateway node and we're collecting execution stats,
+			// output the maximum memory usage to the flow span. Note that
+			// non-gateway nodes use the last outbox to send this information
+			// over.
+			sp.RecordStructured(&execinfrapb.ComponentStats{
+				Component: execinfrapb.FlowComponentID(f.NodeID.SQLInstanceID(), f.FlowCtx.ID),
+				FlowStats: execinfrapb.FlowStats{
+					MaxMemUsage:  optional.MakeUint(uint64(f.FlowCtx.EvalCtx.Mon.MaximumBytes())),
+					MaxDiskUsage: optional.MakeUint(uint64(f.FlowCtx.DiskMonitor.MaximumBytes())),
+				},
+			})
+		}
+	}
+
+	// This closes the disk monitor opened in newFlowCtx.
+	f.DiskMonitor.Stop(ctx)
 	// This closes the monitor opened in ServerImpl.setupFlow.
 	f.EvalCtx.Stop(ctx)
 	for _, p := range f.processors {
@@ -436,7 +458,6 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 	if log.V(1) {
 		log.Infof(ctx, "cleaning up")
 	}
-	sp := tracing.SpanFromContext(ctx)
 	// Local flows do not get registered.
 	if !f.IsLocal() && f.status != FlowNotStarted {
 		f.flowRegistry.UnregisterFlow(f.ID)
@@ -445,9 +466,6 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 	f.ctxCancel()
 	if f.doneFn != nil {
 		f.doneFn()
-	}
-	if sp != nil {
-		sp.Finish()
 	}
 }
 

@@ -61,6 +61,8 @@ func TestClosedTimestampWorksWhenRequestsAreSentToNonLeaseHolders(t *testing.T) 
 	const closeInterval = 10 * time.Millisecond
 	sqlRunner.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '"+
 		closeInterval.String()+"'")
+	sqlRunner.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '"+
+		closeInterval.String()+"'")
 
 	// To make node3 have a large epoch, synthesize a liveness record for with
 	// epoch 1000 before starting the node.
@@ -96,7 +98,7 @@ func TestClosedTimestampWorksWhenRequestsAreSentToNonLeaseHolders(t *testing.T) 
 		target := tc.Target(serverIdx)
 		transferLease(repl.Desc(), target)
 		testutils.SucceedsSoon(t, func() error {
-			if !repl.OwnsValidLease(ctx, db1.Clock().Now()) {
+			if !repl.OwnsValidLease(ctx, db1.Clock().NowAsClockTimestamp()) {
 				return errors.Errorf("don't yet have the lease")
 			}
 			return nil

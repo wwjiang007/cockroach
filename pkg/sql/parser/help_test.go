@@ -49,6 +49,7 @@ func TestContextualHelp(t *testing.T) {
 		{`ALTER TYPE t ADD VALUE ??`, `ALTER TYPE`},
 		{`ALTER TYPE t SET ??`, `ALTER TYPE`},
 		{`ALTER TYPE t RENAME ??`, `ALTER TYPE`},
+		{`ALTER TYPE t DROP VALUE ??`, `ALTER TYPE`},
 
 		{`ALTER INDEX foo@bar RENAME ??`, `ALTER INDEX`},
 		{`ALTER INDEX foo@bar RENAME TO blih ??`, `ALTER INDEX`},
@@ -284,8 +285,11 @@ func TestContextualHelp(t *testing.T) {
 
 		{`SHOW HISTOGRAM ??`, `SHOW HISTOGRAM`},
 
-		{`SHOW QUERIES ??`, `SHOW QUERIES`},
-		{`SHOW LOCAL QUERIES ??`, `SHOW QUERIES`},
+		{`SHOW QUERIES ??`, `SHOW STATEMENTS`},
+		{`SHOW LOCAL QUERIES ??`, `SHOW STATEMENTS`},
+
+		{`SHOW STATEMENTS ??`, `SHOW STATEMENTS`},
+		{`SHOW LOCAL STATEMENTS ??`, `SHOW STATEMENTS`},
 
 		{`SHOW TRACE ??`, `SHOW TRACE`},
 		{`SHOW TRACE FOR SESSION ??`, `SHOW TRACE`},
@@ -360,6 +364,8 @@ func TestContextualHelp(t *testing.T) {
 		{`SHOW RANGES ??`, `SHOW RANGES`},
 
 		{`SHOW USERS ??`, `SHOW USERS`},
+
+		{`SHOW ZONE CONFIGURATION FROM ??`, `SHOW ZONE CONFIGURATION`},
 
 		{`TRUNCATE foo ??`, `TRUNCATE`},
 		{`TRUNCATE foo, ??`, `TRUNCATE`},

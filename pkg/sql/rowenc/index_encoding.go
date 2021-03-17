@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -41,8 +42,8 @@ import (
 func MakeIndexKeyPrefix(
 	codec keys.SQLCodec, desc catalog.TableDescriptor, indexID descpb.IndexID,
 ) []byte {
-	if i, err := desc.FindIndexByID(indexID); err == nil && len(i.Interleave.Ancestors) > 0 {
-		ancestor := &i.Interleave.Ancestors[0]
+	if i, err := desc.FindIndexWithID(indexID); err == nil && i.NumInterleaveAncestors() > 0 {
+		ancestor := i.GetInterleaveAncestor(0)
 		return codec.IndexPrefix(uint32(ancestor.TableID), uint32(ancestor.IndexID))
 	}
 	return codec.IndexPrefix(uint32(desc.GetID()), uint32(indexID))
@@ -216,7 +217,7 @@ func MakeSpanFromEncDatums(
 	alloc *DatumAlloc,
 	keyPrefix []byte,
 ) (_ roachpb.Span, containsNull bool, _ error) {
-	startKey, complete, containsNull, err := makeKeyFromEncDatums(values, types, dirs, tableDesc, index, alloc, keyPrefix)
+	startKey, complete, containsNull, err := MakeKeyFromEncDatums(values, types, dirs, tableDesc, index, alloc, keyPrefix)
 	if err != nil {
 		return roachpb.Span{}, false, err
 	}
@@ -252,8 +253,8 @@ func NeededColumnFamilyIDs(
 	}
 
 	// Build some necessary data structures for column metadata.
-	columns := table.ColumnsWithMutations(true /* includeMutations */)
-	colIdxMap := table.ColumnIdxMapWithMutations(true)
+	columns := table.DeletableColumns()
+	colIdxMap := catalog.ColumnIDToOrdinalMap(columns)
 	var indexedCols util.FastIntSet
 	var compositeCols util.FastIntSet
 	var extraCols util.FastIntSet
@@ -342,7 +343,7 @@ func NeededColumnFamilyIDs(
 			if nc.Contains(columnOrdinal) {
 				needed = true
 			}
-			if !columns[columnOrdinal].Nullable && (!indexedCols.Contains(columnOrdinal) ||
+			if !columns[columnOrdinal].IsNullable() && (!indexedCols.Contains(columnOrdinal) ||
 				compositeCols.Contains(columnOrdinal) && !hasSecondaryEncoding) {
 				// The column is non-nullable and cannot be decoded from a different
 				// family, so this column family must have a KV entry for every row.
@@ -400,7 +401,7 @@ func SplitSpanIntoSeparateFamilies(
 	return appendTo
 }
 
-// makeKeyFromEncDatums creates an index key by concatenating keyPrefix with the
+// MakeKeyFromEncDatums creates an index key by concatenating keyPrefix with the
 // encodings of the given EncDatum values. The values, types, and dirs
 // parameters should be specified in the same order as the index key columns and
 // may be a prefix. The complete return value is true if the resultant key
@@ -410,7 +411,7 @@ func SplitSpanIntoSeparateFamilies(
 // in place of the family id (a varint) to signal the next component of the
 // key.  An example of one level of interleaving (a parent):
 // /<parent_table_id>/<parent_index_id>/<field_1>/<field_2>/NullDesc/<table_id>/<index_id>/<field_3>/<family>
-func makeKeyFromEncDatums(
+func MakeKeyFromEncDatums(
 	values EncDatumRow,
 	types []*types.T,
 	dirs []descpb.IndexDescriptor_Direction,
@@ -546,7 +547,7 @@ func DecodeIndexKeyPrefix(
 	// TODO(dan): This whole operation is n^2 because of the interleaves
 	// bookkeeping. We could improve it to n with a prefix tree of components.
 
-	interleaves := append([]descpb.IndexDescriptor{*desc.GetPrimaryIndex()}, desc.GetPublicNonPrimaryIndexes()...)
+	interleaves := append(make([]catalog.Index, 0, len(desc.ActiveIndexes())), desc.ActiveIndexes()...)
 
 	for component := 0; ; component++ {
 		var tableID descpb.ID
@@ -561,9 +562,9 @@ func DecodeIndexKeyPrefix(
 		}
 
 		for i := len(interleaves) - 1; i >= 0; i-- {
-			if len(interleaves[i].Interleave.Ancestors) <= component ||
-				interleaves[i].Interleave.Ancestors[component].TableID != tableID ||
-				interleaves[i].Interleave.Ancestors[component].IndexID != indexID {
+			if interleaves[i].NumInterleaveAncestors() <= component ||
+				interleaves[i].GetInterleaveAncestor(component).TableID != tableID ||
+				interleaves[i].GetInterleaveAncestor(component).IndexID != indexID {
 
 				// This component, and thus this interleave, doesn't match what was
 				// decoded, remove it.
@@ -578,7 +579,7 @@ func DecodeIndexKeyPrefix(
 
 		// Anything left has the same SharedPrefixLen at index `component`, so just
 		// use the first one.
-		for i := uint32(0); i < interleaves[0].Interleave.Ancestors[component].SharedPrefixLen; i++ {
+		for i := uint32(0); i < interleaves[0].GetInterleaveAncestor(component).SharedPrefixLen; i++ {
 			l, err := encoding.PeekLength(key)
 			if err != nil {
 				return 0, nil, err
@@ -755,6 +756,28 @@ func (a byID) Less(i, j int) bool { return a[i].id < a[j].id }
 func EncodeInvertedIndexKeys(
 	index *descpb.IndexDescriptor, colMap catalog.TableColMap, values []tree.Datum, keyPrefix []byte,
 ) (key [][]byte, err error) {
+	keyPrefix, err = EncodeInvertedIndexPrefixKeys(index, colMap, values, keyPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	var val tree.Datum
+	if i, ok := colMap.Get(index.InvertedColumnID()); ok {
+		val = values[i]
+	} else {
+		val = tree.DNull
+	}
+	if !geoindex.IsEmptyConfig(&index.GeoConfig) {
+		return EncodeGeoInvertedIndexTableKeys(val, keyPrefix, index)
+	}
+	return EncodeInvertedIndexTableKeys(val, keyPrefix, index.Version)
+}
+
+// EncodeInvertedIndexPrefixKeys encodes the non-inverted prefix columns if
+// the given index is a multi-column inverted index.
+func EncodeInvertedIndexPrefixKeys(
+	index *descpb.IndexDescriptor, colMap catalog.TableColMap, values []tree.Datum, keyPrefix []byte,
+) (_ []byte, err error) {
 	numColumns := len(index.ColumnIDs)
 
 	// If the index is a multi-column inverted index, we encode the non-inverted
@@ -774,17 +797,7 @@ func EncodeInvertedIndexKeys(
 			return nil, err
 		}
 	}
-
-	var val tree.Datum
-	if i, ok := colMap.Get(index.ColumnIDs[numColumns-1]); ok {
-		val = values[i]
-	} else {
-		val = tree.DNull
-	}
-	if !geoindex.IsEmptyConfig(&index.GeoConfig) {
-		return EncodeGeoInvertedIndexTableKeys(val, keyPrefix, index)
-	}
-	return EncodeInvertedIndexTableKeys(val, keyPrefix, index.Version)
+	return keyPrefix, nil
 }
 
 // EncodeInvertedIndexTableKeys produces one inverted index key per element in
@@ -814,69 +827,70 @@ func EncodeInvertedIndexTableKeys(
 		// arrays.
 		return json.EncodeInvertedIndexKeys(inKey, val.(*tree.DJSON).JSON)
 	case types.ArrayFamily:
-		return encodeArrayInvertedIndexTableKeys(val.(*tree.DArray), inKey, version)
+		return encodeArrayInvertedIndexTableKeys(val.(*tree.DArray), inKey, version, false /* excludeNulls */)
 	}
 	return nil, errors.AssertionFailedf("trying to apply inverted index to unsupported type %s", datum.ResolvedType())
 }
 
-// EncodeContainingInvertedIndexSpans takes in a key prefix and returns the
-// spans that must be scanned in the inverted index to evaluate a contains (@>)
-// predicate with the given datum, which should be a container (either JSON
-// or Array). These spans should be used to find the objects in the index that
-// contain the given json or array. In other words, if we have a predicate
-// x @> y, this function should use the value of y to find the spans to scan
-// in an inverted index on x.
+// EncodeContainingInvertedIndexSpans returns the spans that must be scanned in
+// the inverted index to evaluate a contains (@>) predicate with the given
+// datum, which should be a container (either JSON or Array). These spans
+// should be used to find the objects in the index that contain the given json
+// or array. In other words, if we have a predicate x @> y, this function
+// should use the value of y to find the spans to scan in an inverted index on
+// x.
 //
-// The spans returned by EncodeContainingInvertedIndexSpans represent the
-// intersection of unions. For example, if the returned results are:
-//
-//   { {["a", "b"), ["c", "d")}, {["e", "f")} }
-//
-// the expression should be evaluated as:
-//
-//             INTERSECTION
-//              /        \
-//           UNION    ["e", "f")
-//          /     \
-//   ["a", "b") ["c", "d")
-//
-// The input inKey is prefixed to the keys in all returned spans.
-//
-// Returns tight=true if the returned spans are tight and cannot produce false
-// positives. Otherwise, returns tight=false.
-//
-// Returns unique=true if the spans are guaranteed not to produce duplicate
-// primary keys. Otherwise, returns unique=false. This distinction is important
-// for the case where the length of spans is 1, and the single element has
-// length greater than 0. Per the above description, this would represent a
-// UNION over the returned spans, with no INTERSECTION. If unique is true, that
-// allows the optimizer to remove the UNION altogether (implemented
-// with the invertedFilterer), and simply return the results of the constrained
-// scan. unique is always false if the length of spans is greater than 1.
-//
-// The spans are not guaranteed to be sorted, so the caller must sort them if
-// needed.
+// The spans are returned in an inverted.SpanExpression, which represents the
+// set operations that must be applied on the spans read during execution. See
+// comments in the SpanExpression definition for details.
 func EncodeContainingInvertedIndexSpans(
-	evalCtx *tree.EvalContext, val tree.Datum, inKey []byte, version descpb.IndexDescriptorVersion,
-) (spans []roachpb.Spans, tight, unique bool, err error) {
+	evalCtx *tree.EvalContext, val tree.Datum,
+) (invertedExpr inverted.Expression, err error) {
 	if val == tree.DNull {
-		return nil, false, false, nil
+		return nil, nil
 	}
 	datum := tree.UnwrapDatum(evalCtx, val)
 	switch val.ResolvedType().Family() {
 	case types.JsonFamily:
-		return json.EncodeContainingInvertedIndexSpans(inKey, val.(*tree.DJSON).JSON)
+		return json.EncodeContainingInvertedIndexSpans(nil /* inKey */, val.(*tree.DJSON).JSON)
 	case types.ArrayFamily:
-		spans, unique, err := encodeContainingArrayInvertedIndexSpans(val.(*tree.DArray), inKey, version)
-		if err != nil {
-			return nil, false, false, err
-		}
-		// Spans for array inverted indexes are always tight.
-		return spans, true /* tight */, unique, err
+		return encodeContainingArrayInvertedIndexSpans(val.(*tree.DArray), nil /* inKey */)
+	default:
+		return nil, errors.AssertionFailedf(
+			"trying to apply inverted index to unsupported type %s", datum.ResolvedType(),
+		)
 	}
-	return nil, false, false, errors.AssertionFailedf(
-		"trying to apply inverted index to unsupported type %s", datum.ResolvedType(),
-	)
+}
+
+// EncodeContainedInvertedIndexSpans returns the spans that must be scanned in
+// the inverted index to evaluate a contained by (<@) predicate with the given
+// datum, which should be a container (either an Array or JSON). These spans
+// should be used to find the objects in the index that could be contained by
+// the given json or array. In other words, if we have a predicate x <@ y, this
+// function should use the value of y to find the spans to scan in an inverted
+// index on x.
+//
+// The spans are returned in an inverted.SpanExpression, which represents the
+// set operations that must be applied on the spans read during execution. The
+// span expression returned will never be tight. See comments in the
+// SpanExpression definition for details.
+func EncodeContainedInvertedIndexSpans(
+	evalCtx *tree.EvalContext, val tree.Datum,
+) (invertedExpr inverted.Expression, err error) {
+	if val == tree.DNull {
+		return nil, nil
+	}
+	datum := tree.UnwrapDatum(evalCtx, val)
+	switch val.ResolvedType().Family() {
+	case types.ArrayFamily:
+		return encodeContainedArrayInvertedIndexSpans(val.(*tree.DArray), nil /* inKey */)
+	case types.JsonFamily:
+		return json.EncodeContainedInvertedIndexSpans(nil /* inKey */, val.(*tree.DJSON).JSON)
+	default:
+		return nil, errors.AssertionFailedf(
+			"trying to apply inverted index to unsupported type %s", datum.ResolvedType(),
+		)
+	}
 }
 
 // encodeArrayInvertedIndexTableKeys returns a list of inverted index keys for
@@ -885,8 +899,11 @@ func EncodeContainingInvertedIndexSpans(
 //
 // This function does not return keys for empty arrays or for NULL array elements
 // unless the version is at least descpb.EmptyArraysInInvertedIndexesVersion.
+// It also does not return keys for NULL array elements if excludeNulls is
+// true. This option is used by encodeContainedArrayInvertedIndexSpans, which
+// builds index spans to evaluate <@ (contained by) expressions.
 func encodeArrayInvertedIndexTableKeys(
-	val *tree.DArray, inKey []byte, version descpb.IndexDescriptorVersion,
+	val *tree.DArray, inKey []byte, version descpb.IndexDescriptorVersion, excludeNulls bool,
 ) (key [][]byte, err error) {
 	if val.Array.Len() == 0 {
 		if version >= descpb.EmptyArraysInInvertedIndexesVersion {
@@ -897,7 +914,7 @@ func encodeArrayInvertedIndexTableKeys(
 	outKeys := make([][]byte, 0, len(val.Array))
 	for i := range val.Array {
 		d := val.Array[i]
-		if d == tree.DNull && version < descpb.EmptyArraysInInvertedIndexesVersion {
+		if d == tree.DNull && (version < descpb.EmptyArraysInInvertedIndexesVersion || excludeNulls) {
 			// Older versions did not include null elements, but we must include them
 			// going forward since `SELECT ARRAY[NULL] @> ARRAY[]` returns true.
 			continue
@@ -922,33 +939,87 @@ func encodeArrayInvertedIndexTableKeys(
 // Returns unique=true if the spans are guaranteed not to produce
 // duplicate primary keys. Otherwise, returns unique=false.
 func encodeContainingArrayInvertedIndexSpans(
-	val *tree.DArray, inKey []byte, version descpb.IndexDescriptorVersion,
-) (spans []roachpb.Spans, unique bool, err error) {
+	val *tree.DArray, inKey []byte,
+) (invertedExpr inverted.Expression, err error) {
 	if val.Array.Len() == 0 {
-		// All arrays contain the empty array.
-		endKey := roachpb.Key(inKey).PrefixEnd()
-		return []roachpb.Spans{{roachpb.Span{Key: inKey, EndKey: endKey}}}, false, nil
+		// All arrays contain the empty array. Return a SpanExpression that
+		// requires a full scan of the inverted index.
+		invertedExpr = inverted.ExprForSpan(
+			inverted.MakeSingleValSpan(inKey), true, /* tight */
+		)
+		return invertedExpr, nil
 	}
 
 	if val.HasNulls {
 		// If there are any nulls, return empty spans. This is needed to ensure
 		// that `SELECT ARRAY[NULL, 2] @> ARRAY[NULL, 2]` is false.
-		return nil, true, nil
+		return &inverted.SpanExpression{Tight: true, Unique: true}, nil
 	}
 
-	keys, err := encodeArrayInvertedIndexTableKeys(val, inKey, version)
+	keys, err := encodeArrayInvertedIndexTableKeys(val, inKey, descpb.EmptyArraysInInvertedIndexesVersion, false /* excludeNulls */)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	spans = make([]roachpb.Spans, len(keys))
-	for i, key := range keys {
-		endKey := roachpb.Key(key).PrefixEnd()
-		spans[i] = roachpb.Spans{{Key: key, EndKey: endKey}}
+	for _, key := range keys {
+		spanExpr := inverted.ExprForSpan(
+			inverted.MakeSingleValSpan(key), true, /* tight */
+		)
+		spanExpr.Unique = true
+		if invertedExpr == nil {
+			invertedExpr = spanExpr
+		} else {
+			invertedExpr = inverted.And(invertedExpr, spanExpr)
+		}
 	}
-	// More than 1 key means that there could be duplicate primary keys in an
-	// inverted index.
-	unique = len(keys) == 1
-	return spans, unique, nil
+	return invertedExpr, nil
+}
+
+// encodeContainedArrayInvertedIndexSpans returns the spans that must be
+// scanned in the inverted index to evaluate a contained by (<@) predicate with
+// the given array, one slice of spans per entry in the array. The input
+// inKey is prefixed to all returned keys.
+//
+// Returns unique=true if the spans are guaranteed not to produce
+// duplicate primary keys. Otherwise, returns unique=false.
+func encodeContainedArrayInvertedIndexSpans(
+	val *tree.DArray, inKey []byte,
+) (invertedExpr inverted.Expression, err error) {
+	// The empty array should always be added to the spans, since it is contained
+	// by everything.
+	emptyArrSpanExpr := inverted.ExprForSpan(
+		inverted.MakeSingleValSpan(encoding.EncodeEmptyArray(inKey)), false, /* tight */
+	)
+	emptyArrSpanExpr.Unique = true
+
+	// If the given array is empty, we return the SpanExpression.
+	if val.Array.Len() == 0 {
+		return emptyArrSpanExpr, nil
+	}
+
+	// We always exclude nulls from the list of keys when evaluating <@.
+	// This is because an expression like ARRAY[NULL] <@ ARRAY[NULL] is false,
+	// since NULL in SQL represents an unknown value.
+	keys, err := encodeArrayInvertedIndexTableKeys(val, inKey, descpb.EmptyArraysInInvertedIndexesVersion, true /* excludeNulls */)
+	if err != nil {
+		return nil, err
+	}
+	invertedExpr = emptyArrSpanExpr
+	for _, key := range keys {
+		spanExpr := inverted.ExprForSpan(
+			inverted.MakeSingleValSpan(key), false, /* tight */
+		)
+		invertedExpr = inverted.Or(invertedExpr, spanExpr)
+	}
+
+	// The inverted expression produced for <@ will never be tight.
+	// For example, if we are evaluating if indexed column x <@ ARRAY[1], the
+	// inverted expression would scan for all arrays in x that contain the
+	// empty array or ARRAY[1]. The resulting arrays could contain other values
+	// and would need to be passed through an additional filter. For example,
+	// ARRAY[1, 2, 3] would be returned by the scan, but it should be filtered
+	// out since ARRAY[1, 2, 3] <@ ARRAY[1] is false.
+	invertedExpr.SetNotTight()
+	return invertedExpr, nil
 }
 
 // EncodeGeoInvertedIndexTableKeys is the equivalent of EncodeInvertedIndexTableKeys
@@ -1045,11 +1116,11 @@ func EncodePrimaryIndex(
 			// We want to include this column if its value is non-null or
 			// we were requested to include all of the columns.
 			if datum != tree.DNull || includeEmpty {
-				col, err := tableDesc.FindColumnByID(family.DefaultColumnID)
+				col, err := tableDesc.FindColumnWithID(family.DefaultColumnID)
 				if err != nil {
 					return err
 				}
-				value, err := MarshalColumnValue(col, datum)
+				value, err := MarshalColumnValue(col.ColumnDesc(), datum)
 				if err != nil {
 					return err
 				}
@@ -1364,13 +1435,14 @@ func EncodeSecondaryIndexes(
 	values []tree.Datum,
 	secondaryIndexEntries []IndexEntry,
 	includeEmpty bool,
-	indexBoundAccount mon.BoundAccount,
-) ([]IndexEntry, error) {
+	indexBoundAccount *mon.BoundAccount,
+) ([]IndexEntry, int64, error) {
+	var memUsedEncodingSecondaryIdxs int64
 	if len(secondaryIndexEntries) > 0 {
 		panic(errors.AssertionFailedf("length of secondaryIndexEntries was non-zero"))
 	}
 
-	if indexBoundAccount.Monitor() == nil {
+	if indexBoundAccount == nil || indexBoundAccount.Monitor() == nil {
 		panic(errors.AssertionFailedf("memory monitor passed to EncodeSecondaryIndexes was nil"))
 	}
 	const sizeOfIndexEntry = int64(unsafe.Sizeof(IndexEntry{}))
@@ -1378,7 +1450,7 @@ func EncodeSecondaryIndexes(
 	for i := range indexes {
 		entries, err := EncodeSecondaryIndex(codec, tableDesc, indexes[i], colMap, values, includeEmpty)
 		if err != nil {
-			return secondaryIndexEntries, err
+			return secondaryIndexEntries, 0, err
 		}
 		// Normally, each index will have exactly one entry. However, inverted
 		// indexes can have 0 or >1 entries, as well as secondary indexes which
@@ -1390,22 +1462,32 @@ func EncodeSecondaryIndexes(
 		// in capacity. Therefore, we must account for another
 		// cap(secondaryIndexEntries) in the index memory account.
 		if cap(secondaryIndexEntries)-len(secondaryIndexEntries) < len(entries) {
-			if err := indexBoundAccount.Grow(ctx, sizeOfIndexEntry*int64(cap(secondaryIndexEntries))); err != nil {
-				return nil, errors.Wrap(err, "failed to re-slice index entries buffer")
+			resliceSize := sizeOfIndexEntry * int64(cap(secondaryIndexEntries))
+			if err := indexBoundAccount.Grow(ctx, resliceSize); err != nil {
+				return nil, 0, errors.Wrap(err,
+					"failed to re-slice index entries buffer")
 			}
+			memUsedEncodingSecondaryIdxs += resliceSize
 		}
 
 		// The index keys can be large and so we must account for them in the index
 		// memory account.
+		// In some cases eg: STORING indexes, the size of the value can also be
+		// non-trivial.
 		for _, index := range entries {
 			if err := indexBoundAccount.Grow(ctx, int64(len(index.Key))); err != nil {
-				return nil, errors.Wrap(err, "failed to allocate space for index keys")
+				return nil, 0, errors.Wrap(err, "failed to allocate space for index keys")
 			}
+			memUsedEncodingSecondaryIdxs += int64(len(index.Key))
+			if err := indexBoundAccount.Grow(ctx, int64(len(index.Value.RawBytes))); err != nil {
+				return nil, 0, errors.Wrap(err, "failed to allocate space for index values")
+			}
+			memUsedEncodingSecondaryIdxs += int64(len(index.Value.RawBytes))
 		}
 
 		secondaryIndexEntries = append(secondaryIndexEntries, entries...)
 	}
-	return secondaryIndexEntries, nil
+	return secondaryIndexEntries, memUsedEncodingSecondaryIdxs, nil
 }
 
 // IndexKeyEquivSignature parses an index key if and only if the index key

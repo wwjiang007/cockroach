@@ -47,6 +47,13 @@ message ComponentID {
   // type.
   optional int32 id = 3 [(gogoproto.nullable) = false,
                          (gogoproto.customname) = "ID"];
+
+  // SQLInstanceID of the node this component is associated with. For cross-node
+  // streams, this is the *origin* node for the stream.
+  optional int32 sql_instance_id = 4 [
+    (gogoproto.nullable) = false,
+    (gogoproto.customname) = "SQLInstanceID",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/base.SQLInstanceID"];
 }
 
 // ComponentStats contains statistics for an execution component. A component is
@@ -148,4 +155,5 @@ message OutputStats {
 // FlowStats contains flow level statistics.
 message FlowStats {
   optional util.optional.Uint max_mem_usage = 1 [(gogoproto.nullable) = false];
+  optional util.optional.Uint max_disk_usage = 2 [(gogoproto.nullable) = false];
 }

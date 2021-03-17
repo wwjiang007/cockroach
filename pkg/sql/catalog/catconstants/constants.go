@@ -36,6 +36,7 @@ const (
 	CrdbInternalBackwardDependenciesTableID
 	CrdbInternalBuildInfoTableID
 	CrdbInternalBuiltinFunctionsTableID
+	CrdbInternalClusterContentionEventsTableID
 	CrdbInternalClusterQueriesTableID
 	CrdbInternalClusterTransactionsTableID
 	CrdbInternalClusterSessionsTableID
@@ -50,10 +51,12 @@ const (
 	CrdbInternalGossipLivenessTableID
 	CrdbInternalGossipNetworkTableID
 	CrdbInternalIndexColumnsTableID
+	CrdbInternalInflightTraceSpanTableID
 	CrdbInternalJobsTableID
 	CrdbInternalKVNodeStatusTableID
 	CrdbInternalKVStoreStatusTableID
 	CrdbInternalLeasesTableID
+	CrdbInternalLocalContentionEventsTableID
 	CrdbInternalLocalQueriesTableID
 	CrdbInternalLocalTransactionsTableID
 	CrdbInternalLocalSessionsTableID
@@ -76,6 +79,8 @@ const (
 	CrdbInternalZonesTableID
 	CrdbInternalInvalidDescriptorsTableID
 	CrdbInternalClusterDatabasePrivilegesTableID
+	CrdbInternalInterleaved
+	CrdbInternalCrossDbRefrences
 	InformationSchemaID
 	InformationSchemaAdministrableRoleAuthorizationsID
 	InformationSchemaApplicableRolesID
@@ -107,56 +112,86 @@ const (
 	PgCatalogID
 	PgCatalogAggregateTableID
 	PgCatalogAmTableID
+	PgCatalogAmopTableID
+	PgCatalogAmprocTableID
 	PgCatalogAttrDefTableID
 	PgCatalogAttributeTableID
 	PgCatalogAuthIDTableID
 	PgCatalogAuthMembersTableID
+	PgCatalogAvailableExtensionVersionsTableID
 	PgCatalogAvailableExtensionsTableID
 	PgCatalogCastTableID
 	PgCatalogClassTableID
 	PgCatalogCollationTableID
+	PgCatalogConfigTableID
 	PgCatalogConstraintTableID
 	PgCatalogConversionTableID
+	PgCatalogCursorsTableID
 	PgCatalogDatabaseTableID
+	PgCatalogDbRoleSettingTableID
 	PgCatalogDefaultACLTableID
 	PgCatalogDependTableID
 	PgCatalogDescriptionTableID
-	PgCatalogSharedDescriptionTableID
 	PgCatalogEnumTableID
 	PgCatalogEventTriggerTableID
 	PgCatalogExtensionTableID
+	PgCatalogFileSettingsTableID
 	PgCatalogForeignDataWrapperTableID
 	PgCatalogForeignServerTableID
 	PgCatalogForeignTableTableID
+	PgCatalogGroupTableID
+	PgCatalogHbaFileRulesTableID
 	PgCatalogIndexTableID
 	PgCatalogIndexesTableID
 	PgCatalogInheritsTableID
 	PgCatalogLanguageTableID
+	PgCatalogLargeobjectTableID
 	PgCatalogLocksTableID
 	PgCatalogMatViewsTableID
 	PgCatalogNamespaceTableID
 	PgCatalogOpclassTableID
 	PgCatalogOperatorTableID
+	PgCatalogOpfamilyTableID
+	PgCatalogPoliciesTableID
 	PgCatalogPreparedStatementsTableID
 	PgCatalogPreparedXactsTableID
 	PgCatalogProcTableID
+	PgCatalogPublicationRelTableID
+	PgCatalogPublicationTableID
+	PgCatalogPublicationTablesTableID
 	PgCatalogRangeTableID
+	PgCatalogReplicationOriginTableID
 	PgCatalogRewriteTableID
 	PgCatalogRolesTableID
+	PgCatalogRulesTableID
 	PgCatalogSecLabelsTableID
+	PgCatalogSecurityLabelTableID
 	PgCatalogSequencesTableID
 	PgCatalogSettingsTableID
+	PgCatalogShadowTableID
+	PgCatalogSharedDescriptionTableID
+	PgCatalogSharedSecurityLabelTableID
 	PgCatalogShdependTableID
-	PgCatalogUserTableID
-	PgCatalogUserMappingTableID
+	PgCatalogShmemAllocationsTableID
+	PgCatalogStatActivityTableID
+	PgCatalogStatisticExtTableID
+	PgCatalogSubscriptionTableID
 	PgCatalogTablesTableID
 	PgCatalogTablespaceTableID
+	PgCatalogTimezoneAbbrevsTableID
+	PgCatalogTimezoneNamesTableID
+	PgCatalogTransformTableID
 	PgCatalogTriggerTableID
+	PgCatalogTsConfigMapTableID
+	PgCatalogTsConfigTableID
+	PgCatalogTsDictTableID
+	PgCatalogTsParserTableID
+	PgCatalogTsTemplateTableID
 	PgCatalogTypeTableID
+	PgCatalogUserMappingTableID
+	PgCatalogUserMappingsTableID
+	PgCatalogUserTableID
 	PgCatalogViewsTableID
-	PgCatalogStatActivityTableID
-	PgCatalogSecurityLabelTableID
-	PgCatalogSharedSecurityLabelTableID
 	PgExtensionSchemaID
 	PgExtensionGeographyColumnsTableID
 	PgExtensionGeometryColumnsTableID

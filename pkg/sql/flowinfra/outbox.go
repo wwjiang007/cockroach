@@ -68,8 +68,12 @@ type Outbox struct {
 
 	// numOutboxes is an atomic that keeps track of how many outboxes are left.
 	// When there is one outbox left, the flow-level stats are added to the last
-	// outbox's span stats.
+	// outbox's span stats unless isGatewayNode is true, in which case, the flow
+	// will do so in its Cleanup method.
 	numOutboxes *int32
+
+	// isGatewayNode specifies whether this outbox is running on the gateway node.
+	isGatewayNode bool
 }
 
 var _ execinfra.RowReceiver = &Outbox{}
@@ -81,11 +85,13 @@ func NewOutbox(
 	nodeID roachpb.NodeID,
 	streamID execinfrapb.StreamID,
 	numOutboxes *int32,
+	isGatewayNode bool,
 ) *Outbox {
 	m := &Outbox{flowCtx: flowCtx, nodeID: nodeID}
 	m.encoder.SetHeaderFields(flowCtx.ID, streamID)
 	m.streamID = streamID
 	m.numOutboxes = numOutboxes
+	m.isGatewayNode = isGatewayNode
 	m.stats.Component = flowCtx.StreamComponentID(streamID)
 	return m
 }
@@ -217,9 +223,9 @@ func (m *Outbox) mainLoop(ctx context.Context) error {
 		span.SetTag(execinfrapb.FlowIDTagKey, m.flowCtx.ID.String())
 		span.SetTag(execinfrapb.StreamIDTagKey, m.streamID)
 	}
-	// spanFinished specifies whether we called tracing.FinishSpan on the span.
-	// Some code paths (e.g. stats collection) need to prematurely call
-	// FinishSpan to get trace data.
+	// spanFinished specifies whether we've Finish()-ed the span. Some code
+	// paths (e.g. stats collection) need to prematurely call it to get trace
+	// data.
 	spanFinished := false
 	defer func() {
 		if !spanFinished {
@@ -292,14 +298,15 @@ func (m *Outbox) mainLoop(ctx context.Context) error {
 					if err != nil {
 						return err
 					}
-					if m.numOutboxes != nil && atomic.AddInt32(m.numOutboxes, -1) == 0 {
+					if !m.isGatewayNode && m.numOutboxes != nil && atomic.AddInt32(m.numOutboxes, -1) == 0 {
 						// TODO(cathymw): maxMemUsage shouldn't be attached to span stats that are associated with streams,
 						// since it's a flow level stat. However, due to the row exec engine infrastructure, it is too
 						// complicated to attach this to a flow level span. If the row exec engine gets removed, getting
 						// maxMemUsage from streamStats should be removed as well.
 						m.stats.FlowStats.MaxMemUsage.Set(uint64(m.flowCtx.EvalCtx.Mon.MaximumBytes()))
+						m.stats.FlowStats.MaxDiskUsage.Set(uint64(m.flowCtx.DiskMonitor.MaximumBytes()))
 					}
-					span.SetSpanStats(&m.stats)
+					span.RecordStructured(&m.stats)
 					span.Finish()
 					spanFinished = true
 					if trace := execinfra.GetTraceData(ctx); trace != nil {

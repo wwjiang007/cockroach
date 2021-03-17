@@ -14,14 +14,12 @@ go_library(
 
 go_test(
     name = "fsm_test",
+    size = "small",
     srcs = [
         "example_test.go",
         "fsm_test.go",
         "match_test.go",
     ],
     embed = [":fsm"],
-    deps = [
-        "//pkg/util/fsm",
-        "@com_github_stretchr_testify//require",
-    ],
+    deps = ["@com_github_stretchr_testify//require"],
 )

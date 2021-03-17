@@ -23,16 +23,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -88,7 +89,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	const numNodes = 3
+	const numNodes = 5
 	args := base.TestClusterArgs{
 		ReplicationMode:   base.ReplicationManual,
 		ServerArgsPerNode: make(map[int]base.TestServerArgs, numNodes),
@@ -116,6 +117,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	startKey := []byte("a")
 	tc.SplitRangeOrFatal(t, startKey)
 	tc.AddVotersOrFatal(t, startKey, tc.Target(1), tc.Target(2))
+	tc.AddNonVotersOrFatal(t, startKey, tc.Target(3), tc.Target(4))
 	if pErr := tc.WaitForVoters(startKey, tc.Target(1), tc.Target(2)); pErr != nil {
 		t.Fatalf("Unexpected error waiting for replication: %v", pErr)
 	}
@@ -128,13 +130,12 @@ func TestReplicaRangefeed(t *testing.T) {
 	if _, pErr := kv.SendWrappedWith(ctx, db, roachpb.Header{Timestamp: ts1}, incArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
-	tc.WaitForValues(t, roachpb.Key("b"), []int64{9, 9, 9})
+	tc.WaitForValues(t, roachpb.Key("b"), []int64{9, 9, 9, 9, 9})
 
-	replNum := 3
-	streams := make([]*testStream, replNum)
-	streamErrC := make(chan *roachpb.Error, replNum)
+	streams := make([]*testStream, numNodes)
+	streamErrC := make(chan *roachpb.Error, numNodes)
 	rangefeedSpan := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")}
-	for i := 0; i < replNum; i++ {
+	for i := 0; i < numNodes; i++ {
 		stream := newTestStream()
 		streams[i] = stream
 		ts := tc.Servers[i]
@@ -158,7 +159,7 @@ func TestReplicaRangefeed(t *testing.T) {
 
 	checkForExpEvents := func(expEvents []*roachpb.RangeFeedEvent) {
 		t.Helper()
-		for i, stream := range streams {
+		for _, stream := range streams {
 			var events []*roachpb.RangeFeedEvent
 			testutils.SucceedsSoon(t, func() error {
 				if len(streamErrC) > 0 {
@@ -167,6 +168,15 @@ func TestReplicaRangefeed(t *testing.T) {
 				}
 
 				events = stream.Events()
+				// Filter out checkpoints. Those are not deterministic; they can come at any time.
+				var filteredEvents []*roachpb.RangeFeedEvent
+				for _, e := range events {
+					if e.Checkpoint != nil {
+						continue
+					}
+					filteredEvents = append(filteredEvents, e)
+				}
+				events = filteredEvents
 				if len(events) < len(expEvents) {
 					return errors.Errorf("too few events: %v", events)
 				}
@@ -176,9 +186,7 @@ func TestReplicaRangefeed(t *testing.T) {
 			if len(streamErrC) > 0 {
 				t.Fatalf("unexpected error from stream: %v", <-streamErrC)
 			}
-			if !reflect.DeepEqual(events, expEvents) {
-				t.Fatalf("incorrect events on stream %d, found %v, want %v", i, events, expEvents)
-			}
+			require.Equal(t, expEvents, events)
 		}
 	}
 
@@ -189,10 +197,6 @@ func TestReplicaRangefeed(t *testing.T) {
 	expEvents := []*roachpb.RangeFeedEvent{
 		{Val: &roachpb.RangeFeedValue{
 			Key: roachpb.Key("b"), Value: expVal1,
-		}},
-		{Checkpoint: &roachpb.RangeFeedCheckpoint{
-			Span:       rangefeedSpan,
-			ResolvedTS: hlc.Timestamp{},
 		}},
 	}
 	checkForExpEvents(expEvents)
@@ -305,7 +309,7 @@ func TestReplicaRangefeed(t *testing.T) {
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		for i := 0; i < replNum; i++ {
+		for i := 0; i < numNodes; i++ {
 			ts := tc.Servers[i]
 			store, pErr := ts.Stores().GetStore(ts.GetFirstStoreID())
 			if pErr != nil {
@@ -337,17 +341,23 @@ func TestReplicaRangefeedExpiringLeaseError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	store, _ := createTestStore(t, stopper)
+	ctx := context.Background()
+	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serv.(*server.TestServer)
+	defer s.Stopper().Stop(ctx)
+	store, err := s.Stores().GetStore(s.GetFirstStoreID())
+	require.NoError(t, err)
+
+	_, rdesc, err := s.ScratchRangeWithExpirationLeaseEx()
+	require.NoError(t, err)
 
 	// Establish a rangefeed on the replica we plan to remove.
 	stream := newTestStream()
 	req := roachpb.RangeFeedRequest{
 		Header: roachpb.Header{
-			RangeID: store.LookupReplica(roachpb.RKey("a")).RangeID,
+			RangeID: store.LookupReplica(rdesc.StartKey).RangeID,
 		},
-		Span: roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")},
+		Span: roachpb.Span{Key: rdesc.StartKey.AsRawKey(), EndKey: rdesc.EndKey.AsRawKey()},
 	}
 
 	// Cancel the stream's context so that RangeFeed would return
@@ -772,8 +782,10 @@ func TestReplicaRangefeedPushesTransactions(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc, db, _, repls := setupClusterForClosedTimestampTesting(ctx, t, testingTargetDuration, testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	tc, db, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
+		testingCloseFraction, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
@@ -884,8 +896,10 @@ func TestReplicaRangefeedNudgeSlowClosedTimestamp(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc, db, desc, repls := setupClusterForClosedTimestampTesting(ctx, t, testingTargetDuration, testingCloseFraction, aggressiveResolvedTimestampClusterArgs)
+	tc, db, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration,
+		testingCloseFraction, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
+	repls := replsForRange(ctx, t, tc, desc, numNodes)
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)

@@ -12,7 +12,7 @@ go_library(
         "//pkg/col/coldata",
         "//pkg/col/typeconv",
         "//pkg/sql/catalog/descpb",
-        "//pkg/sql/colexecbase/colexecerror",
+        "//pkg/sql/colexecerror",
         "//pkg/sql/rowenc",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
@@ -23,6 +23,7 @@ go_library(
 
 go_test(
     name = "coldataext_test",
+    size = "small",
     srcs = ["datum_vec_test.go"],
     embed = [":coldataext"],
     deps = [

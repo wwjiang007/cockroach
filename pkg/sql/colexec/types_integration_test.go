@@ -19,8 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -50,9 +50,9 @@ func TestSQLTypesIntegration(t *testing.T) {
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Cfg: &execinfra.ServerConfig{
-			Settings:    st,
-			DiskMonitor: diskMonitor,
+			Settings: st,
 		},
+		DiskMonitor: diskMonitor,
 	}
 
 	var da rowenc.DatumAlloc
@@ -94,7 +94,7 @@ func TestSQLTypesIntegration(t *testing.T) {
 				output,
 				nil, /* metadataSourcesQueue */
 				nil, /* toClose */
-				nil, /* execStatsForTrace */
+				nil, /* getStats */
 				nil, /* cancelFlow */
 			)
 			require.NoError(t, err)
@@ -121,7 +121,7 @@ func TestSQLTypesIntegration(t *testing.T) {
 // - converting from Arrow format
 // and returns the resulting batch.
 type arrowTestOperator struct {
-	OneInputNode
+	colexecop.OneInputNode
 
 	c *colserde.ArrowBatchConverter
 	r *colserde.RecordBatchSerializer
@@ -129,16 +129,16 @@ type arrowTestOperator struct {
 	typs []*types.T
 }
 
-var _ colexecbase.Operator = &arrowTestOperator{}
+var _ colexecop.Operator = &arrowTestOperator{}
 
 func newArrowTestOperator(
-	input colexecbase.Operator,
+	input colexecop.Operator,
 	c *colserde.ArrowBatchConverter,
 	r *colserde.RecordBatchSerializer,
 	typs []*types.T,
-) colexecbase.Operator {
+) colexecop.Operator {
 	return &arrowTestOperator{
-		OneInputNode: NewOneInputNode(input),
+		OneInputNode: colexecop.NewOneInputNode(input),
 		c:            c,
 		r:            r,
 		typs:         typs,
@@ -146,11 +146,11 @@ func newArrowTestOperator(
 }
 
 func (a *arrowTestOperator) Init() {
-	a.input.Init()
+	a.Input.Init()
 }
 
 func (a *arrowTestOperator) Next(ctx context.Context) coldata.Batch {
-	batchIn := a.input.Next(ctx)
+	batchIn := a.Input.Next(ctx)
 	// Note that we don't need to handle zero-length batches in a special way.
 	var buf bytes.Buffer
 	arrowDataIn, err := a.c.BatchToArrow(batchIn)

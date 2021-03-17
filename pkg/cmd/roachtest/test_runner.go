@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"html"
 	"io"
 	"math/rand"
 	"net"
@@ -269,7 +270,7 @@ func (r *testRunner) Run(
 	for i := 0; i < parallelism; i++ {
 		i := i // Copy for closure.
 		wg.Add(1)
-		stopper.RunWorker(ctx, func(ctx context.Context) {
+		if err := stopper.RunAsyncTask(ctx, "worker", func(ctx context.Context) {
 			defer wg.Done()
 
 			if err := r.runWorker(
@@ -284,15 +285,22 @@ func (r *testRunner) Run(
 				msg := fmt.Sprintf("Worker %d returned with error. Quiescing. Error: %+v", i, err)
 				shout(ctx, l, lopt.stdout, msg)
 				errs.AddErr(err)
-				// Quiesce the stopper. This will cause all workers to not pick up more
-				// tests after finishing the currently running one.
-				stopper.Quiesce(ctx)
+				// Stop the stopper. This will cause all workers to not pick up more
+				// tests after finishing the currently running one. We add one to the
+				// WaitGroup so that wg.Wait() will also wait for the stopper.
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					stopper.Stop(ctx)
+				}()
 				// Interrupt everybody waiting for resources.
 				if qp != nil {
 					qp.Close(msg)
 				}
 			}
-		})
+		}); err != nil {
+			wg.Done()
+		}
 	}
 
 	// Wait for all the workers to finish.
@@ -1100,7 +1108,7 @@ func (r *testRunner) serveHTTP(wr http.ResponseWriter, req *http.Request) {
 		name := fmt.Sprintf("%s (run %d)", t.test, t.run)
 		status := "PASS"
 		if !t.pass {
-			status = "FAIL " + t.failure
+			status = "FAIL " + strings.ReplaceAll(html.EscapeString(t.failure), "\n", "<br>")
 		}
 		duration := fmt.Sprintf("%s (%s - %s)", t.end.Sub(t.start), t.start, t.end)
 		fmt.Fprintf(wr, "<tr><td>%s</td><td>%s</td><td>%s</td><tr/>", name, status, duration)
@@ -1176,8 +1184,8 @@ func PredecessorVersion(buildVersion version.Version) (string, error) {
 	// (see runVersionUpgrade). The same is true for adding a new key to this
 	// map.
 	verMap := map[string]string{
-		"21.1": "20.2.3",
-		"20.2": "20.1.10",
+		"21.1": "20.2.6",
+		"20.2": "20.1.12",
 		"20.1": "19.2.11",
 		"19.2": "19.1.11",
 		"19.1": "2.1.9",

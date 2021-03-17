@@ -152,14 +152,19 @@ func (r gcQueueScore) String() string {
 // in the event that the cumulative ages of GC'able bytes or extant
 // intents exceed thresholds.
 func (gcq *gcQueue) shouldQueue(
-	ctx context.Context, now hlc.Timestamp, repl *Replica, _ *config.SystemConfig,
+	ctx context.Context, now hlc.ClockTimestamp, repl *Replica, _ *config.SystemConfig,
 ) (bool, float64) {
 
 	// Consult the protected timestamp state to determine whether we can GC and
 	// the timestamp which can be used to calculate the score.
 	_, zone := repl.DescAndZone()
-	canGC, _, gcTimestamp, _ := repl.checkProtectedTimestampsForGC(ctx, *zone.GC)
+	canGC, _, gcTimestamp, oldThreshold, newThreshold := repl.checkProtectedTimestampsForGC(ctx, *zone.GC)
 	if !canGC {
+		return false, 0
+	}
+	// If performing a GC will not advance the GC threshold, there's no reason
+	// to GC again.
+	if newThreshold.Equal(oldThreshold) {
 		return false, 0
 	}
 	r := makeGCQueueScore(ctx, repl, gcTimestamp, *zone.GC)
@@ -442,7 +447,7 @@ func (gcq *gcQueue) process(
 	// Consult the protected timestamp state to determine whether we can GC and
 	// the timestamp which can be used to calculate the score and updated GC
 	// threshold.
-	canGC, cacheTimestamp, gcTimestamp, newThreshold := repl.checkProtectedTimestampsForGC(ctx, *zone.GC)
+	canGC, cacheTimestamp, gcTimestamp, _, newThreshold := repl.checkProtectedTimestampsForGC(ctx, *zone.GC)
 	if !canGC {
 		return false, nil
 	}

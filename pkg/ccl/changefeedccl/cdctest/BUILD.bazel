@@ -12,6 +12,7 @@ go_library(
     deps = [
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
+        "//pkg/roachpb",
         "//pkg/sql",
         "//pkg/sql/parser",
         "//pkg/sql/sem/tree",
@@ -24,6 +25,7 @@ go_library(
         "//pkg/util/randutil",
         "//pkg/util/retry",
         "//pkg/util/timeutil",
+        "@com_github_cockroachdb_cockroach_go//crdb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_jackc_pgx//:pgx",
     ],
@@ -31,6 +33,7 @@ go_library(
 
 go_test(
     name = "cdctest_test",
+    size = "small",
     srcs = [
         "main_test.go",
         "validator_test.go",

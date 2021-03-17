@@ -252,7 +252,7 @@ vectorized: true
 └── • render
     │ columns: (r)
     │ estimated row count: 1,000 (missing stats)
-    │ render 0: b + 2
+    │ render r: b + 2
     │
     └── • scan
           columns: (b)
@@ -276,7 +276,7 @@ vectorized: true
 └── • render
     │ columns: (y)
     │ estimated row count: 1,000 (missing stats)
-    │ render 0: b + 2
+    │ render y: b + 2
     │
     └── • scan
           columns: (b)
@@ -653,6 +653,7 @@ distribution: local
 vectorized: true
 ·
 • ordinality
+│ estimated row count: 3
 │
 └── • values
       size: 1 column, 3 rows
@@ -664,9 +665,11 @@ distribution: local
 vectorized: true
 ·
 • sort
+│ estimated row count: 3
 │ order: -"ordinality"
 │
 └── • ordinality
+    │ estimated row count: 3
     │
     └── • values
           size: 1 column, 3 rows
@@ -774,10 +777,10 @@ vectorized: true
     └── • render
         │ columns: (a, b, c, c_new)
         │ estimated row count: 1,000 (missing stats)
-        │ render 0: true
-        │ render 1: a
-        │ render 2: b
-        │ render 3: c
+        │ render c_new: true
+        │ render a: a
+        │ render b: b
+        │ render c: c
         │
         └── • scan
               columns: (a, b, c)
@@ -858,18 +861,19 @@ vectorized: true
 • project
 │ columns: (b, a)
 │
-└── • sort
+└── • render
     │ columns: (column6, a, b)
     │ ordering: +a
     │ estimated row count: 1,000 (missing stats)
-    │ order: +a
+    │ render column6: a
+    │ render a: a
+    │ render b: b
     │
-    └── • render
-        │ columns: (column6, a, b)
+    └── • sort
+        │ columns: (a, b)
+        │ ordering: +a
         │ estimated row count: 1,000 (missing stats)
-        │ render 0: a
-        │ render 1: a
-        │ render 2: b
+        │ order: +a
         │
         └── • scan
               columns: (a, b)
@@ -886,18 +890,19 @@ vectorized: true
 • project
 │ columns: (b, a)
 │
-└── • sort
+└── • render
     │ columns: (column6, a, b)
     │ ordering: +b
     │ estimated row count: 1,000 (missing stats)
-    │ order: +b
+    │ render column6: b
+    │ render a: a
+    │ render b: b
     │
-    └── • render
-        │ columns: (column6, a, b)
+    └── • sort
+        │ columns: (a, b)
+        │ ordering: +b
         │ estimated row count: 1,000 (missing stats)
-        │ render 0: b
-        │ render 1: a
-        │ render 2: b
+        │ order: +b
         │
         └── • scan
               columns: (a, b)

@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
@@ -23,24 +24,24 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
-func (p *planner) schemaExists(
-	ctx context.Context, parentID descpb.ID, schema string,
-) (bool, error) {
+func schemaExists(
+	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, parentID descpb.ID, schema string,
+) (bool, descpb.ID, error) {
 	// Check statically known schemas.
 	if schema == tree.PublicSchema {
-		return true, nil
+		return true, descpb.InvalidID, nil
 	}
 	for _, s := range virtualSchemas {
 		if s.name == schema {
-			return true, nil
+			return true, descpb.InvalidID, nil
 		}
 	}
 	// Now lookup in the namespace for other schemas.
-	exists, _, err := catalogkv.LookupObjectID(ctx, p.txn, p.ExecCfg().Codec, parentID, keys.RootNamespaceID, schema)
+	exists, schemaID, err := catalogkv.LookupObjectID(ctx, txn, codec, parentID, keys.RootNamespaceID, schema)
 	if err != nil {
-		return false, err
+		return false, descpb.InvalidID, err
 	}
-	return exists, nil
+	return exists, schemaID, nil
 }
 
 func (p *planner) writeSchemaDesc(ctx context.Context, desc *schemadesc.Mutable) error {
@@ -59,14 +60,14 @@ func (p *planner) writeSchemaDescChange(
 	job, jobExists := p.extendedEvalCtx.SchemaChangeJobCache[desc.ID]
 	if jobExists {
 		// Update it.
-		if err := job.WithTxn(p.txn).SetDescription(ctx,
+		if err := job.SetDescription(ctx, p.txn,
 			func(ctx context.Context, desc string) (string, error) {
 				return desc + "; " + jobDesc, nil
 			},
 		); err != nil {
 			return err
 		}
-		log.Infof(ctx, "job %d: updated with for change on schema %d", *job.ID(), desc.ID)
+		log.Infof(ctx, "job %d: updated with for change on schema %d", job.ID(), desc.ID)
 	} else {
 		// Or, create a new job.
 		jobRecord := jobs.Record{
@@ -79,13 +80,14 @@ func (p *planner) writeSchemaDescChange(
 				// jobs.
 				FormatVersion: jobspb.DatabaseJobFormatVersion,
 			},
-			Progress: jobspb.SchemaChangeProgress{},
+			Progress:      jobspb.SchemaChangeProgress{},
+			NonCancelable: true,
 		}
-		newJob, err := p.extendedEvalCtx.QueueJob(jobRecord)
+		newJob, err := p.extendedEvalCtx.QueueJob(ctx, jobRecord)
 		if err != nil {
 			return err
 		}
-		log.Infof(ctx, "queued new schema change job %d for schema %d", *newJob.ID(), desc.ID)
+		log.Infof(ctx, "queued new schema change job %d for schema %d", newJob.ID(), desc.ID)
 	}
 
 	return p.writeSchemaDesc(ctx, desc)

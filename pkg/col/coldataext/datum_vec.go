@@ -16,7 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -87,7 +87,10 @@ func (d *Datum) Hash(da *rowenc.DatumAlloc) []byte {
 	// decode ed for fingerprinting, so we pass in nil memory account.
 	b, err := ed.Fingerprint(context.TODO(), d.ResolvedType(), da, nil /* appendTo */, nil /* acc */)
 	if err != nil {
-		colexecerror.InternalError(err)
+		// Since we know that the memory accounting error cannot occur in
+		// Fingerprint, we only can get an expected error (e.g. unable to encode
+		// JSON as a key), so we propagate all of them accordingly.
+		colexecerror.ExpectedError(err)
 	}
 	return b
 }

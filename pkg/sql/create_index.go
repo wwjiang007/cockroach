@@ -112,7 +112,7 @@ func (p *planner) setupFamilyAndConstraintForShard(
 	if err != nil {
 		return err
 	}
-	info, err := tableDesc.GetConstraintInfo(ctx, nil)
+	info, err := tableDesc.GetConstraintInfo()
 	if err != nil {
 		return err
 	}
@@ -145,7 +145,7 @@ func (p *planner) setupFamilyAndConstraintForShard(
 // is hash sharded. Note that `tableDesc` will be modified when this method is called for
 // a hash sharded index.
 func MakeIndexDescriptor(
-	params runParams, n *tree.CreateIndex, tableDesc *tabledesc.Mutable,
+	params runParams, n tree.CreateIndex, tableDesc *tabledesc.Mutable,
 ) (*descpb.IndexDescriptor, error) {
 	// Ensure that the columns we want to index exist before trying to create the
 	// index.
@@ -169,10 +169,6 @@ func MakeIndexDescriptor(
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support interleaved tables")
 		}
 
-		if n.PartitionBy != nil {
-			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support partitioning")
-		}
-
 		if n.Sharded != nil {
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support hash sharding")
 		}
@@ -185,17 +181,14 @@ func MakeIndexDescriptor(
 			return nil, pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes can't be unique")
 		}
 
-		if !params.SessionData().EnableMultiColumnInvertedIndexes && len(n.Columns) > 1 {
-			return nil, pgerror.New(pgcode.FeatureNotSupported, "indexing more than one column with an inverted index is not supported")
-		}
 		indexDesc.Type = descpb.IndexDescriptor_INVERTED
-		columnDesc, _, err := tableDesc.FindColumnByName(n.Columns[len(n.Columns)-1].Column)
+		column, err := tableDesc.FindColumnWithName(n.Columns[len(n.Columns)-1].Column)
 		if err != nil {
 			return nil, err
 		}
-		switch columnDesc.Type.Family() {
+		switch column.GetType().Family() {
 		case types.GeometryFamily:
-			config, err := geoindex.GeometryIndexConfigForSRID(columnDesc.Type.GeoSRIDOrZero())
+			config, err := geoindex.GeometryIndexConfigForSRID(column.GetType().GeoSRIDOrZero())
 			if err != nil {
 				return nil, err
 			}
@@ -207,20 +200,23 @@ func MakeIndexDescriptor(
 		}
 		telemetry.Inc(sqltelemetry.InvertedIndexCounter)
 	}
-
+	columns := n.Columns
 	if n.Sharded != nil {
-		if n.PartitionBy != nil {
+		if n.PartitionByIndex.ContainsPartitions() {
 			return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
+		}
+		if tableDesc.IsLocalityRegionalByRow() {
+			return nil, hashShardedIndexesOnRegionalByRowError()
 		}
 		if n.Interleave != nil {
 			return nil, pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot also be hash sharded")
 		}
-		shardCol, newColumn, err := setupShardedIndex(
+		shardCol, newColumns, newColumn, err := setupShardedIndex(
 			params.ctx,
 			params.EvalContext(),
 			&params.p.semaCtx,
 			params.SessionData().HashShardedIndexesEnabled,
-			&n.Columns,
+			n.Columns,
 			n.Sharded.ShardBuckets,
 			tableDesc,
 			&indexDesc,
@@ -228,6 +224,7 @@ func MakeIndexDescriptor(
 		if err != nil {
 			return nil, err
 		}
+		columns = newColumns
 		if newColumn {
 			if err := params.p.setupFamilyAndConstraintForShard(params.ctx, tableDesc, shardCol,
 				indexDesc.Sharded.ColumnNames, indexDesc.Sharded.ShardBuckets); err != nil {
@@ -247,7 +244,7 @@ func MakeIndexDescriptor(
 		telemetry.Inc(sqltelemetry.PartialIndexCounter)
 	}
 
-	if err := indexDesc.FillColumns(n.Columns); err != nil {
+	if err := indexDesc.FillColumns(columns); err != nil {
 		return nil, err
 	}
 
@@ -270,11 +267,11 @@ func validateIndexColumnsExist(desc *tabledesc.Mutable, columns tree.IndexElemLi
 		if column.Expr != nil {
 			return unimplemented.NewWithIssuef(9682, "only simple columns are supported as index elements")
 		}
-		_, dropping, err := desc.FindColumnByName(column.Column)
+		foundColumn, err := desc.FindColumnWithName(column.Column)
 		if err != nil {
 			return err
 		}
-		if dropping {
+		if foundColumn.Dropped() {
 			return colinfo.NewUndefinedColumnError(string(column.Column))
 		}
 	}
@@ -289,46 +286,50 @@ func (n *createIndexNode) ReadingOwnWrites() {}
 var hashShardedIndexesDisabledError = pgerror.Newf(pgcode.FeatureNotSupported,
 	"hash sharded indexes require the experimental_enable_hash_sharded_indexes session variable")
 
+// setupShardedIndex updates the index descriptor with the relevant new column.
+// It also returns the column so it can be added to the table. It returns the
+// new column set for the index. This set must be used regardless of whether or
+// not there is a newly created column.
 func setupShardedIndex(
 	ctx context.Context,
 	evalCtx *tree.EvalContext,
 	semaCtx *tree.SemaContext,
 	shardedIndexEnabled bool,
-	columns *tree.IndexElemList,
+	columns tree.IndexElemList,
 	bucketsExpr tree.Expr,
 	tableDesc *tabledesc.Mutable,
 	indexDesc *descpb.IndexDescriptor,
 	isNewTable bool,
-) (shard *descpb.ColumnDescriptor, newColumn bool, err error) {
+) (shard *descpb.ColumnDescriptor, newColumns tree.IndexElemList, newColumn bool, err error) {
 	if !shardedIndexEnabled {
-		return nil, false, hashShardedIndexesDisabledError
+		return nil, nil, false, hashShardedIndexesDisabledError
 	}
 
-	colNames := make([]string, 0, len(*columns))
-	for _, c := range *columns {
+	colNames := make([]string, 0, len(columns))
+	for _, c := range columns {
 		colNames = append(colNames, string(c.Column))
 	}
 	buckets, err := tabledesc.EvalShardBucketCount(ctx, semaCtx, evalCtx, bucketsExpr)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	shardCol, newColumn, err := maybeCreateAndAddShardCol(int(buckets), tableDesc,
 		colNames, isNewTable)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	shardIdxElem := tree.IndexElem{
 		Column:    tree.Name(shardCol.Name),
 		Direction: tree.Ascending,
 	}
-	*columns = append(tree.IndexElemList{shardIdxElem}, *columns...)
+	newColumns = append(tree.IndexElemList{shardIdxElem}, columns...)
 	indexDesc.Sharded = descpb.ShardedDescriptor{
 		IsSharded:    true,
 		Name:         shardCol.Name,
 		ShardBuckets: buckets,
 		ColumnNames:  colNames,
 	}
-	return shardCol, newColumn, nil
+	return shardCol, newColumns, newColumn, nil
 }
 
 // maybeCreateAndAddShardCol adds a new hidden computed shard column (or its mutation) to
@@ -341,24 +342,24 @@ func maybeCreateAndAddShardCol(
 	if err != nil {
 		return nil, false, err
 	}
-	existingShardCol, dropped, err := desc.FindColumnByName(tree.Name(shardCol.Name))
-	if err == nil && !dropped {
+	existingShardCol, err := desc.FindColumnWithName(tree.Name(shardCol.Name))
+	if err == nil && !existingShardCol.Dropped() {
 		// TODO(ajwerner): In what ways is existingShardCol allowed to differ from
 		// the newly made shardCol? Should there be some validation of
 		// existingShardCol?
-		if !existingShardCol.Hidden {
+		if !existingShardCol.IsHidden() {
 			// The user managed to reverse-engineer our crazy shard column name, so
 			// we'll return an error here rather than try to be tricky.
 			return nil, false, pgerror.Newf(pgcode.DuplicateColumn,
 				"column %s already specified; can't be used for sharding", shardCol.Name)
 		}
-		return existingShardCol, false, nil
+		return existingShardCol.ColumnDesc(), false, nil
 	}
 	columnIsUndefined := sqlerrors.IsUndefinedColumnError(err)
 	if err != nil && !columnIsUndefined {
 		return nil, false, err
 	}
-	if columnIsUndefined || dropped {
+	if columnIsUndefined || existingShardCol.Dropped() {
 		if isNewTable {
 			desc.AddColumn(shardCol)
 		} else {
@@ -369,11 +370,37 @@ func maybeCreateAndAddShardCol(
 	return shardCol, created, nil
 }
 
+var interleavedTableDeprecationError = errors.WithIssueLink(
+	pgnotice.Newf("interleaved tables and interleaved indexes are deprecated in 20.2 and will be removed in 21.2"),
+	errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
+)
+
+var interleavedTableDisabledError = errors.WithIssueLink(
+	pgerror.New(pgcode.WarningDeprecatedFeature,
+		"interleaved tables and interleaved indexes are disabled due to the sql.defaults."+
+			"interleaved_tables.enabled cluster setting. Note that interleaved tables and interleaved indexes will be "+
+			"removed in a future release. For details, see https://www.cockroachlabs.com/docs/releases/v20.2.0#deprecations"),
+	errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
+)
+
+// interleavedTableDeprecationAction either returns an error, if interleaved
+// tables are disabled, or sends a notice, if they're not.
+func interleavedTableDeprecationAction(params runParams) error {
+	if !InterleavedTablesEnabled.Get(params.p.execCfg.SV()) {
+		return interleavedTableDisabledError
+	}
+	params.p.BufferClientNotice(
+		params.ctx,
+		interleavedTableDeprecationError,
+	)
+	return nil
+}
+
 func (n *createIndexNode) startExec(params runParams) error {
 	telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("index"))
-	_, dropped, err := n.tableDesc.FindIndexByName(string(n.n.Name))
+	foundIndex, err := n.tableDesc.FindIndexWithName(string(n.n.Name))
 	if err == nil {
-		if dropped {
+		if foundIndex.Dropped() {
 			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 				"index %q being dropped, try again later", string(n.n.Name))
 		}
@@ -391,7 +418,11 @@ func (n *createIndexNode) startExec(params runParams) error {
 
 	// Warn against creating a non-partitioned index on a partitioned table,
 	// which is undesirable in most cases.
-	if n.n.PartitionBy == nil && n.tableDesc.GetPrimaryIndex().Partitioning.NumColumns > 0 {
+	// Avoid the warning if we have PARTITION ALL BY as all indexes will implicitly
+	// have relevant partitioning columns prepended at the front.
+	if n.n.PartitionByIndex == nil &&
+		n.tableDesc.GetPrimaryIndex().GetPartitioning().NumColumns > 0 &&
+		!n.tableDesc.IsPartitionAllBy() {
 		params.p.BufferClientNotice(
 			params.ctx,
 			errors.WithHint(
@@ -402,16 +433,16 @@ func (n *createIndexNode) startExec(params runParams) error {
 	}
 
 	if n.n.Interleave != nil {
-		params.p.BufferClientNotice(
-			params.ctx,
-			errors.WithIssueLink(
-				pgnotice.Newf("interleaved tables and indexes are deprecated in 20.2 and will be removed in 21.2"),
-				errors.IssueLink{IssueURL: build.MakeIssueURL(52009)},
-			),
-		)
+		if n.n.PartitionByIndex != nil {
+			return pgerror.New(pgcode.FeatureNotSupported, "interleaved indexes cannot be partitioned")
+		}
+
+		if err := interleavedTableDeprecationAction(params); err != nil {
+			return err
+		}
 	}
 
-	indexDesc, err := MakeIndexDescriptor(params, n.n, n.tableDesc)
+	indexDesc, err := MakeIndexDescriptor(params, *n.n, n.tableDesc)
 	if err != nil {
 		return err
 	}
@@ -427,13 +458,21 @@ func (n *createIndexNode) startExec(params runParams) error {
 	}
 	indexDesc.Version = encodingVersion
 
-	if n.n.PartitionBy != nil {
-		partitioning, err := CreatePartitioning(params.ctx, params.p.ExecCfg().Settings,
-			params.EvalContext(), n.tableDesc, indexDesc, n.n.PartitionBy)
-		if err != nil {
-			return err
-		}
-		indexDesc.Partitioning = partitioning
+	if n.n.PartitionByIndex != nil && n.tableDesc.GetLocalityConfig() != nil {
+		return pgerror.New(
+			pgcode.FeatureNotSupported,
+			"cannot define PARTITION BY on a new INDEX in a multi-region database",
+		)
+	}
+
+	*indexDesc, err = params.p.configureIndexDescForNewIndexPartitioning(
+		params.ctx,
+		n.tableDesc,
+		*indexDesc,
+		n.n.PartitionByIndex,
+	)
+	if err != nil {
+		return err
 	}
 
 	mutationIdx := len(n.tableDesc.Mutations)
@@ -443,6 +482,14 @@ func (n *createIndexNode) startExec(params runParams) error {
 	if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
 		return err
 	}
+	if err := params.p.configureZoneConfigForNewIndexPartitioning(
+		params.ctx,
+		n.tableDesc,
+		*indexDesc,
+	); err != nil {
+		return err
+	}
+
 	// The index name may have changed as a result of
 	// AllocateIDs(). Retrieve it for the event log below.
 	index := n.tableDesc.Mutations[mutationIdx].GetIndex()
@@ -484,3 +531,83 @@ func (n *createIndexNode) startExec(params runParams) error {
 func (*createIndexNode) Next(runParams) (bool, error) { return false, nil }
 func (*createIndexNode) Values() tree.Datums          { return tree.Datums{} }
 func (*createIndexNode) Close(context.Context)        {}
+
+// configureIndexDescForNewIndexPartitioning returns a new copy of an index descriptor
+// containing modifications needed if partitioning is configured.
+func (p *planner) configureIndexDescForNewIndexPartitioning(
+	ctx context.Context,
+	tableDesc *tabledesc.Mutable,
+	indexDesc descpb.IndexDescriptor,
+	partitionByIndex *tree.PartitionByIndex,
+) (descpb.IndexDescriptor, error) {
+	var err error
+	if partitionByIndex.ContainsPartitioningClause() || tableDesc.IsPartitionAllBy() {
+		var partitionBy *tree.PartitionBy
+		if !tableDesc.IsPartitionAllBy() {
+			if partitionByIndex.ContainsPartitions() {
+				partitionBy = partitionByIndex.PartitionBy
+			}
+		} else if partitionByIndex.ContainsPartitioningClause() {
+			return indexDesc, pgerror.New(
+				pgcode.FeatureNotSupported,
+				"cannot define PARTITION BY on an index if the table has a PARTITION ALL BY definition",
+			)
+		} else {
+			partitionBy, err = partitionByFromTableDesc(p.ExecCfg().Codec, tableDesc)
+			if err != nil {
+				return indexDesc, err
+			}
+		}
+		allowImplicitPartitioning := p.EvalContext().SessionData.ImplicitColumnPartitioningEnabled ||
+			tableDesc.IsLocalityRegionalByRow()
+		if partitionBy != nil {
+			if indexDesc, err = CreatePartitioning(
+				ctx,
+				p.ExecCfg().Settings,
+				p.EvalContext(),
+				tableDesc,
+				indexDesc,
+				partitionBy,
+				nil, /* allowedNewColumnNames */
+				allowImplicitPartitioning,
+			); err != nil {
+				return indexDesc, err
+			}
+		}
+	}
+	return indexDesc, nil
+}
+
+// configureZoneConfigForNewIndexPartitioning configures the zone config for any new index
+// in a REGIONAL BY ROW table.
+// This *must* be done after the index ID has been allocated.
+func (p *planner) configureZoneConfigForNewIndexPartitioning(
+	ctx context.Context, tableDesc *tabledesc.Mutable, indexDesc descpb.IndexDescriptor,
+) error {
+	if indexDesc.ID == 0 {
+		return errors.AssertionFailedf("index %s does not have id", indexDesc.Name)
+	}
+	// For REGIONAL BY ROW tables, correctly configure relevant zone configurations.
+	if tableDesc.IsLocalityRegionalByRow() {
+		_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
+			ctx,
+			p.txn,
+			tableDesc.ParentID,
+			tree.DatabaseLookupFlags{Required: true},
+		)
+		if err != nil {
+			return err
+		}
+		if err := ApplyZoneConfigForMultiRegionTable(
+			ctx,
+			p.txn,
+			p.ExecCfg(),
+			*dbDesc.RegionConfig,
+			tableDesc,
+			applyZoneConfigForMultiRegionTableOptionNewIndexes(indexDesc.ID),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}

@@ -357,8 +357,10 @@ func (ir *IntentResolver) MaybePushTransactions(
 	log.Eventf(ctx, "pushing %d transaction(s)", len(pushTxns))
 
 	// Attempt to push the transaction(s).
+	pushTo := h.Timestamp.Next()
 	b := &kv.Batch{}
 	b.Header.Timestamp = ir.clock.Now()
+	b.Header.Timestamp.Forward(pushTo)
 	for _, pushTxn := range pushTxns {
 		b.AddRawRequest(&roachpb.PushTxnRequest{
 			RequestHeader: roachpb.RequestHeader{
@@ -366,7 +368,7 @@ func (ir *IntentResolver) MaybePushTransactions(
 			},
 			PusherTxn: pusherTxn,
 			PusheeTxn: *pushTxn,
-			PushTo:    h.Timestamp.Next(),
+			PushTo:    pushTo,
 			PushType:  pushType,
 		})
 	}
@@ -375,6 +377,10 @@ func (ir *IntentResolver) MaybePushTransactions(
 	if err != nil {
 		return nil, b.MustPErr()
 	}
+
+	// TODO(nvanbenschoten): if we succeed because the transaction has already
+	// been pushed _past_ where we were pushing, we need to set the synthetic
+	// bit. This is part of #36431.
 
 	br := b.RawResponse()
 	pushedTxns := make(map[uuid.UUID]*roachpb.Transaction, len(br.Responses))
@@ -854,6 +860,8 @@ func (ir *IntentResolver) ResolveIntents(
 			_ = resp.Resp // ignore the response
 		case <-ctx.Done():
 			return roachpb.NewError(ctx.Err())
+		case <-ir.stopper.ShouldQuiesce():
+			return roachpb.NewErrorf("stopping")
 		}
 	}
 	return nil

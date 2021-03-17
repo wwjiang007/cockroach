@@ -1,4 +1,11 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//build:STRINGER.bzl", "stringer")
+
+filegroup(
+    name = "testdata",
+    srcs = glob(["testdata/**"]),
+    visibility = ["//pkg/sql/sem/tree/eval_test:__subpackages__"],
+)
 
 go_library(
     name = "tree",
@@ -27,7 +34,6 @@ go_library(
         "constants.go",
         "copy.go",
         "create.go",
-        "createtypevariety_string.go",
         "datum.go",
         "decimal.go",
         "delete.go",
@@ -65,6 +71,7 @@ go_library(
         "regexp_cache.go",
         "region.go",
         "rename.go",
+        "replication_stream.go",
         "returning.go",
         "revoke.go",
         "run_control.go",
@@ -74,8 +81,8 @@ go_library(
         "set.go",
         "show.go",
         "split.go",
-        "statementtype_string.go",
         "stmt.go",
+        "stream_ingestion.go",
         "survival_goal.go",
         "table_name.go",
         "table_pattern.go",
@@ -87,6 +94,7 @@ go_library(
         "type_check.go",
         "type_name.go",
         "union.go",
+        "unsupported_error.go",
         "update.go",
         "values.go",
         "var_name.go",
@@ -96,11 +104,14 @@ go_library(
         "window_funcs_util.go",
         "with.go",
         "zone.go",
+        ":gen-createtypevariety-stringer",  # keep
+        ":gen-statementtype-stringer",  # keep
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/sem/tree",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
+        "//pkg/clusterversion",
         "//pkg/geo",
         "//pkg/geo/geopb",
         "//pkg/keys",
@@ -155,6 +166,7 @@ go_library(
 
 go_test(
     name = "tree_test",
+    size = "small",
     srcs = [
         "casts_test.go",
         "col_types_test.go",
@@ -187,6 +199,7 @@ go_test(
         "timeconv_test.go",
         "type_check_internal_test.go",
         "type_check_test.go",
+        "type_name_test.go",
         "window_funcs_test.go",
     ],
     data = glob(["testdata/**"]),
@@ -198,6 +211,7 @@ go_test(
         "//pkg/security",
         "//pkg/security/securitytest",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog/typedesc",
         "//pkg/sql/oidext",
         "//pkg/sql/opt/exec/execbuilder",
         "//pkg/sql/opt/optbuilder",
@@ -205,7 +219,6 @@ go_test(
         "//pkg/sql/parser",
         "//pkg/sql/rowenc",
         "//pkg/sql/sem/builtins",
-        "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondata",
         "//pkg/sql/types",
         "//pkg/testutils",
@@ -226,4 +239,16 @@ go_test(
         "@com_github_stretchr_testify//require",
         "@org_golang_x_sync//errgroup",
     ],
+)
+
+stringer(
+    name = "gen-createtypevariety-stringer",
+    src = "create.go",
+    typ = "CreateTypeVariety",
+)
+
+stringer(
+    name = "gen-statementtype-stringer",
+    src = "stmt.go",
+    typ = "StatementType",
 )

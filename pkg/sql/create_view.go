@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/errors"
 )
 
 // createViewNode represents a CREATE VIEW statement.
@@ -60,23 +62,27 @@ type createViewNode struct {
 func (n *createViewNode) ReadingOwnWrites() {}
 
 func (n *createViewNode) startExec(params runParams) error {
+	tableType := tree.GetTableType(
+		false /* isSequence */, true /* isView */, n.materialized,
+	)
 	if n.replace {
-		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("or_replace_view"))
+		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter(fmt.Sprintf("or_replace_%s", tableType)))
 	} else {
-		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter("view"))
+		telemetry.Inc(sqltelemetry.SchemaChangeCreateCounter(tableType))
 	}
 
 	viewName := n.viewName.Object()
-	persistence := n.persistence
 	log.VEventf(params.ctx, 2, "dependencies for view %s:\n%s", viewName, n.planDeps.String())
 
 	// Check that the view does not contain references to other databases.
 	if !allowCrossDatabaseViews.Get(&params.p.execCfg.Settings.SV) {
 		for _, dep := range n.planDeps {
-			if dbID := dep.desc.ParentID; dbID != n.dbDesc.ID && dbID != keys.SystemDatabaseID {
-				return pgerror.Newf(pgcode.FeatureNotSupported,
-					"the view cannot refer to other databases; (see the '%s' cluster setting)",
-					allowCrossDatabaseViewsSetting,
+			if dbID := dep.desc.GetParentID(); dbID != n.dbDesc.ID && dbID != keys.SystemDatabaseID {
+				return errors.WithHintf(
+					pgerror.Newf(pgcode.FeatureNotSupported,
+						"the view cannot refer to other databases; (see the '%s' cluster setting)",
+						allowCrossDatabaseViewsSetting),
+					crossDBReferenceDeprecationHint(),
 				)
 			}
 		}
@@ -85,25 +91,29 @@ func (n *createViewNode) startExec(params runParams) error {
 	// First check the backrefs and see if any of them are temporary.
 	// If so, promote this view to temporary.
 	backRefMutables := make(map[descpb.ID]*tabledesc.Mutable, len(n.planDeps))
+	hasTempBackref := false
 	for id, updated := range n.planDeps {
 		backRefMutable := params.p.Descriptors().GetUncommittedTableByID(id)
 		if backRefMutable == nil {
-			backRefMutable = tabledesc.NewExistingMutable(*updated.desc.TableDesc())
+			backRefMutable = tabledesc.NewBuilder(updated.desc.TableDesc()).BuildExistingMutableTable()
 		}
-		if !persistence.IsTemporary() && backRefMutable.Temporary {
-			// This notice is sent from pg, let's imitate.
-			params.p.BufferClientNotice(
-				params.ctx,
-				pgnotice.Newf(`view "%s" will be a temporary view`, viewName),
-			)
-			persistence = tree.PersistenceTemporary
+		if !n.persistence.IsTemporary() && backRefMutable.Temporary {
+			hasTempBackref = true
 		}
 		backRefMutables[id] = backRefMutable
 	}
+	if hasTempBackref {
+		n.persistence = tree.PersistenceTemporary
+		// This notice is sent from pg, let's imitate.
+		params.p.BufferClientNotice(
+			params.ctx,
+			pgnotice.Newf(`view "%s" will be a temporary view`, viewName),
+		)
+	}
 
 	var replacingDesc *tabledesc.Mutable
-
-	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), persistence, n.viewName)
+	tKey, schemaID, err := getTableCreateParams(params, n.dbDesc.GetID(), n.persistence, n.viewName,
+		tree.ResolveRequireViewDesc, n.ifNotExists)
 	if err != nil {
 		switch {
 		case !sqlerrors.IsRelationAlreadyExistsError(err):
@@ -239,7 +249,7 @@ func (n *createViewNode) startExec(params runParams) error {
 			backRefMutable,
 			descpb.InvalidMutationID,
 			fmt.Sprintf("updating view reference %q in table %s(%d)", n.viewName,
-				updated.desc.Name, updated.desc.ID,
+				updated.desc.GetName(), updated.desc.GetID(),
 			),
 		); err != nil {
 			return err
@@ -251,8 +261,7 @@ func (n *createViewNode) startExec(params runParams) error {
 		return err
 	}
 
-	dg := catalogkv.NewOneLevelUncachedDescGetter(params.p.txn, params.ExecCfg().Codec)
-	if err := newDesc.Validate(params.ctx, dg); err != nil {
+	if err := validateDescriptor(params.ctx, params.p, newDesc); err != nil {
 		return err
 	}
 
@@ -461,4 +470,9 @@ func overrideColumnNames(cols colinfo.ResultColumns, newNames tree.NameList) col
 		res[i].Name = string(newNames[i])
 	}
 	return res
+}
+
+func crossDBReferenceDeprecationHint() string {
+	return fmt.Sprintf("Note that cross-database references will be removed in future releases. See: %s",
+		docs.ReleaseNotesURL(`#deprecations`))
 }

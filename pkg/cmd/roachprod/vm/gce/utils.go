@@ -18,6 +18,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"strings"
 	"text/template"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/vm"
@@ -61,7 +62,8 @@ for d in $(ls /dev/disk/by-id/google-local-* /dev/disk/by-id/google-persistent-d
     sudo mkdir -p "${mountpoint}"
     sudo mkfs.ext4 -F ${d}
     sudo mount -o ${mount_opts} ${d} ${mountpoint}
-    echo "${d} ${mountpoint} ext4 ${mount_opts} 1 1" | sudo tee -a /etc/fstab
+	echo "${d} ${mountpoint} ext4 ${mount_opts} 1 1" | sudo tee -a /etc/fstab
+	sudo chmod 777 ${mountpoint}
   else
     echo "Disk ${disknum}: ${d} already mounted, skipping..."
   fi
@@ -69,9 +71,9 @@ done
 if [ "${disknum}" -eq "0" ]; then
   echo "No disks mounted, creating /mnt/data1"
   sudo mkdir -p /mnt/data1
+  sudo chmod 777 /mnt/data1
 fi
 
-sudo chmod 777 /mnt/data1
 # sshguard can prevent frequent ssh connections to the same host. Disable it.
 sudo service sshguard stop
 # increase the number of concurrent unauthenticated connections to the sshd
@@ -160,11 +162,17 @@ func SyncDNS(vms vm.List) error {
 			fmt.Fprintf(os.Stderr, "removing %s failed: %v", f.Name(), err)
 		}
 	}()
+
+	var zoneBuilder strings.Builder
 	for _, vm := range vms {
-		if len(vm.Name) < 60 {
-			fmt.Fprintf(f, "%s 60 IN A %s\n", vm.Name, vm.PublicIP)
+		entry, err := vm.ZoneEntry()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: skipping: %s\n", err)
+			continue
 		}
+		zoneBuilder.WriteString(entry)
 	}
+	fmt.Fprint(f, zoneBuilder.String())
 	f.Close()
 
 	args := []string{"--project", dnsProject, "dns", "record-sets", "import",
@@ -172,7 +180,7 @@ func SyncDNS(vms vm.List) error {
 	cmd := exec.Command("gcloud", args...)
 	output, err := cmd.CombinedOutput()
 
-	return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", args, output)
+	return errors.Wrapf(err, "Command: %s\nOutput: %s\nZone file contents:\n%s", cmd, output, zoneBuilder.String())
 }
 
 // GetUserAuthorizedKeys retreives reads a list of user public keys from the

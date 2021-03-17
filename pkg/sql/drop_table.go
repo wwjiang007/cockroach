@@ -16,7 +16,9 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -83,8 +85,9 @@ func (p *planner) DropTable(ctx context.Context, n *tree.DropTable) (planNode, e
 				}
 			}
 		}
-		for _, idx := range droppedDesc.AllNonDropIndexes() {
-			for _, ref := range idx.InterleavedBy {
+		for _, idx := range droppedDesc.NonDropIndexes() {
+			for i := 0; i < idx.NumInterleavedBy(); i++ {
+				ref := idx.GetInterleavedBy(i)
 				if _, ok := td[ref.Table]; !ok {
 					if err := p.canRemoveInterleave(ctx, droppedDesc.Name, ref, n.DropBehavior); err != nil {
 						return nil, err
@@ -131,6 +134,7 @@ func (n *dropTableNode) startExec(params runParams) error {
 			droppedDesc,
 			false, /* droppingDatabase */
 			tree.AsStringWithFQNames(n.n, params.Ann()),
+			n.n.DropBehavior,
 		)
 		if err != nil {
 			return err
@@ -141,9 +145,7 @@ func (n *dropTableNode) startExec(params runParams) error {
 		if err := params.p.logEvent(params.ctx,
 			droppedDesc.ID,
 			&eventpb.DropTable{
-				TableName: toDel.tn.FQString(),
-				// TODO(knz): the droppedViews are insufficiently qualified
-				// See: https://github.com/cockroachdb/cockroach/issues/57735
+				TableName:           toDel.tn.FQString(),
 				CascadeDroppedViews: droppedViews,
 			}); err != nil {
 			return err
@@ -256,11 +258,11 @@ func (p *planner) removeInterleave(ctx context.Context, ref descpb.ForeignKeyRef
 		// The referenced table is being dropped. No need to modify it further.
 		return nil
 	}
-	idx, err := table.FindIndexByID(ref.Index)
+	idx, err := table.FindIndexWithID(ref.Index)
 	if err != nil {
 		return err
 	}
-	idx.Interleave.Ancestors = nil
+	idx.IndexDesc().Interleave.Ancestors = nil
 	// No job description, since this is presumably part of some larger schema change.
 	return p.writeSchemaChange(ctx, table, descpb.InvalidMutationID, "")
 }
@@ -268,9 +270,13 @@ func (p *planner) removeInterleave(ctx context.Context, ref descpb.ForeignKeyRef
 // dropTableImpl does the work of dropping a table (and everything that depends
 // on it if `cascade` is enabled). It returns a list of view names that were
 // dropped due to `cascade` behavior. droppingParent indicates whether this
-// table's parent (either database or schema) is being dropped.
+// table's parent (either database or schema) is being dropped
 func (p *planner) dropTableImpl(
-	ctx context.Context, tableDesc *tabledesc.Mutable, droppingParent bool, jobDesc string,
+	ctx context.Context,
+	tableDesc *tabledesc.Mutable,
+	droppingParent bool,
+	jobDesc string,
+	behavior tree.DropBehavior,
 ) ([]string, error) {
 	var droppedViews []string
 
@@ -299,13 +305,14 @@ func (p *planner) dropTableImpl(
 	tableDesc.InboundFKs = nil
 
 	// Remove interleave relationships.
-	for _, idx := range tableDesc.AllNonDropIndexes() {
-		if len(idx.Interleave.Ancestors) > 0 {
-			if err := p.removeInterleaveBackReference(ctx, tableDesc, idx); err != nil {
+	for _, idx := range tableDesc.NonDropIndexes() {
+		if idx.NumInterleaveAncestors() > 0 {
+			if err := p.removeInterleaveBackReference(ctx, tableDesc, idx.IndexDesc()); err != nil {
 				return droppedViews, err
 			}
 		}
-		for _, ref := range idx.InterleavedBy {
+		for i := 0; i < idx.NumInterleavedBy(); i++ {
+			ref := idx.GetInterleavedBy(i)
 			if err := p.removeInterleave(ctx, ref); err != nil {
 				return droppedViews, err
 			}
@@ -321,7 +328,7 @@ func (p *planner) dropTableImpl(
 
 	// Drop sequences that the columns of the table own.
 	for _, col := range tableDesc.Columns {
-		if err := p.dropSequencesOwnedByCol(ctx, &col, !droppingParent); err != nil {
+		if err := p.dropSequencesOwnedByCol(ctx, &col, !droppingParent, behavior); err != nil {
 			return droppedViews, err
 		}
 	}
@@ -332,7 +339,7 @@ func (p *planner) dropTableImpl(
 	dependedOnBy := append([]descpb.TableDescriptor_Reference(nil), tableDesc.DependedOnBy...)
 	for _, ref := range dependedOnBy {
 		viewDesc, err := p.getViewDescForCascade(
-			ctx, tableDesc.TypeName(), tableDesc.Name, tableDesc.ParentID, ref.ID, tree.DropCascade,
+			ctx, string(tableDesc.DescriptorType()), tableDesc.Name, tableDesc.ParentID, ref.ID, tree.DropCascade,
 		)
 		if err != nil {
 			return droppedViews, err
@@ -345,8 +352,14 @@ func (p *planner) dropTableImpl(
 		if err != nil {
 			return droppedViews, err
 		}
+
+		qualifiedView, err := p.getQualifiedTableName(ctx, viewDesc)
+		if err != nil {
+			return droppedViews, err
+		}
+
 		droppedViews = append(droppedViews, cascadedViews...)
-		droppedViews = append(droppedViews, viewDesc.Name)
+		droppedViews = append(droppedViews, qualifiedView.FQString())
 	}
 
 	err := p.removeTableComments(ctx, tableDesc)
@@ -354,13 +367,20 @@ func (p *planner) dropTableImpl(
 		return droppedViews, err
 	}
 
-	// Remove any references to types that this table has if a job is meant to be
-	// queued. If not, then the job that is handling the drop table will also
-	// clean up all of the types to be dropped.
-	if !droppingParent {
-		if err := p.removeBackRefsFromAllTypesInTable(ctx, tableDesc); err != nil {
-			return droppedViews, err
-		}
+	// Remove any references to types.
+	//
+	// Note: In some historical context this attempted to defer these removals to
+	// the asynchronous schema change in the case that the parent was being
+	// dropped. This optimization was, as I understand it, to avoid creating
+	// so many descriptor writes if the type was definitely being dropped. This
+	// would be the case if the database were being dropped as theoretically cross
+	// database types have never been permitted. Unfortunately, the droppingParent
+	// flag does not indicate whether it's the schema or parent being dropped.
+	//
+	// TODO(ajwerner): Consider adding a flag to indicate what is actually being
+	// dropped and to omit this step if it is the database rather than the schema.
+	if err := p.removeBackRefsFromAllTypesInTable(ctx, tableDesc); err != nil {
+		return droppedViews, err
 	}
 
 	err = p.initiateDropTable(ctx, tableDesc, !droppingParent, jobDesc, true /* drain name */)
@@ -373,7 +393,7 @@ func (p *planner) unsplitRangesForTable(ctx context.Context, tableDesc *tabledes
 	// allowed to scan the meta ranges directly.
 	if p.ExecCfg().Codec.ForSystemTenant() {
 		span := tableDesc.TableSpan(p.ExecCfg().Codec)
-		ranges, err := ScanMetaKVs(ctx, p.txn, span)
+		ranges, err := kvclient.ScanMetaKVs(ctx, p.txn, span)
 		if err != nil {
 			return err
 		}
@@ -451,7 +471,7 @@ func (p *planner) initiateDropTable(
 	// Also, changes made here do not affect schema change jobs created in this
 	// transaction with no mutation ID; they remain in the cache, and will be
 	// updated when writing the job record to drop the table.
-	jobIDs := make(map[int64]struct{})
+	jobIDs := make(map[jobspb.JobID]struct{})
 	var id descpb.MutationID
 	for _, m := range tableDesc.Mutations {
 		if id != m.MutationID {
@@ -477,8 +497,8 @@ func (p *planner) initiateDropTable(
 			}
 			return err
 		}
-		if err := mutationJob.WithTxn(p.txn).Update(
-			ctx, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+		if err := mutationJob.Update(
+			ctx, p.txn, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 				status := md.Status
 				switch status {
 				case jobs.StatusSucceeded, jobs.StatusCanceled, jobs.StatusFailed:
@@ -641,10 +661,11 @@ func (p *planner) removeInterleaveBackReference(
 		// The referenced table is being dropped. No need to modify it further.
 		return nil
 	}
-	targetIdx, err := t.FindIndexByID(ancestor.IndexID)
+	targetIdxI, err := t.FindIndexWithID(ancestor.IndexID)
 	if err != nil {
 		return err
 	}
+	targetIdx := targetIdxI.IndexDesc()
 	foundAncestor := false
 	for k, ref := range targetIdx.InterleavedBy {
 		if ref.Table == tableDesc.ID && ref.Index == idx.ID {

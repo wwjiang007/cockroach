@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupresolver"
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
@@ -182,13 +183,13 @@ func getLogicallyMergedTableSpans(
 	checkForKVInBounds func(start, end roachpb.Key, endTime hlc.Timestamp) (bool, error),
 ) ([]roachpb.Span, error) {
 	var nonDropIndexIDs []descpb.IndexID
-	if err := table.ForeachNonDropIndex(func(idxDesc *descpb.IndexDescriptor) error {
-		key := tableAndIndex{tableID: table.GetID(), indexID: idxDesc.ID}
+	if err := catalog.ForEachNonDropIndex(table, func(idx catalog.Index) error {
+		key := tableAndIndex{tableID: table.GetID(), indexID: idx.GetID()}
 		if added[key] {
 			return nil
 		}
 		added[key] = true
-		nonDropIndexIDs = append(nonDropIndexIDs, idxDesc.ID)
+		nonDropIndexIDs = append(nonDropIndexIDs, idx.GetID())
 		return nil
 	}); err != nil {
 		return nil, err
@@ -225,11 +226,11 @@ func getLogicallyMergedTableSpans(
 		lhsSpan := table.IndexSpan(codec, lhsIndexID)
 		rhsSpan := table.IndexSpan(codec, rhsIndexID)
 
-		lhsIndex, err := table.FindIndexByID(lhsIndexID)
+		lhsIndex, err := table.FindIndexWithID(lhsIndexID)
 		if err != nil {
 			return nil, err
 		}
-		rhsIndex, err := table.FindIndexByID(rhsIndexID)
+		rhsIndex, err := table.FindIndexWithID(rhsIndexID)
 		if err != nil {
 			return nil, err
 		}
@@ -331,9 +332,9 @@ func spansForAllTableIndexes(
 		// entire interval. DROPPED tables should never later become PUBLIC.
 		// TODO(pbardea): Consider and test the interaction between revision_history
 		// backups and OFFLINE tables.
-		rawTbl := descpb.TableFromDescriptor(rev.Desc, hlc.Timestamp{})
+		rawTbl, _, _, _ := descpb.FromDescriptor(rev.Desc)
 		if rawTbl != nil && rawTbl.State != descpb.DescriptorState_DROP {
-			tbl := tabledesc.NewImmutable(*rawTbl)
+			tbl := tabledesc.NewBuilder(rawTbl).BuildImmutableTable()
 			revSpans, err := getLogicallyMergedTableSpans(tbl, added, execCfg.Codec, rev.Time,
 				checkForKVInBounds)
 			if err != nil {
@@ -807,13 +808,30 @@ func backupPlanHook(
 			mvccFilter = MVCCFilter_All
 		}
 
-		targetDescs, completeDBs, err := ResolveTargetsToDescriptors(ctx, p, endTime, backupStmt.Targets)
-		if err != nil {
-			return errors.Wrap(err, "failed to resolve targets specified in the BACKUP stmt")
-		}
+		var targetDescs []catalog.Descriptor
+		var completeDBs []descpb.ID
 
-		if backupStmt.Coverage() == tree.AllDescriptors && len(targetDescs) == 0 {
-			return errors.New("no descriptors available to backup at selected time")
+		switch backupStmt.Coverage() {
+		case tree.RequestedDescriptors:
+			var err error
+			targetDescs, completeDBs, err = backupresolver.ResolveTargetsToDescriptors(ctx, p, endTime, backupStmt.Targets)
+			if err != nil {
+				return errors.Wrap(err, "failed to resolve targets specified in the BACKUP stmt")
+			}
+		case tree.AllDescriptors:
+			allDescs, err := backupresolver.LoadAllDescs(ctx, p.ExecCfg().Codec, p.ExecCfg().DB, endTime)
+			if err != nil {
+				return err
+			}
+			targetDescs, completeDBs, err = fullClusterTargetsBackup(allDescs)
+			if err != nil {
+				return err
+			}
+			if len(targetDescs) == 0 {
+				return errors.New("no descriptors available to backup at selected time")
+			}
+		default:
+			return errors.AssertionFailedf("unexpected descriptor coverage %v", backupStmt.Coverage())
 		}
 
 		// Check BACKUP privileges.
@@ -836,6 +854,10 @@ func backupPlanHook(
 		}
 
 		if err := ensureInterleavesIncluded(tables); err != nil {
+			return err
+		}
+
+		if err := validateMultiRegionBackup(backupStmt, targetDescs, tables); err != nil {
 			return err
 		}
 
@@ -953,7 +975,7 @@ func backupPlanHook(
 
 			// Include all tenants.
 			// TODO(tbg): make conditional on cluster setting.
-			tenantRows, err = p.ExecCfg().InternalExecutor.Query(
+			tenantRows, err = p.ExecCfg().InternalExecutor.QueryBuffered(
 				ctx, "backup-lookup-tenant", p.ExtendedEvalContext().Txn,
 				`SELECT id, active, info FROM system.tenants`,
 			)
@@ -991,7 +1013,7 @@ func backupPlanHook(
 			dbsInPrev := make(map[descpb.ID]struct{})
 			rawDescs := prevBackups[len(prevBackups)-1].Descriptors
 			for i := range rawDescs {
-				if t := descpb.TableFromDescriptor(&rawDescs[i], hlc.Timestamp{}); t != nil {
+				if t, _, _, _ := descpb.FromDescriptor(&rawDescs[i]); t != nil {
 					tablesInPrev[t.ID] = struct{}{}
 				}
 			}
@@ -1029,7 +1051,7 @@ func backupPlanHook(
 				return errors.Wrap(err, "invalid previous backups")
 			}
 			if coveredTime != startTime {
-				return errors.Wrapf(err, "expected previous backups to cover until time %v, got %v", startTime, coveredTime)
+				return errors.Errorf("expected previous backups to cover until time %v, got %v", startTime, coveredTime)
 			}
 		}
 
@@ -1114,7 +1136,7 @@ func backupPlanHook(
 		//  2. Verifies we can write to destination location.
 		// This temporary checkpoint file gets renamed to real checkpoint
 		// file when the backup jobs starts execution.
-		doWriteBackupManifestCheckpoint := func(ctx context.Context, jobID int64) error {
+		doWriteBackupManifestCheckpoint := func(ctx context.Context, jobID jobspb.JobID) error {
 			if err := writeBackupManifest(
 				ctx, p.ExecCfg().Settings, defaultStore, tempCheckpointFileNameForJob(jobID),
 				encryptionOptions, &backupManifest,
@@ -1219,41 +1241,42 @@ func backupPlanHook(
 		if backupStmt.Options.Detached {
 			// When running inside an explicit transaction, we simply create the job
 			// record. We do not wait for the job to finish.
-			aj, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
-				ctx, jr, p.ExtendedEvalContext().Txn)
+			jobID := p.ExecCfg().JobRegistry.MakeJobID()
+			_, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
+				ctx, jr, jobID, p.ExtendedEvalContext().Txn)
 			if err != nil {
 				return err
 			}
 
-			if err := doWriteBackupManifestCheckpoint(ctx, *aj.ID()); err != nil {
+			if err := doWriteBackupManifestCheckpoint(ctx, jobID); err != nil {
 				return err
 			}
 
 			// The protect timestamp logic for a DETACHED BACKUP can be run within the
 			// same txn as the BACKUP is being planned in, because we do not wait for
 			// the BACKUP job to complete.
-			err = protectTimestampForBackup(ctx, p, p.ExtendedEvalContext().Txn, *aj.ID(), spans,
+			err = protectTimestampForBackup(ctx, p, p.ExtendedEvalContext().Txn, jobID, spans,
 				startTime, endTime, backupDetails)
 			if err != nil {
 				return err
 			}
 
-			resultsCh <- tree.Datums{tree.NewDInt(tree.DInt(*aj.ID()))}
+			resultsCh <- tree.Datums{tree.NewDInt(tree.DInt(jobID))}
 			collectTelemetry()
 			return nil
 		}
 
 		var sj *jobs.StartableJob
+		jobID := p.ExecCfg().JobRegistry.MakeJobID()
 		if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-			sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn, resultsCh)
-			if err != nil {
+			if err := p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, txn, jr); err != nil {
 				return err
 			}
-			if err := doWriteBackupManifestCheckpoint(ctx, *sj.ID()); err != nil {
+			if err := doWriteBackupManifestCheckpoint(ctx, jobID); err != nil {
 				return err
 			}
 
-			return protectTimestampForBackup(ctx, p, txn, *sj.ID(), spans, startTime, endTime,
+			return protectTimestampForBackup(ctx, p, txn, jobID, spans, startTime, endTime,
 				backupDetails)
 		}); err != nil {
 			if sj != nil {
@@ -1265,8 +1288,13 @@ func backupPlanHook(
 		}
 
 		collectTelemetry()
-
-		return sj.Run(ctx)
+		if err := sj.Start(ctx); err != nil {
+			return err
+		}
+		if err := sj.AwaitCompletion(ctx); err != nil {
+			return err
+		}
+		return sj.ReportExecutionResults(ctx, resultsCh)
 	}
 
 	if backupStmt.Options.Detached {
@@ -1324,7 +1352,7 @@ func protectTimestampForBackup(
 	ctx context.Context,
 	p sql.PlanHookState,
 	txn *kv.Txn,
-	jobID int64,
+	jobID jobspb.JobID,
 	spans []roachpb.Span,
 	startTime, endTime hlc.Timestamp,
 	backupDetails jobspb.BackupDetails,

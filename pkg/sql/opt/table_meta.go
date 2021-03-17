@@ -52,10 +52,8 @@ func (t TableID) IndexColumnID(idx cat.Index, idxOrd int) ColumnID {
 // NOTE: This method cannot do complete bounds checking, so it's up to the
 //       caller to ensure that this column is really in the given base table.
 func (t TableID) ColumnOrdinal(id ColumnID) int {
-	if util.RaceEnabled {
-		if id < t.firstColID() {
-			panic(errors.AssertionFailedf("ordinal cannot be negative"))
-		}
+	if util.CrdbTestBuild && id < t.firstColID() {
+		panic(errors.AssertionFailedf("ordinal cannot be negative"))
 	}
 	return int(id - t.firstColID())
 }
@@ -137,6 +135,10 @@ type TableMeta struct {
 	// the consistency of foreign keys.
 	IgnoreForeignKeys bool
 
+	// IgnoreUniqueWithoutIndexKeys is true if we should disable any rules that
+	// depend on the consistency of unique without index constraints.
+	IgnoreUniqueWithoutIndexKeys bool
+
 	// Constraints stores a *FiltersExpr containing filters that are known to
 	// evaluate to true on the table data. This list is extracted from validated
 	// check constraints; specifically, those check constraints that we can prove
@@ -156,11 +158,11 @@ type TableMeta struct {
 	// Computed columns with non-immutable operators are omitted.
 	ComputedCols map[ColumnID]ScalarExpr
 
-	// PartialIndexPredicates is a map from index ordinals on the table to
+	// partialIndexPredicates is a map from index ordinals on the table to
 	// *FiltersExprs representing the predicate on the corresponding partial
 	// index. If an index is not a partial index, it will not have an entry in
 	// the map.
-	PartialIndexPredicates map[cat.IndexOrdinal]ScalarExpr
+	partialIndexPredicates map[cat.IndexOrdinal]ScalarExpr
 
 	// anns annotates the table metadata with arbitrary data.
 	anns [maxTableAnnIDCount]interface{}
@@ -174,8 +176,7 @@ func (tm *TableMeta) clearAnnotations() {
 	}
 }
 
-// IndexColumns returns the metadata IDs for the set of table columns in the
-// given index.
+// IndexColumns returns the set of table columns in the given index.
 // TODO(justin): cache this value in the table metadata.
 func (tm *TableMeta) IndexColumns(indexOrd int) ColSet {
 	index := tm.Table.Index(indexOrd)
@@ -188,9 +189,8 @@ func (tm *TableMeta) IndexColumns(indexOrd int) ColSet {
 	return indexCols
 }
 
-// IndexColumnsMapVirtual returns the metadata IDs for the set of table columns
-// in the given index. Virtual inverted index columns are mapped to their source
-// column.
+// IndexColumnsMapVirtual returns the set of table columns in the given index.
+// Virtual inverted index columns are mapped to their source column.
 func (tm *TableMeta) IndexColumnsMapVirtual(indexOrd int) ColSet {
 	index := tm.Table.Index(indexOrd)
 
@@ -206,8 +206,7 @@ func (tm *TableMeta) IndexColumnsMapVirtual(indexOrd int) ColSet {
 	return indexCols
 }
 
-// IndexKeyColumns returns the metadata IDs for the set of strict key columns in
-// the given index.
+// IndexKeyColumns returns the set of strict key columns in the given index.
 func (tm *TableMeta) IndexKeyColumns(indexOrd int) ColSet {
 	index := tm.Table.Index(indexOrd)
 
@@ -219,9 +218,8 @@ func (tm *TableMeta) IndexKeyColumns(indexOrd int) ColSet {
 	return indexCols
 }
 
-// IndexKeyColumnsMapVirtual returns the metadata IDs for the set of strict key
-// columns in the given index. Inverted index columns are mapped to their source
-// column.
+// IndexKeyColumnsMapVirtual returns the set of strict key columns in the given
+// index. Inverted index columns are mapped to their source column.
 func (tm *TableMeta) IndexKeyColumnsMapVirtual(indexOrd int) ColSet {
 	index := tm.Table.Index(indexOrd)
 
@@ -254,10 +252,48 @@ func (tm *TableMeta) AddComputedCol(colID ColumnID, computedCol ScalarExpr) {
 // AddPartialIndexPredicate adds a partial index predicate to the table's
 // metadata.
 func (tm *TableMeta) AddPartialIndexPredicate(ord cat.IndexOrdinal, pred ScalarExpr) {
-	if tm.PartialIndexPredicates == nil {
-		tm.PartialIndexPredicates = make(map[cat.IndexOrdinal]ScalarExpr)
+	if tm.partialIndexPredicates == nil {
+		tm.partialIndexPredicates = make(map[cat.IndexOrdinal]ScalarExpr)
 	}
-	tm.PartialIndexPredicates[ord] = pred
+	tm.partialIndexPredicates[ord] = pred
+}
+
+// PartialIndexPredicate returns the given index's predicate scalar expression,
+// if the index is a partial index. Returns ok=false if the index is not a
+// partial index. Panics if the index is a partial index but a predicate scalar
+// expression does not exist in the table metadata.
+func (tm *TableMeta) PartialIndexPredicate(ord cat.IndexOrdinal) (pred ScalarExpr, ok bool) {
+	if _, isPartialIndex := tm.Table.Index(ord).Predicate(); !isPartialIndex {
+		return nil, false
+	}
+	pred, ok = tm.partialIndexPredicates[ord]
+	if !ok {
+		panic(errors.AssertionFailedf("partial index predicate does not exist in table metadata"))
+	}
+	return pred, true
+}
+
+// PartialIndexPredicatesForFormattingOnly returns the partialIndexPredicates
+// map.
+//
+// WARNING: The returned map is NOT a source-of-truth for determining if an
+// index is a partial index. This function should only be used to show the
+// partial index expressions that have been built for a table when formatting
+// opt expressions. Use PartialIndexPredicate in all other cases.
+func (tm *TableMeta) PartialIndexPredicatesForFormattingOnly() map[cat.IndexOrdinal]ScalarExpr {
+	return tm.partialIndexPredicates
+}
+
+// VirtualComputedColumns returns the set of virtual computed table columns.
+func (tm *TableMeta) VirtualComputedColumns() ColSet {
+	var virtualCols ColSet
+	for col := range tm.ComputedCols {
+		ord := tm.MetaID.ColumnOrdinal(col)
+		if tm.Table.Column(ord).IsVirtualComputed() {
+			virtualCols.Add(col)
+		}
+	}
+	return virtualCols
 }
 
 // TableAnnotation returns the given annotation that is associated with the

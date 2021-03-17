@@ -33,11 +33,13 @@ go_library(
 
 go_test(
     name = "slstorage_test",
+    size = "small",
     srcs = [
         "main_test.go",
         "slstorage_test.go",
     ],
     deps = [
+        ":slstorage",
         "//pkg/base",
         "//pkg/security",
         "//pkg/security/securitytest",
@@ -45,7 +47,6 @@ go_test(
         "//pkg/settings/cluster",
         "//pkg/sql/catalog/systemschema",
         "//pkg/sql/sqlliveness",
-        "//pkg/sql/sqlliveness/slstorage",
         "//pkg/sql/sqlutil",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",

@@ -96,6 +96,14 @@ type MVCCIterator interface {
 	// in the iteration. After this call, Valid() will be true if the
 	// iterator was not positioned at the first key.
 	Prev()
+
+	// SeekIntentGE is a specialized version of SeekGE(MVCCKey{Key: key}), when
+	// the caller expects to find an intent, and additionally has the txnUUID
+	// for the intent it is looking for. When running with separated intents,
+	// this can optimize the behavior of the underlying Engine for write heavy
+	// keys by avoiding the need to iterate over many deleted intents.
+	SeekIntentGE(key roachpb.Key, txnUUID uuid.UUID)
+
 	// Key returns the current key.
 	Key() MVCCKey
 	// UnsafeRawKey returns the current raw key which could be an encoded
@@ -147,8 +155,25 @@ type MVCCIterator interface {
 	// and the encoded SST data specified, within the provided key range. Returns
 	// stats on skipped KVs, or an error if a collision is found.
 	CheckForKeyCollisions(sstData []byte, start, end roachpb.Key) (enginepb.MVCCStats, error)
-	// SetUpperBound installs a new upper bound for this iterator. The caller can modify
-	// the parameter after this function returns.
+	// SetUpperBound installs a new upper bound for this iterator. The caller
+	// can modify the parameter after this function returns. This must not be a
+	// nil key. When Reader.ConsistentIterators is true, prefer creating a new
+	// iterator.
+	//
+	// Due to the rare use, we are limiting this method to not switch an
+	// iterator from a global key upper-bound to a local key upper-bound (it
+	// simplifies some code in intentInterleavingIter) or vice versa. Iterator
+	// reuse already happens under-the-covers for most Reader implementations
+	// when constructing a new iterator, and that is a much cleaner solution.
+	//
+	// TODO(sumeer): this method is rarely used and is a source of complexity
+	// since intentInterleavingIter needs to fiddle with the bounds of its
+	// underlying iterators when this is called. Currently only used by
+	// pebbleBatch.ClearIterRange to modify the upper bound of the iterator it
+	// is given: this use is unprincipled and there is a comment in that code
+	// about it. The caller is already usually setting the bounds accurately,
+	// and in some cases the callee is tightening the upper bound. Remove that
+	// use case and remove this from the interface.
 	SetUpperBound(roachpb.Key)
 	// Stats returns statistics about the iterator.
 	Stats() IteratorStats
@@ -200,8 +225,13 @@ type EngineIterator interface {
 	// Value returns the current value as a byte slice.
 	// REQUIRES: latest positioning function returned valid=true.
 	Value() []byte
-	// SetUpperBound installs a new upper bound for this iterator.
+	// SetUpperBound installs a new upper bound for this iterator. When
+	// Reader.ConsistentIterators is true, prefer creating a new iterator.
+	// TODO(sumeer): remove this method.
 	SetUpperBound(roachpb.Key)
+	// GetRawIter is a low-level method only for use in the storage package,
+	// that returns the underlying pebble Iterator.
+	GetRawIter() *pebble.Iterator
 }
 
 // IterOptions contains options used to create an {MVCC,Engine}Iterator.
@@ -253,6 +283,23 @@ type MVCCIterKind int
 const (
 	// MVCCKeyAndIntentsIterKind specifies that intents must be seen, and appear
 	// interleaved with keys, even if they are in a separated lock table.
+	// Iterators of this kind are not allowed to span from local to global keys,
+	// since the physical layout has the separated lock table in-between the
+	// local and global keys. These iterators do strict error checking and panic
+	// if the caller seems that to be trying to violate this constraint.
+	// Specifically:
+	// - If both bounds are set they must not span from local to global.
+	// - Any bound (lower or upper), constrains the iterator for its lifetime to
+	//   one of local or global keys. The iterator will not tolerate a seek or
+	//   SetUpperBound call that violates this constraint.
+	// We could, with significant code complexity, not constrain an iterator for
+	// its lifetime, and allow a seek that specifies a global (local) key to
+	// change the constraint to global (local). This would allow reuse of the
+	// same iterator with a large global upper-bound. But a Next call on the
+	// highest local key (Prev on the lowest global key) would still not be able
+	// to transparently skip over the intermediate lock table. We deem that
+	// behavior to be more surprising and bug-prone (for the caller), than being
+	// strict.
 	MVCCKeyAndIntentsIterKind MVCCIterKind = iota
 	// MVCCKeyIterKind specifies that the caller does not need to see intents.
 	// Any interleaved intents may be seen, but no correctness properties are
@@ -263,7 +310,19 @@ const (
 	MVCCKeyIterKind
 )
 
-// Reader is the read interface to an engine's data.
+// Reader is the read interface to an engine's data. Certain implementations
+// of Reader guarantee consistency of the underlying engine state across the
+// different iterators created by NewMVCCIterator, NewEngineIterator:
+// - pebbleSnapshot, because it uses an engine snapshot.
+// - pebbleReadOnly, pebbleBatch: when the IterOptions do not specify a
+//   timestamp hint. Note that currently the engine state visible here is
+//   not as of the time of the Reader creation. It is the time when the
+//   first iterator is created.
+// The ConsistentIterators method returns true when this consistency is
+// guaranteed by the Reader.
+// TODO(sumeer): this partial consistency can be a source of bugs if future
+// code starts relying on it, but rarely uses a Reader that does not guarantee
+// it. Can we enumerate the current cases where KV uses Engine as a Reader?
 type Reader interface {
 	// Close closes the reader, freeing up any outstanding resources. Note that
 	// various implementations have slightly different behaviors. In particular,
@@ -334,6 +393,10 @@ type Reader interface {
 	// with the iterator to free resources. The caller can change IterOptions
 	// after this function returns.
 	NewEngineIterator(opts IterOptions) EngineIterator
+	// ConsistentIterators returns true if the Reader implementation guarantees
+	// that the different iterators constructed by this Reader will see the
+	// same underlying Engine state.
+	ConsistentIterators() bool
 }
 
 // PrecedingIntentState is information needed when writing or clearing an
@@ -408,7 +471,8 @@ type Writer interface {
 	// decrease, we can stop tracking txnDidNotUpdateMeta and still optimize
 	// ClearIntent by always doing single-clear.
 	ClearIntent(
-		key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID) error
+		key roachpb.Key, state PrecedingIntentState, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
+	) (separatedIntentCountDelta int, _ error)
 	// ClearEngineKey removes the item from the db with the given EngineKey.
 	// Note that clear actually removes entries from the storage engine. This is
 	// a general-purpose and low-level method that should be used sparingly,
@@ -502,14 +566,19 @@ type Writer interface {
 	//
 	// It is safe to modify the contents of the arguments after Put returns.
 	PutIntent(
-		key roachpb.Key, value []byte, state PrecedingIntentState, txnDidNotUpdateMeta bool,
-		txnUUID uuid.UUID) error
+		ctx context.Context, key roachpb.Key, value []byte, state PrecedingIntentState,
+		txnDidNotUpdateMeta bool, txnUUID uuid.UUID) (separatedIntentCountDelta int, _ error)
 	// PutEngineKey sets the given key to the value provided. This is a
 	// general-purpose and low-level method that should be used sparingly,
 	// only when the other Put* methods are not applicable.
 	//
 	// It is safe to modify the contents of the arguments after Put returns.
 	PutEngineKey(key EngineKey, value []byte) error
+	// SafeToWriteSeparatedIntents is only for internal use in the storage
+	// package. Returns an error if the callee does not know whether it is safe.
+	// This method is temporary, to handle the transition from clusters where
+	// not all nodes understand separated intents.
+	SafeToWriteSeparatedIntents(ctx context.Context) (bool, error)
 
 	// LogData adds the specified data to the RocksDB WAL. The data is
 	// uninterpreted by RocksDB (i.e. not added to the memtable or sstables).
@@ -580,31 +649,28 @@ type Engine interface {
 	// operations) are executed on it and caches iterators to avoid the overhead
 	// of creating multiple iterators for batched reads.
 	//
-	// All iterators created from a read-only engine with the same "Prefix"
-	// option are guaranteed to provide a consistent snapshot of the underlying
-	// engine. For instance, two prefix iterators created from a read-only
-	// engine will provide a consistent snapshot. Similarly, two non-prefix
-	// iterators created from a read-only engine will provide a consistent
-	// snapshot. However, a prefix iterator and a non-prefix iterator created
-	// from a read-only engine are not guaranteed to provide a consistent view
-	// of the underlying engine.
-	//
-	// TODO(nvanbenschoten): remove this complexity when we're fully on Pebble
-	// and can guarantee that all iterators created from a read-only engine are
-	// consistent. To do this, we will want to add an MVCCIterator.Clone method.
+	// All iterators created from a read-only engine are guaranteed to provide a
+	// consistent snapshot of the underlying engine. See the comment on the
+	// Reader interface and the Reader.ConsistentIterators method.
 	NewReadOnly() ReadWriter
-	// NewWriteOnlyBatch returns a new instance of a batched engine which wraps
-	// this engine. A write-only batch accumulates all mutations and applies them
-	// atomically on a call to Commit(). Read operations return an error.
+	// NewUnindexedBatch returns a new instance of a batched engine which wraps
+	// this engine. It is unindexed, in that writes to the batch are not
+	// visible to reads until after it commits. The batch accumulates all
+	// mutations and applies them atomically on a call to Commit(). Read
+	// operations return an error, unless writeOnly is set to false.
 	//
-	// Note that a distinct write-only batch allows reads. Distinct batches are a
-	// means of indicating that the user does not need to read its own writes.
+	// When writeOnly is false, reads will be satisfied by reading from the
+	// underlying engine, i.e., the caller does not see its own writes. This
+	// setting should be used only when the caller is certain that this
+	// optimization is correct, and beneficial. There are subtleties here -- see
+	// the discussion on https://github.com/cockroachdb/cockroach/pull/57661 for
+	// more details.
 	//
-	// TODO(peter): This should return a WriteBatch interface, but there are mild
-	// complications in both defining that interface and implementing it. In
-	// particular, Batch.Close would no longer come from Reader and we'd need to
-	// refactor a bunch of code in rocksDBBatch.
-	NewWriteOnlyBatch() Batch
+	// TODO(sumeer): We should separate the writeOnly=true case into a
+	// separate method, that returns a WriteBatch interface. Even better would
+	// be not having an option to pass writeOnly=false, and have the caller
+	// explicitly work with a separate WriteBatch and Reader.
+	NewUnindexedBatch(writeOnly bool) Batch
 	// NewSnapshot returns a new instance of a read-only snapshot
 	// engine. Snapshots are instantaneous and, as long as they're
 	// released relatively quickly, inexpensive. Snapshots are released
@@ -645,6 +711,11 @@ type Engine interface {
 	// which must not exist. The directory should be on the same file system so
 	// that hard links can be used.
 	CreateCheckpoint(dir string) error
+
+	// IsSeparatedIntentsEnabledForTesting is a test only method used in tests
+	// that know that this enabled setting is not changing and need the value to
+	// adjust their expectations.
+	IsSeparatedIntentsEnabledForTesting() bool
 }
 
 // Batch is the interface for batch specific operations.
@@ -658,32 +729,6 @@ type Batch interface {
 	// engine. This is a noop unless the batch was created via NewBatch(). If
 	// sync is true, the batch is synchronously committed to disk.
 	Commit(sync bool) error
-	// Distinct returns a view of the existing batch which only sees writes that
-	// were performed before the Distinct batch was created. That is, the
-	// returned batch will not read its own writes, but it will read writes to
-	// the parent batch performed before the call to Distinct(), except if the
-	// parent batch is a WriteOnlyBatch, in which case the Distinct() batch will
-	// read from the underlying engine.
-	//
-	// The returned
-	// batch needs to be closed before using the parent batch again. This is used
-	// as an optimization to avoid flushing mutations buffered by the batch in
-	// situations where we know all of the batched operations are for distinct
-	// keys.
-	//
-	// TODO(tbg): it seems insane that you cannot read from a WriteOnlyBatch but
-	// you can read from a Distinct on top of a WriteOnlyBatch but randomly don't
-	// see the batch at all. I was personally just bitten by this.
-	//
-	// TODO(itsbilal): Improve comments around how/why distinct batches are an
-	// optimization in the rocksdb write path.
-	//
-	// TODO(sumeer): Most Distinct() batches are being created on Pebble indexed
-	// batches, so the comment about only seeing writes before the batch was
-	// created is incorrect. See discussion in
-	// https://github.com/cockroachdb/pebble/issues/943
-	// https://github.com/cockroachdb/cockroach/pull/57661
-	Distinct() ReadWriter
 	// Empty returns whether the batch has been written to or not.
 	Empty() bool
 	// Len returns the size of the underlying representation of the batch.

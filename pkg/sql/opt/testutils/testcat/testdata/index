@@ -16,12 +16,11 @@ TABLE kv
  ├── k int not null
  ├── v int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
- ├── INDEX primary
+ ├── PRIMARY INDEX primary
  │    └── k int not null
- ├── INDEX idx
- │    ├── v int
- │    └── k int not null
- └── UNIQUE (k)
+ └── INDEX idx
+      ├── v int
+      └── k int not null
 
 exec-ddl
 CREATE INDEX idx2 ON kv (v)
@@ -54,14 +53,12 @@ TABLE kv
  ├── k int not null
  ├── v int
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
- ├── INDEX primary
+ ├── PRIMARY INDEX primary
  │    └── k int not null
- ├── INDEX idx
- │    ├── v int
- │    ├── k int not null
- │    └── WHERE
- │         └── v > 1
- └── UNIQUE (k)
+ └── INDEX idx
+      ├── v int
+      ├── k int not null
+      └── WHERE v > 1
 
 exec-ddl
 CREATE TABLE g (
@@ -83,20 +80,19 @@ TABLE g
  ├── b int
  ├── geog geography
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
- ├── geog_inverted_key geography not null [hidden] [virtual-inverted]
- ├── geog_inverted_key geography not null [hidden] [virtual-inverted]
- ├── INDEX primary
+ ├── geog_inverted_key geography not null [virtual-inverted]
+ ├── geog_inverted_key geography not null [virtual-inverted]
+ ├── PRIMARY INDEX primary
  │    └── k int not null
  ├── INVERTED INDEX secondary
  │    ├── a int
- │    ├── geog_inverted_key geography not null [hidden] [virtual-inverted]
+ │    ├── geog_inverted_key geography not null [virtual-inverted]
  │    └── k int not null
- ├── INVERTED INDEX secondary
- │    ├── a int
- │    ├── b int
- │    ├── geog_inverted_key geography not null [hidden] [virtual-inverted]
- │    └── k int not null
- └── UNIQUE (k)
+ └── INVERTED INDEX secondary
+      ├── a int
+      ├── b int
+      ├── geog_inverted_key geography not null [virtual-inverted]
+      └── k int not null
 
 # Test for expression-based index columns.
 exec-ddl
@@ -125,7 +121,7 @@ TABLE xyz
  ├── idx_expr_1 string as (lower(z)) virtual [hidden]
  ├── idx_expr_2 int as (y + 1) virtual [hidden]
  ├── idx_expr_3 int as (x + y) virtual [hidden]
- ├── INDEX primary
+ ├── PRIMARY INDEX primary
  │    └── x int not null
  ├── INDEX idx1
  │    ├── idx_expr_1 string as (lower(z)) virtual [hidden]
@@ -138,11 +134,9 @@ TABLE xyz
  │    ├── idx_expr_2 int as (y + 1) virtual [hidden]
  │    ├── idx_expr_1 string as (lower(z)) virtual [hidden]
  │    └── x int not null
- ├── INDEX idx4
- │    ├── idx_expr_3 int as (x + y) virtual [hidden]
- │    ├── y int
- │    ├── x int not null
- │    ├── z string (storing)
- │    └── WHERE
- │         └── v > 1
- └── UNIQUE (x)
+ └── INDEX idx4
+      ├── idx_expr_3 int as (x + y) virtual [hidden]
+      ├── y int
+      ├── x int not null
+      ├── z string (storing)
+      └── WHERE v > 1

@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -77,26 +78,37 @@ type JSON interface {
 	// inverted index keys, one per path through the receiver.
 	encodeInvertedIndexKeys(b []byte) ([][]byte, error)
 
-	// encodeContainingInvertedIndexSpans takes in a key prefix and returns
-	// slices of inverted index spans, one slice of spans per path through the
-	// receiver. If a path ends in an empty array or object, the corresponding
-	// slice includes one span for that path, as well one span for all paths in
-	// which the empty array or object is replaced with a non-empty array or
-	// object. This matches the logic of the @> (contains) operator.
+	// encodeContainingInvertedIndexSpans takes in a key prefix and returns the
+	// spans that must be scanned in the inverted index to evaluate a contains (@>)
+	// predicate with the given JSON (i.e., find the objects in the index that
+	// contain the given JSON).
+	//
+	// The spans are returned in an inverted.SpanExpression, which represents the
+	// set operations that must be applied on the spans read during execution. See
+	// comments in the SpanExpression definition for details.
 	//
 	// If isRoot is true, this function is being called at the root level of the
 	// JSON hierarchy. If isObjectValue is true, the given JSON is the value of a
 	// JSON object key. Note that isRoot and isObjectValue cannot both be true at
 	// the same time.
+	encodeContainingInvertedIndexSpans(
+		b []byte, isRoot, isObjectValue bool,
+	) (invertedExpr inverted.Expression, err error)
+
+	// encodeContainedInvertedIndexSpans takes in a key prefix and returns the
+	// spans that must be scanned in the inverted index to evaluate a contained
+	// by (<@) predicate with the given JSON (i.e., find the objects in the index
+	// that are contained by the given JSON).
 	//
-	// Returns tight=true if the returned spans are tight and cannot produce
-	// false positives. Otherwise, returns tight=false.
+	// The spans are returned in an inverted.SpanExpression, which represents the
+	// set operations that must be applied on the spans read during execution. See
+	// comments in the SpanExpression definition for details.
 	//
-	// Returns unique=true if the spans are guaranteed not to produce duplicate
-	// primary keys. Otherwise, returns unique=false.
-	encodeContainingInvertedIndexSpans(b []byte, isRoot, isObjectValue bool) (
-		_ []roachpb.Spans, tight, unique bool, err error,
-	)
+	// If isRoot is true, this function is being called at the root level of the
+	// JSON hierarchy.
+	encodeContainedInvertedIndexSpans(
+		b []byte, isRoot bool,
+	) (invertedExpr inverted.Expression, err error)
 
 	// numInvertedIndexEntries returns the number of entries that will be
 	// produced if this JSON gets included in an inverted index.
@@ -139,7 +151,15 @@ type JSON interface {
 	// AsText returns the JSON document as a string, with quotes around strings removed, and null as nil.
 	AsText() (*string, error)
 
-	// Exists implements the `?` operator.
+	// AsDecimal returns the JSON document as a apd.Decimal if it is a numeric
+	// type, and a boolean inidicating if this JSON document is a numeric type.
+	AsDecimal() (*apd.Decimal, bool)
+
+	// Exists implements the `?` operator: does the string exist as a top-level
+	// key within the JSON value?
+	//
+	// If the object is a JSON array, returns true when the key is a top-level
+	// element of the array.
 	Exists(string) (bool, error)
 
 	// StripNulls returns the JSON document with all object fields that have null values omitted
@@ -399,6 +419,9 @@ func (s *pairSorter) unique() {
 // pairs, which are unique by key.
 type jsonObject []jsonKeyValuePair
 
+var emptyJSONObject = jsonObject(nil)
+var emptyJSONArray = jsonArray(nil)
+
 func (jsonNull) Type() Type   { return NullJSONType }
 func (jsonFalse) Type() Type  { return FalseJSONType }
 func (jsonTrue) Type() Type   { return TrueJSONType }
@@ -414,6 +437,17 @@ func (j jsonNumber) MaybeDecode() JSON { return j }
 func (j jsonString) MaybeDecode() JSON { return j }
 func (j jsonArray) MaybeDecode() JSON  { return j }
 func (j jsonObject) MaybeDecode() JSON { return j }
+
+func (j jsonNull) AsDecimal() (*apd.Decimal, bool)   { return nil, false }
+func (j jsonFalse) AsDecimal() (*apd.Decimal, bool)  { return nil, false }
+func (j jsonTrue) AsDecimal() (*apd.Decimal, bool)   { return nil, false }
+func (j jsonString) AsDecimal() (*apd.Decimal, bool) { return nil, false }
+func (j jsonArray) AsDecimal() (*apd.Decimal, bool)  { return nil, false }
+func (j jsonObject) AsDecimal() (*apd.Decimal, bool) { return nil, false }
+func (j jsonNumber) AsDecimal() (*apd.Decimal, bool) {
+	d := apd.Decimal(j)
+	return &d, true
+}
 
 func (j jsonNull) tryDecode() (JSON, error)   { return j, nil }
 func (j jsonFalse) tryDecode() (JSON, error)  { return j, nil }
@@ -750,42 +784,51 @@ func EncodeInvertedIndexKeys(b []byte, json JSON) ([][]byte, error) {
 
 // EncodeContainingInvertedIndexSpans takes in a key prefix and returns the
 // spans that must be scanned in the inverted index to evaluate a contains (@>)
-// predicate with the given json (i.e., find the objects in the index that
-// contain the given json).
+// predicate with the given JSON (i.e., find the objects in the index that
+// contain the given JSON).
 //
-// The spans returned by EncodeContainingInvertedIndexSpans represent the
-// intersection of unions. For example, if the returned results are:
+// The spans are returned in an inverted.SpanExpression, which represents the
+// set operations that must be applied on the spans read during execution. See
+// comments in the SpanExpression definition for details.
 //
-//   { {["a", "b"), ["c", "d")}, {["e", "f")} }
-//
-// the expression should be evaluated as:
-//
-//             INTERSECTION
-//              /        \
-//           UNION    ["e", "f")
-//          /     \
-//   ["a", "b") ["c", "d")
-//
-// Returns tight=true if the returned spans are tight and cannot produce false
-// positives. Otherwise, returns tight=false.
-//
-// Returns unique=true if the spans are guaranteed not to produce duplicate
-// primary keys. Otherwise, returns unique=false. This distinction is important
-// for the case where the length of spans is 1, and the single element has
-// length greater than 0. Per the above description, this would represent a
-// UNION over the returned spans, with no INTERSECTION. If unique is true, that
-// allows the optimizer to remove the UNION altogether (implemented
-// with the invertedFilterer), and simply return the results of the constrained
-// scan. unique is always false if the length of spans is greater than 1.
-//
-// The spans are not guaranteed to be sorted, so the caller must sort them if
-// needed.
+// The input inKey is prefixed to the keys in all returned spans.
 func EncodeContainingInvertedIndexSpans(
 	b []byte, json JSON,
-) (spans []roachpb.Spans, tight, unique bool, err error) {
+) (invertedExpr inverted.Expression, err error) {
 	return json.encodeContainingInvertedIndexSpans(
 		encoding.EncodeJSONAscending(b), true /* isRoot */, false, /* isObjectValue */
 	)
+}
+
+// EncodeContainedInvertedIndexSpans takes in a key prefix and returns the
+// spans that must be scanned in the inverted index to evaluate a contained by
+// (<@) predicate with the given JSON (i.e., find the objects in the index that
+// could be contained by the given JSON).
+//
+// The spans are returned in an inverted.SpanExpression, which represents the
+// set operations that must be applied on the spans read during execution. See
+// comments in the SpanExpression definition for details.
+//
+// The input inKey is prefixed to the keys in all returned spans.
+func EncodeContainedInvertedIndexSpans(
+	b []byte, json JSON,
+) (invertedExpr inverted.Expression, err error) {
+	invertedExpr, err = json.encodeContainedInvertedIndexSpans(
+		encoding.EncodeJSONAscending(b), true, /* isRoot */
+	)
+	if err != nil {
+		return nil, err
+	}
+	// The produced inverted expression will never be tight. This is because the
+	// span expression produced will match all objects that contain at least one
+	// of the keys, which does not guarantee they only contain the keys.
+	// In other words, there may be false positives included that will need to
+	// pass through an additional filter.
+	// For example, the spans produced for '{"a": "b"}' will include both
+	// '{"a": "b"}' and '{"a": "b", "c", "d"}', but the second row should be
+	// filtered out since '{"a": "b", "c", "d"}' <@ '{"a": "b"}' is false.
+	invertedExpr.SetNotTight()
+	return invertedExpr, nil
 }
 
 func (j jsonNull) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
@@ -795,8 +838,15 @@ func (j jsonNull) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 
 func (j jsonNull) encodeContainingInvertedIndexSpans(
 	b []byte, isRoot, isObjectValue bool,
-) ([]roachpb.Spans, bool, bool, error) {
+) (inverted.Expression, error) {
 	return encodeContainingInvertedIndexSpansFromLeaf(j, b, isRoot, isObjectValue)
+}
+
+func (j jsonNull) encodeContainedInvertedIndexSpans(
+	b []byte, isRoot bool,
+) (inverted.Expression, error) {
+	invertedExpr, err := encodeContainedInvertedIndexSpansFromLeaf(j, b, isRoot)
+	return invertedExpr, err
 }
 
 func (jsonTrue) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
@@ -806,8 +856,15 @@ func (jsonTrue) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 
 func (j jsonTrue) encodeContainingInvertedIndexSpans(
 	b []byte, isRoot, isObjectValue bool,
-) ([]roachpb.Spans, bool, bool, error) {
+) (inverted.Expression, error) {
 	return encodeContainingInvertedIndexSpansFromLeaf(j, b, isRoot, isObjectValue)
+}
+
+func (j jsonTrue) encodeContainedInvertedIndexSpans(
+	b []byte, isRoot bool,
+) (inverted.Expression, error) {
+	invertedExpr, err := encodeContainedInvertedIndexSpansFromLeaf(j, b, isRoot)
+	return invertedExpr, err
 }
 
 func (jsonFalse) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
@@ -817,8 +874,15 @@ func (jsonFalse) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 
 func (j jsonFalse) encodeContainingInvertedIndexSpans(
 	b []byte, isRoot, isObjectValue bool,
-) ([]roachpb.Spans, bool, bool, error) {
+) (inverted.Expression, error) {
 	return encodeContainingInvertedIndexSpansFromLeaf(j, b, isRoot, isObjectValue)
+}
+
+func (j jsonFalse) encodeContainedInvertedIndexSpans(
+	b []byte, isRoot bool,
+) (inverted.Expression, error) {
+	invertedExpr, err := encodeContainedInvertedIndexSpansFromLeaf(j, b, isRoot)
+	return invertedExpr, err
 }
 
 func (j jsonString) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
@@ -828,8 +892,15 @@ func (j jsonString) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 
 func (j jsonString) encodeContainingInvertedIndexSpans(
 	b []byte, isRoot, isObjectValue bool,
-) ([]roachpb.Spans, bool, bool, error) {
+) (inverted.Expression, error) {
 	return encodeContainingInvertedIndexSpansFromLeaf(j, b, isRoot, isObjectValue)
+}
+
+func (j jsonString) encodeContainedInvertedIndexSpans(
+	b []byte, isRoot bool,
+) (inverted.Expression, error) {
+	invertedExpr, err := encodeContainedInvertedIndexSpansFromLeaf(j, b, isRoot)
+	return invertedExpr, err
 }
 
 func (j jsonNumber) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
@@ -840,8 +911,15 @@ func (j jsonNumber) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 
 func (j jsonNumber) encodeContainingInvertedIndexSpans(
 	b []byte, isRoot, isObjectValue bool,
-) ([]roachpb.Spans, bool, bool, error) {
+) (inverted.Expression, error) {
 	return encodeContainingInvertedIndexSpansFromLeaf(j, b, isRoot, isObjectValue)
+}
+
+func (j jsonNumber) encodeContainedInvertedIndexSpans(
+	b []byte, isRoot bool,
+) (inverted.Expression, error) {
+	invertedExpr, err := encodeContainedInvertedIndexSpansFromLeaf(j, b, isRoot)
+	return invertedExpr, err
 }
 
 func (j jsonArray) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
@@ -870,50 +948,96 @@ func (j jsonArray) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 
 func (j jsonArray) encodeContainingInvertedIndexSpans(
 	b []byte, isRoot, isObjectValue bool,
-) (spans []roachpb.Spans, tight, unique bool, err error) {
+) (invertedExpr inverted.Expression, err error) {
 	// Checking for an empty array.
 	if len(j) == 0 {
 		return encodeContainingInvertedIndexSpansFromLeaf(j, b, isRoot, isObjectValue)
 	}
 
 	prefix := encoding.EncodeArrayAscending(b)
-	tight, unique = true, true
 	for i := range j {
-		children, childTight, childUnique, err := j[i].encodeContainingInvertedIndexSpans(
+		child, err := j[i].encodeContainingInvertedIndexSpans(
 			prefix[:len(prefix):len(prefix)], false /* isRoot */, false, /* isObjectValue */
 		)
 		if err != nil {
-			return nil, false, false, err
+			return nil, err
 		}
-		spans = append(spans, children...)
-		tight = tight && childTight
-		unique = unique && childUnique
-	}
 
-	// Deduplicate the entries, since arrays can have duplicates - we don't want
-	// to emit duplicate spans from this method, as it's more expensive to
-	// deduplicate spans via KV (which will actually write the keys) than to do
-	// it now (just an in-memory sort and distinct).
-	spans = uniq.SortAndUniquifySpanSets(spans)
+		if invertedExpr == nil {
+			invertedExpr = child
+		} else {
+			invertedExpr = inverted.And(invertedExpr, child)
+		}
+	}
 
 	// If this array is not at the root and has more than one element,
 	// we cannot produce tight spans. This is because we cannot rely on the keys
 	// alone to determine whether the top level JSON is contained in another JSON.
 	// For example, '[[1], [2]]' and '[[1, 2]]' have exactly the same keys, but
 	// '[[1, 2]]' @> '[[1], [2]]' is true, while '[[1], [2]]' @> '[[1, 2]]' is
-	// false. We will return tight=false for the second case, which will
-	// signal the need to filter out false positives.
-	if !isRoot && j.Len() > 1 && len(spans) > 1 {
-		tight = false
+	// false. We will return an expression with Tight=false for the second case,
+	// which will signal the need to filter out false positives.
+	//
+	// Note that in addition to checking that the original array had length > 1,
+	// we also check that the spanExpr is an intersection. The inverted.And
+	// function performs some deduplication, so it's possible that the original
+	// array had duplicates that were removed, causing the intersection to be
+	// removed.
+	if spanExpr, ok := invertedExpr.(*inverted.SpanExpression); ok &&
+		!isRoot && j.Len() > 1 && spanExpr.Operator == inverted.SetIntersection {
+		invertedExpr.SetNotTight()
 	}
 
-	// We cannot guarantee that there will be no duplicate primary keys if there
-	// is more than one element.
-	if j.Len() > 1 && len(spans) > 1 {
-		unique = false
+	return invertedExpr, nil
+}
+
+func (j jsonArray) encodeContainedInvertedIndexSpans(
+	b []byte, isRoot bool,
+) (invertedExpr inverted.Expression, err error) {
+	// The empty array should always be added to the spans, since it is contained
+	// by everything.
+	emptyArrSpanExpr := inverted.ExprForSpan(
+		inverted.MakeSingleValSpan(encoding.EncodeJSONEmptyArray(b[:len(b):len(b)])), false, /* tight */
+	)
+	emptyArrSpanExpr.Unique = true
+	// If the given jsonArray is empty, we return the SpanExpression.
+	if len(j) == 0 {
+		return emptyArrSpanExpr, nil
 	}
 
-	return spans, tight, unique, nil
+	invertedExpr = emptyArrSpanExpr
+	prefix := encoding.EncodeArrayAscending(b[:len(b):len(b)])
+	for i := range j {
+		childWithPrefix, err := j[i].encodeContainedInvertedIndexSpans(
+			prefix[:len(prefix):len(prefix)], false, /* isRoot */
+		)
+		if err != nil {
+			return nil, err
+		}
+		invertedExpr = inverted.Or(invertedExpr, childWithPrefix)
+
+		// Scalars inside the array should also be included in the spans
+		// without the array prefix, since they are contained by the array. This
+		// only applies to arrays not nested inside other arrays or objects, so
+		// isRoot must be true.
+		// For example, '1' <@ '[1]' is true, but '1' <@ '[[1]]' is false.
+		// However for non-scalar types, the structure of nesting must match.
+		// For example, '{"a": "a"}' <@ '[{"a": "a"}, {"b": "c"}]' is false, and
+		// '[{"a": "a"}]' <@ '[{"a": "a"}, {"b": "c"}]' is true.
+		// Therefore, we only include childWithoutPrefix for non-nested primitives
+		// and empty arrays/objects.
+		if isRoot && isEnd(j[i]) {
+			childWithoutPrefix, err := j[i].encodeContainedInvertedIndexSpans(
+				b[:len(b):len(b)], false, /* isRoot */
+			)
+			if err != nil {
+				return nil, err
+			}
+			invertedExpr = inverted.Or(invertedExpr, childWithoutPrefix)
+		}
+	}
+
+	return invertedExpr, nil
 }
 
 func (j jsonObject) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
@@ -946,28 +1070,29 @@ func (j jsonObject) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 
 func (j jsonObject) encodeContainingInvertedIndexSpans(
 	b []byte, isRoot, isObjectValue bool,
-) (spans []roachpb.Spans, tight, unique bool, err error) {
+) (invertedExpr inverted.Expression, err error) {
 	if len(j) == 0 {
 		return encodeContainingInvertedIndexSpansFromLeaf(j, b, isRoot, isObjectValue)
 	}
 
-	tight, unique = true, true
 	for i := range j {
 		// We're trying to see if this is the end of the JSON path. If it is, then
 		// we don't want to add an extra separator.
 		end := isEnd(j[i].v)
 
 		prefix := encoding.EncodeJSONKeyStringAscending(b[:len(b):len(b)], string(j[i].k), end)
-		children, childTight, childUnique, err := j[i].v.encodeContainingInvertedIndexSpans(
+		child, err := j[i].v.encodeContainingInvertedIndexSpans(
 			prefix, false /* isRoot */, true, /* isObjectValue */
 		)
 		if err != nil {
-			return nil, false, false, err
+			return nil, err
 		}
 
-		spans = append(spans, children...)
-		tight = tight && childTight
-		unique = unique && childUnique
+		if invertedExpr == nil {
+			invertedExpr = child
+		} else {
+			invertedExpr = inverted.And(invertedExpr, child)
+		}
 	}
 
 	// If this object is not at the root and has more than one element,
@@ -977,19 +1102,65 @@ func (j jsonObject) encodeContainingInvertedIndexSpans(
 	// have exactly the same keys, but
 	// '[{"a": "b", "c": "d"}]' @> '[{"a": "b"}, {"c": "d"}]' is true, while
 	// '[{"a": "b"}, {"c": "d"}]' @> '[{"a": "b", "c": "d"}]' is false.
-	// We will return tight=false for the second case, which will signal the
-	// need to filter out false positives.
+	// We will return an expression with Tight=false for the second case, which
+	// will signal the need to filter out false positives.
 	if !isRoot && j.Len() > 1 {
-		tight = false
+		invertedExpr.SetNotTight()
 	}
 
-	// We cannot guarantee that there will be no duplicates if there is more than
-	// one element.
-	if j.Len() > 1 {
-		unique = false
-	}
-	return spans, tight, unique, nil
+	return invertedExpr, nil
+}
 
+func (j jsonObject) encodeContainedInvertedIndexSpans(
+	b []byte, isRoot bool,
+) (invertedExpr inverted.Expression, err error) {
+	// The empty object should always be added to the spans, since it is contained
+	// by everything.
+	emptyObjSpanExpr := inverted.ExprForSpan(
+		inverted.MakeSingleValSpan(encoding.EncodeJSONEmptyObject(b[:len(b):len(b)])), false, /* tight */
+	)
+	emptyObjSpanExpr.Unique = true
+	// If the given jsonObject is empty, we return the SpanExpression.
+	if len(j) == 0 {
+		return emptyObjSpanExpr, nil
+	}
+
+	invertedExpr = emptyObjSpanExpr
+	for i := range j {
+		// We're trying to see if this is the end of the JSON path. If it is, then
+		// we don't want to add an extra separator.
+		end := isEnd(j[i].v)
+
+		prefix := encoding.EncodeJSONKeyStringAscending(b[:len(b):len(b)], string(j[i].k), end)
+
+		child, err := j[i].v.encodeContainedInvertedIndexSpans(
+			prefix, false, /* isRoot */
+		)
+		if err != nil {
+			return nil, err
+		}
+		invertedExpr = inverted.Or(invertedExpr, child)
+
+		// When we have a nested object or array, we want to include the empty
+		// object or array span with the prefix. For example, '{"a": {"b": "c"}}'
+		// should include the span for '{"a": {}}', and '{"a": [1]}' should include
+		// '{"a": []}'.
+		if !end {
+			v := emptyJSONForType(j[i].v)
+			if v != nil {
+				prefixWithEnd := encoding.EncodeJSONKeyStringAscending(b[:len(b):len(b)], string(j[i].k), true)
+				childWithEnd, err := v.encodeContainedInvertedIndexSpans(
+					prefixWithEnd, false, /* isRoot */
+				)
+				if err != nil {
+					return nil, err
+				}
+				invertedExpr = inverted.Or(invertedExpr, childWithEnd)
+			}
+		}
+	}
+
+	return invertedExpr, nil
 }
 
 // isEnd returns true if a JSON value is the end of the JSON path.
@@ -1014,6 +1185,29 @@ func isEnd(json JSON) bool {
 	return end
 }
 
+// emptyJSONForType returns either an empty JSON array or object corresponding
+// to the input JSON type. If the provided JSON is not an object or array, it
+// returns nil.
+func emptyJSONForType(json JSON) JSON {
+	switch t := json.(type) {
+	case jsonArray:
+		return emptyJSONArray
+
+	case jsonObject:
+		return emptyJSONObject
+
+	case *jsonEncoded:
+		switch t.typ {
+		case ArrayJSONType:
+			return emptyJSONArray
+
+		case ObjectJSONType:
+			return emptyJSONObject
+		}
+	}
+	return nil
+}
+
 // encodeContainingInvertedIndexSpansFromLeaf encodes the spans that must be
 // scanned in an inverted index to find the JSON objects that contain the given
 // leaf JSON value. A leaf is any scalar json such as '1', 'true', or 'null',
@@ -1023,25 +1217,20 @@ func isEnd(json JSON) bool {
 // JSON hierarchy. If isObjectValue is true, the given JSON is the value of a
 // JSON object key. Note that isRoot and isObjectValue cannot both be true at
 // the same time.
-//
-// Returns tight=true if the returned spans are tight and cannot produce
-// false positives. Otherwise, returns tight=false.
-//
-// Returns unique=true if the spans are guaranteed not to produce duplicate
-// primary keys. Otherwise, returns unique=false.
 func encodeContainingInvertedIndexSpansFromLeaf(
 	j JSON, b []byte, isRoot, isObjectValue bool,
-) (_ []roachpb.Spans, tight, unique bool, err error) {
+) (invertedExpr inverted.Expression, err error) {
 	keys, err := j.encodeInvertedIndexKeys(b)
 	if err != nil {
-		return nil, false, false, err
+		return nil, err
 	}
 
-	var spans roachpb.Spans
+	invertedExpr = &inverted.SpanExpression{Tight: true}
+	var unique bool
 	prefix := b[:len(b):len(b)]
 	if isObjectValue {
 		if isRoot {
-			return nil, false, false, errors.AssertionFailedf(
+			return nil, errors.AssertionFailedf(
 				"isObjectValue and isRoot should not both be true",
 			)
 		}
@@ -1061,7 +1250,7 @@ func encodeContainingInvertedIndexSpansFromLeaf(
 	switch t := j.(type) {
 	case jsonArray:
 		if t.Len() != 0 {
-			return nil, false, false, errors.AssertionFailedf(
+			return nil, errors.AssertionFailedf(
 				"encodeContainingInvertedIndexSpansFromLeaf called on a non-empty jsonArray",
 			)
 		}
@@ -1082,7 +1271,7 @@ func encodeContainingInvertedIndexSpansFromLeaf(
 
 	case jsonObject:
 		if t.Len() != 0 {
-			return nil, false, false, errors.AssertionFailedf(
+			return nil, errors.AssertionFailedf(
 				"encodeContainingInvertedIndexSpansFromLeaf called on a non-empty jsonObject",
 			)
 		}
@@ -1100,13 +1289,13 @@ func encodeContainingInvertedIndexSpansFromLeaf(
 		// '["a"]' @> '{"a": {}}' are false)
 		//
 		// This span can have duplicate PKs, so unique=false.
-		spans = append(spans, roachpb.Span{
+		invertedExpr = inverted.Or(invertedExpr, inverted.ExprForSpan(inverted.Span{
 			// EncodeJSONObjectSpanStartAscending generates the first possible value
 			// for JSON objects.
-			Key: roachpb.Key(encoding.EncodeJSONObjectSpanStartAscending(prefix)),
+			Start: inverted.EncVal(encoding.EncodeJSONObjectSpanStartAscending(prefix)),
 			// This end key is equal to jsonInvertedIndex + 1.
-			EndKey: roachpb.Key(prefix).PrefixEnd(),
-		})
+			End: inverted.EncVal(roachpb.Key(prefix).PrefixEnd()),
+		}, true /* tight */))
 
 	default:
 		if isRoot {
@@ -1122,7 +1311,7 @@ func encodeContainingInvertedIndexSpansFromLeaf(
 			jArr := arr.Build()
 			arrKeys, err := jArr.encodeInvertedIndexKeys(prefix)
 			if err != nil {
-				return nil, false, false, err
+				return nil, err
 			}
 			keys = append(keys, arrKeys...)
 
@@ -1141,11 +1330,68 @@ func encodeContainingInvertedIndexSpansFromLeaf(
 	}
 
 	for _, key := range keys {
-		endKey := roachpb.Key(key).PrefixEnd()
-		spans = append(spans, roachpb.Span{Key: key, EndKey: endKey})
+		invertedExpr = inverted.Or(invertedExpr, inverted.ExprForSpan(
+			inverted.MakeSingleValSpan(inverted.EncVal(key)), true, /* tight */
+		))
+	}
+	if spanExpr, ok := invertedExpr.(*inverted.SpanExpression); ok {
+		spanExpr.Unique = unique
 	}
 
-	return []roachpb.Spans{spans}, true, unique, nil
+	return invertedExpr, nil
+}
+
+// encodeContainedInvertedIndexSpansFromLeaf encodes the spans that must be
+// scanned in an inverted index to find the JSON objects that are contained by
+// the given leaf JSON value. A leaf is any scalar json such as '1', 'true', or
+// 'null'. The resulting span should only include the key for the leaf.
+// Unlike encodeContainingInvertedIndexSpansFromLeaf, empty JSON objects and
+// array spans are not encoded by this function.
+//
+// If isRoot is true, this function is being called at the root level of the
+// JSON hierarchy. If isObjectValue is true, the given JSON is the value of a
+// JSON object key. Note that isRoot and isObjectValue cannot both be true at
+// the same time.
+func encodeContainedInvertedIndexSpansFromLeaf(
+	j JSON, b []byte, isRoot bool,
+) (invertedExpr inverted.Expression, err error) {
+	keys, err := j.encodeInvertedIndexKeys(b)
+	if err != nil {
+		return nil, err
+	}
+
+	invertedExpr = &inverted.SpanExpression{Tight: false}
+	var unique bool
+	switch j.(type) {
+	case jsonArray:
+		return nil, errors.AssertionFailedf(
+			"encodeContainedInvertedIndexSpansFromLeaf called on a jsonArray",
+		)
+
+	case jsonObject:
+		return nil, errors.AssertionFailedf(
+			"encodeContainedInvertedIndexSpansFromLeaf called on a jsonObject",
+		)
+
+	default:
+		// The leaf is a scalar, so we only want the single span that contains the
+		// key for it, because the scalar can only contain itself.
+		if isRoot {
+			// We can guarantee that there will not be duplicate primary keys produced
+			// for paths ending in a scalar if it is the root.
+			unique = true
+		}
+		for _, key := range keys {
+			invertedExpr = inverted.Or(invertedExpr, inverted.ExprForSpan(
+				inverted.MakeSingleValSpan(key), false, /* tight */
+			))
+		}
+		if spanExpr, ok := invertedExpr.(*inverted.SpanExpression); ok {
+			spanExpr.Unique = unique
+		}
+
+		return invertedExpr, nil
+	}
 }
 
 // NumInvertedIndexEntries returns the number of inverted index entries that
@@ -1429,6 +1675,22 @@ func (jsonString) FetchValKey(string) (JSON, error) { return nil, nil }
 func (jsonNumber) FetchValKey(string) (JSON, error) { return nil, nil }
 func (jsonArray) FetchValKey(string) (JSON, error)  { return nil, nil }
 
+func fetchValIdxForScalar(j JSON, idx int) JSON {
+	// The 0'th element (and -1'st element with negative indexing) of a scalar
+	// JSON value is the scalar itself. This effectively treats scalar values as
+	// single element arrays.
+	if idx == 0 || idx == -1 {
+		return j
+	}
+	return nil
+}
+
+func (j jsonNull) FetchValIdx(idx int) (JSON, error)   { return fetchValIdxForScalar(j, idx), nil }
+func (j jsonTrue) FetchValIdx(idx int) (JSON, error)   { return fetchValIdxForScalar(j, idx), nil }
+func (j jsonFalse) FetchValIdx(idx int) (JSON, error)  { return fetchValIdxForScalar(j, idx), nil }
+func (j jsonString) FetchValIdx(idx int) (JSON, error) { return fetchValIdxForScalar(j, idx), nil }
+func (j jsonNumber) FetchValIdx(idx int) (JSON, error) { return fetchValIdxForScalar(j, idx), nil }
+
 func (j jsonArray) FetchValIdx(idx int) (JSON, error) {
 	if idx < 0 {
 		idx = len(j) + idx
@@ -1439,11 +1701,6 @@ func (j jsonArray) FetchValIdx(idx int) (JSON, error) {
 	return nil, nil
 }
 
-func (jsonNull) FetchValIdx(int) (JSON, error)   { return nil, nil }
-func (jsonTrue) FetchValIdx(int) (JSON, error)   { return nil, nil }
-func (jsonFalse) FetchValIdx(int) (JSON, error)  { return nil, nil }
-func (jsonString) FetchValIdx(int) (JSON, error) { return nil, nil }
-func (jsonNumber) FetchValIdx(int) (JSON, error) { return nil, nil }
 func (jsonObject) FetchValIdx(int) (JSON, error) { return nil, nil }
 
 // FetchPath implements the #> operator.
@@ -1736,8 +1993,12 @@ func (j jsonObject) RemoveString(s string) (JSON, bool, error) {
 	return jsonObject(newVal), true, nil
 }
 
-func (jsonNull) RemoveString(string) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
-func (jsonTrue) RemoveString(string) (JSON, bool, error) { return nil, false, errCannotDeleteFromScalar }
+func (jsonNull) RemoveString(string) (JSON, bool, error) {
+	return nil, false, errCannotDeleteFromScalar
+}
+func (jsonTrue) RemoveString(string) (JSON, bool, error) {
+	return nil, false, errCannotDeleteFromScalar
+}
 func (jsonFalse) RemoveString(string) (JSON, bool, error) {
 	return nil, false, errCannotDeleteFromScalar
 }

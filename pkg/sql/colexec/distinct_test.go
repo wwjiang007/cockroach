@@ -17,7 +17,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -28,8 +30,8 @@ import (
 type distinctTestCase struct {
 	distinctCols            []uint32
 	typs                    []*types.T
-	tuples                  []tuple
-	expected                []tuple
+	tuples                  []colexectestutils.Tuple
+	expected                []colexectestutils.Tuple
 	isOrderedOnDistinctCols bool
 }
 
@@ -37,7 +39,7 @@ var distinctTestCases = []distinctTestCase{
 	{
 		distinctCols: []uint32{0, 1, 2},
 		typs:         []*types.T{types.Float, types.Int, types.String, types.Int},
-		tuples: tuples{
+		tuples: colexectestutils.Tuples{
 			{nil, nil, nil, nil},
 			{nil, nil, nil, nil},
 			{nil, nil, "30", nil},
@@ -48,7 +50,7 @@ var distinctTestCases = []distinctTestCase{
 			{2.0, 3, "40", 4},
 			{2.0, 3, "40", 4},
 		},
-		expected: tuples{
+		expected: colexectestutils.Tuples{
 			{nil, nil, nil, nil},
 			{nil, nil, "30", nil},
 			{1.0, 2, "30", 4},
@@ -61,7 +63,7 @@ var distinctTestCases = []distinctTestCase{
 	{
 		distinctCols: []uint32{1, 0, 2},
 		typs:         []*types.T{types.Float, types.Int, types.Bytes, types.Int},
-		tuples: tuples{
+		tuples: colexectestutils.Tuples{
 			{nil, nil, nil, nil},
 			{nil, nil, nil, nil},
 			{nil, nil, "30", nil},
@@ -72,7 +74,7 @@ var distinctTestCases = []distinctTestCase{
 			{2.0, 3, "40", 4},
 			{2.0, 3, "40", 4},
 		},
-		expected: tuples{
+		expected: colexectestutils.Tuples{
 			{nil, nil, nil, nil},
 			{nil, nil, "30", nil},
 			{1.0, 2, "30", 4},
@@ -85,7 +87,7 @@ var distinctTestCases = []distinctTestCase{
 	{
 		distinctCols: []uint32{0, 1, 2},
 		typs:         []*types.T{types.Float, types.Int, types.String, types.Int},
-		tuples: tuples{
+		tuples: colexectestutils.Tuples{
 			{1.0, 2, "30", 4},
 			{1.0, 2, "30", 4},
 			{nil, nil, nil, nil},
@@ -96,7 +98,7 @@ var distinctTestCases = []distinctTestCase{
 			{2.0, 3, "40", 4},
 			{2.0, 3, "40", 4},
 		},
-		expected: tuples{
+		expected: colexectestutils.Tuples{
 			{1.0, 2, "30", 4},
 			{nil, nil, nil, nil},
 			{2.0, 2, "30", 4},
@@ -108,7 +110,7 @@ var distinctTestCases = []distinctTestCase{
 	{
 		distinctCols: []uint32{0},
 		typs:         []*types.T{types.Int, types.Bytes},
-		tuples: tuples{
+		tuples: colexectestutils.Tuples{
 			{1, "a"},
 			{2, "b"},
 			{3, "c"},
@@ -119,7 +121,7 @@ var distinctTestCases = []distinctTestCase{
 			{2, "2"},
 			{3, "3"},
 		},
-		expected: tuples{
+		expected: colexectestutils.Tuples{
 			{1, "a"},
 			{2, "b"},
 			{3, "c"},
@@ -129,11 +131,11 @@ var distinctTestCases = []distinctTestCase{
 		},
 	},
 	{
-		// This is to test hashTable deduplication with various batch size
+		// This is to test HashTable deduplication with various batch size
 		// boundaries and ensure it always emits the first tuple it encountered.
 		distinctCols: []uint32{0},
 		typs:         []*types.T{types.Int, types.String},
-		tuples: tuples{
+		tuples: colexectestutils.Tuples{
 			{1, "1"},
 			{1, "2"},
 			{1, "3"},
@@ -151,7 +153,7 @@ var distinctTestCases = []distinctTestCase{
 			{1, "15"},
 			{1, "16"},
 		},
-		expected: tuples{
+		expected: colexectestutils.Tuples{
 			{1, "1"},
 			{2, "6"},
 			{0, "11"},
@@ -160,7 +162,7 @@ var distinctTestCases = []distinctTestCase{
 	{
 		distinctCols: []uint32{0},
 		typs:         []*types.T{types.Jsonb, types.String},
-		tuples: tuples{
+		tuples: colexectestutils.Tuples{
 			{`'{"id": 1}'`, "a"},
 			{`'{"id": 2}'`, "b"},
 			{`'{"id": 3}'`, "c"},
@@ -171,7 +173,7 @@ var distinctTestCases = []distinctTestCase{
 			{`'{"id": 6}'`, "f"},
 			{`'{"id": 3}'`, "3"},
 		},
-		expected: tuples{
+		expected: colexectestutils.Tuples{
 			{`'{"id": 1}'`, "a"},
 			{`'{"id": 2}'`, "b"},
 			{`'{"id": 3}'`, "c"},
@@ -188,8 +190,8 @@ func TestDistinct(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
 	for _, tc := range distinctTestCases {
 		log.Infof(context.Background(), "unordered")
-		runTestsWithTyps(t, []tuples{tc.tuples}, [][]*types.T{tc.typs}, tc.expected, orderedVerifier,
-			func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+		colexectestutils.RunTestsWithTyps(t, testAllocator, []colexectestutils.Tuples{tc.tuples}, [][]*types.T{tc.typs}, tc.expected, colexectestutils.OrderedVerifier,
+			func(input []colexecop.Operator) (colexecop.Operator, error) {
 				return NewUnorderedDistinct(
 					testAllocator, input[0], tc.distinctCols, tc.typs,
 				), nil
@@ -201,20 +203,61 @@ func TestDistinct(t *testing.T) {
 				for i, j := range rng.Perm(len(tc.distinctCols))[:numOrderedCols] {
 					orderedCols[i] = tc.distinctCols[j]
 				}
-				runTestsWithTyps(t, []tuples{tc.tuples}, [][]*types.T{tc.typs}, tc.expected, orderedVerifier,
-					func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+				colexectestutils.RunTestsWithTyps(t, testAllocator, []colexectestutils.Tuples{tc.tuples}, [][]*types.T{tc.typs}, tc.expected, colexectestutils.OrderedVerifier,
+					func(input []colexecop.Operator) (colexecop.Operator, error) {
 						return newPartiallyOrderedDistinct(
 							testAllocator, input[0], tc.distinctCols, orderedCols, tc.typs,
 						)
 					})
 			}
 			log.Info(context.Background(), "ordered")
-			runTestsWithTyps(t, []tuples{tc.tuples}, [][]*types.T{tc.typs}, tc.expected, orderedVerifier,
-				func(input []colexecbase.Operator) (colexecbase.Operator, error) {
-					return NewOrderedDistinct(input[0], tc.distinctCols, tc.typs)
+			colexectestutils.RunTestsWithTyps(t, testAllocator, []colexectestutils.Tuples{tc.tuples}, [][]*types.T{tc.typs}, tc.expected, colexectestutils.OrderedVerifier,
+				func(input []colexecop.Operator) (colexecop.Operator, error) {
+					return colexecbase.NewOrderedDistinct(input[0], tc.distinctCols, tc.typs)
 				})
 		}
 	}
+}
+
+func TestUnorderedDistinctRandom(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	rng, _ := randutil.NewPseudoRand()
+	nCols := 1 + rng.Intn(3)
+	typs := make([]*types.T, nCols)
+	distinctCols := make([]uint32, nCols)
+	for i := range typs {
+		typs[i] = types.Int
+		distinctCols[i] = uint32(i)
+	}
+	nDistinctBatches := 2 + rng.Intn(2)
+	newTupleProbability := rng.Float64()
+	nTuples := int(float64(nDistinctBatches*coldata.BatchSize()) / newTupleProbability)
+	const maxNumTuples = 25000
+	if nTuples > maxNumTuples {
+		// If we happen to set a large value for coldata.BatchSize() and a small
+		// value for newTupleProbability, we might end up with huge number of
+		// tuples. Then, when runTests test harness uses small batch size, the
+		// test might take a while, so we'll limit the number of tuples.
+		nTuples = maxNumTuples
+	}
+	tups, expected := generateRandomDataForUnorderedDistinct(rng, nTuples, nCols, newTupleProbability)
+	colexectestutils.RunTestsWithTyps(t, testAllocator, []colexectestutils.Tuples{tups}, [][]*types.T{typs}, expected, colexectestutils.UnorderedVerifier,
+		func(input []colexecop.Operator) (colexecop.Operator, error) {
+			return NewUnorderedDistinct(testAllocator, input[0], distinctCols, typs), nil
+		},
+	)
+}
+
+// getNewValueProbabilityForDistinct returns the probability that we need to use
+// a new value for a single element in a tuple when overall the tuples need to
+// be distinct with newTupleProbability and they consists of nCols columns.
+func getNewValueProbabilityForDistinct(newTupleProbability float64, nCols int) float64 {
+	// We have the following equation:
+	//   newTupleProbability = 1 - (1 - newValueProbability) ^ nCols,
+	// so applying some manipulations we get:
+	//   newValueProbability = 1 - (1 - newTupleProbability) ^ (1 / nCols).
+	return 1.0 - math.Pow(1-newTupleProbability, 1.0/float64(nCols))
 }
 
 // runDistinctBenchmarks runs the benchmarks of a distinct operator variant on
@@ -222,7 +265,7 @@ func TestDistinct(t *testing.T) {
 func runDistinctBenchmarks(
 	ctx context.Context,
 	b *testing.B,
-	distinctConstructor func(allocator *colmem.Allocator, input colexecbase.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecbase.Operator, error),
+	distinctConstructor func(allocator *colmem.Allocator, input colexecop.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecop.Operator, error),
 	getNumOrderedCols func(nCols int) int,
 	namePrefix string,
 	isExternal bool,
@@ -251,11 +294,7 @@ func runDistinctBenchmarks(
 					}
 					distinctCols := []uint32{0, 1, 2, 3}[:nCols]
 					numOrderedCols := getNumOrderedCols(nCols)
-					// We have the following equation:
-					//   newTupleProbability = 1 - (1 - newValueProbability) ^ nCols,
-					// so applying some manipulations we get:
-					//   newValueProbability = 1 - (1 - newTupleProbability) ^ (1 / nCols).
-					newValueProbability := 1.0 - math.Pow(1-newTupleProbability, 1.0/float64(nCols))
+					newValueProbability := getNewValueProbabilityForDistinct(newTupleProbability, nCols)
 					for i := range distinctCols {
 						col := cols[i].Int64()
 						col[0] = 0
@@ -285,7 +324,7 @@ func runDistinctBenchmarks(
 								// Note that the source will be ordered on all nCols so that the
 								// number of distinct tuples doesn't vary between different
 								// distinct operator variations.
-								source := newChunkingBatchSource(typs, cols, nRows)
+								source := colexectestutils.NewChunkingBatchSource(testAllocator, typs, cols, nRows)
 								distinct, err := distinctConstructor(testAllocator, source, distinctCols, numOrderedCols, typs)
 								if err != nil {
 									b.Fatal(err)
@@ -305,15 +344,15 @@ func runDistinctBenchmarks(
 func BenchmarkDistinct(b *testing.B) {
 	ctx := context.Background()
 
-	distinctConstructors := []func(*colmem.Allocator, colexecbase.Operator, []uint32, int, []*types.T) (colexecbase.Operator, error){
-		func(allocator *colmem.Allocator, input colexecbase.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecbase.Operator, error) {
+	distinctConstructors := []func(*colmem.Allocator, colexecop.Operator, []uint32, int, []*types.T) (colexecop.Operator, error){
+		func(allocator *colmem.Allocator, input colexecop.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecop.Operator, error) {
 			return NewUnorderedDistinct(allocator, input, distinctCols, typs), nil
 		},
-		func(allocator *colmem.Allocator, input colexecbase.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecbase.Operator, error) {
+		func(allocator *colmem.Allocator, input colexecop.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecop.Operator, error) {
 			return newPartiallyOrderedDistinct(allocator, input, distinctCols, distinctCols[:numOrderedCols], typs)
 		},
-		func(allocator *colmem.Allocator, input colexecbase.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecbase.Operator, error) {
-			return NewOrderedDistinct(input, distinctCols, typs)
+		func(allocator *colmem.Allocator, input colexecop.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecop.Operator, error) {
+			return colexecbase.NewOrderedDistinct(input, distinctCols, typs)
 		},
 	}
 	distinctNames := []string{"Unordered", "PartiallyOrdered", "Ordered"}

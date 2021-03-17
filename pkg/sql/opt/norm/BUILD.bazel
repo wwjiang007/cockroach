@@ -14,6 +14,7 @@ go_library(
         "join_funcs.go",
         "limit_funcs.go",
         "list_sorter.go",
+        "mutation_funcs.go",
         "ordering_funcs.go",
         "project_builder.go",
         "project_funcs.go",
@@ -56,6 +57,7 @@ go_library(
 
 go_test(
     name = "norm_test",
+    size = "small",
     srcs = [
         "decorrelate_funcs_test.go",
         "factory_test.go",
@@ -64,11 +66,11 @@ go_test(
     ],
     data = glob(["testdata/**"]),
     embed = [":norm"],
+    tags = ["broken_in_bazel"],
     deps = [
         "//pkg/settings/cluster",
         "//pkg/sql/opt",
         "//pkg/sql/opt/memo",
-        "//pkg/sql/opt/norm",
         "//pkg/sql/opt/testutils",
         "//pkg/sql/opt/testutils/opttester",
         "//pkg/sql/opt/testutils/testcat",

@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
@@ -98,12 +97,12 @@ func NewTxn(ctx context.Context, db *DB, gatewayNodeID roachpb.NodeID) *Txn {
 			errors.AssertionFailedf("attempting to create txn with nil db"), ctx))
 	}
 
-	now := db.clock.Now()
+	now := db.clock.NowAsClockTimestamp()
 	kvTxn := roachpb.MakeTransaction(
 		"unnamed",
 		nil, // baseKey
 		roachpb.NormalUserPriority,
-		now,
+		now.ToTimestamp(),
 		db.clock.MaxOffset().Nanoseconds(),
 	)
 
@@ -124,7 +123,7 @@ func NewTxnFromProto(
 	ctx context.Context,
 	db *DB,
 	gatewayNodeID roachpb.NodeID,
-	now hlc.Timestamp,
+	now hlc.ClockTimestamp,
 	typ TxnType,
 	proto *roachpb.Transaction,
 ) *Txn {
@@ -310,6 +309,14 @@ func (txn *Txn) ProvisionalCommitTimestamp() hlc.Timestamp {
 	return txn.mu.sender.ProvisionalCommitTimestamp()
 }
 
+// RequiredFrontier returns the largest timestamp at which the transaction may
+// read values when performing a read-only operation.
+func (txn *Txn) RequiredFrontier() hlc.Timestamp {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.RequiredFrontier()
+}
+
 // SetSystemConfigTrigger sets the system db trigger to true on this transaction.
 // This will impact the EndTxnRequest. Note that this method takes a boolean
 // argument indicating whether this transaction is intended for the system
@@ -335,9 +342,7 @@ func (txn *Txn) SetSystemConfigTrigger(forSystemTenant bool) error {
 }
 
 // DisablePipelining instructs the transaction not to pipeline requests. It
-// should rarely be necessary to call this method. It is only recommended for
-// transactions that need extremely precise control over the request ordering,
-// like the transaction that merges ranges together.
+// should rarely be necessary to call this method.
 //
 // DisablePipelining must be called before any operations are performed on the
 // transaction.
@@ -359,13 +364,27 @@ func (txn *Txn) NewBatch() *Batch {
 // Get retrieves the value for a key, returning the retrieved key/value or an
 // error. It is not considered an error for the key to not exist.
 //
-//   r, err := db.Get("a")
+//   r, err := txn.Get("a")
 //   // string(r.Key) == "a"
 //
 // key can be either a byte slice or a string.
 func (txn *Txn) Get(ctx context.Context, key interface{}) (KeyValue, error) {
 	b := txn.NewBatch()
 	b.Get(key)
+	return getOneRow(txn.Run(ctx, b), b)
+}
+
+// GetForUpdate retrieves the value for a key, returning the retrieved key/value
+// or an error. An unreplicated, exclusive lock is acquired on the key, if it
+// exists. It is not considered an error for the key to not exist.
+//
+//   r, err := txn.GetForUpdate("a")
+//   // string(r.Key) == "a"
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) GetForUpdate(ctx context.Context, key interface{}) (KeyValue, error) {
+	b := txn.NewBatch()
+	b.GetForUpdate(key)
 	return getOneRow(txn.Run(ctx, b), b)
 }
 
@@ -582,8 +601,6 @@ func (txn *Txn) DelRange(ctx context.Context, begin, end interface{}) error {
 // operation. The order of the results matches the order the operations were
 // added to the batch.
 func (txn *Txn) Run(ctx context.Context, b *Batch) error {
-	tracing.AnnotateTrace()
-	defer tracing.AnnotateTrace()
 	if err := b.prepare(); err != nil {
 		return err
 	}
@@ -1137,8 +1154,8 @@ func (txn *Txn) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) {
 func (txn *Txn) GenerateForcedRetryableError(ctx context.Context, msg string) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
-	now := txn.db.clock.Now()
-	txn.mu.sender.ManualRestart(ctx, txn.mu.userPriority, now)
+	now := txn.db.clock.NowAsClockTimestamp()
+	txn.mu.sender.ManualRestart(ctx, txn.mu.userPriority, now.ToTimestamp())
 	txn.resetDeadlineLocked()
 	return roachpb.NewTransactionRetryWithProtoRefreshError(
 		msg,
@@ -1147,7 +1164,7 @@ func (txn *Txn) GenerateForcedRetryableError(ctx context.Context, msg string) er
 			txn.debugNameLocked(),
 			nil, // baseKey
 			txn.mu.userPriority,
-			now,
+			now.ToTimestamp(),
 			txn.db.clock.MaxOffset().Nanoseconds(),
 		))
 }
@@ -1285,4 +1302,19 @@ func (txn *Txn) ReleaseSavepoint(ctx context.Context, s SavepointToken) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 	return txn.mu.sender.ReleaseSavepoint(ctx, s)
+}
+
+// ManualRefresh forces a refresh of the read timestamp of a transaction to
+// match that of its write timestamp. It is only recommended for transactions
+// that need extremely precise control over the request ordering, like the
+// transaction that merges ranges together. When combined with
+// DisablePipelining, this feature allows the range merge transaction to
+// prove that it will not be pushed between sending its SubsumeRequest and
+// committing. This enables that request to be pushed at earlier points in
+// its lifecycle.
+func (txn *Txn) ManualRefresh(ctx context.Context) error {
+	txn.mu.Lock()
+	sender := txn.mu.sender
+	txn.mu.Unlock()
+	return sender.ManualRefresh(ctx)
 }

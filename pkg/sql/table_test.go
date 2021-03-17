@@ -302,11 +302,16 @@ func TestMakeTableDescIndexes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%d (%s): %v", i, d.sql, err)
 		}
-		if !reflect.DeepEqual(d.primary, *schema.GetPrimaryIndex()) {
-			t.Fatalf("%d (%s): primary mismatch: expected %+v, but got %+v", i, d.sql, d.primary, schema.GetPrimaryIndex())
+		activeIndexDescs := make([]descpb.IndexDescriptor, len(schema.ActiveIndexes()))
+		for i, index := range schema.ActiveIndexes() {
+			activeIndexDescs[i] = *index.IndexDesc()
 		}
-		if !reflect.DeepEqual(d.indexes, append([]descpb.IndexDescriptor{}, schema.GetPublicNonPrimaryIndexes()...)) {
-			t.Fatalf("%d (%s): index mismatch: expected %+v, but got %+v", i, d.sql, d.indexes, schema.GetPublicNonPrimaryIndexes())
+
+		if !reflect.DeepEqual(d.primary, activeIndexDescs[0]) {
+			t.Fatalf("%d (%s): primary mismatch: expected %+v, but got %+v", i, d.sql, d.primary, activeIndexDescs[0])
+		}
+		if !reflect.DeepEqual(d.indexes, activeIndexDescs[1:]) {
+			t.Fatalf("%d (%s): index mismatch: expected %+v, but got %+v", i, d.sql, d.indexes, activeIndexDescs[1:])
 		}
 
 	}
@@ -388,7 +393,7 @@ func TestPrimaryKeyUnspecified(t *testing.T) {
 	}
 	desc.SetPrimaryIndex(descpb.IndexDescriptor{})
 
-	err = desc.ValidateTable(ctx)
+	err = catalog.ValidateSelf(desc)
 	if !testutils.IsError(err, tabledesc.ErrMissingPrimaryKey.Error()) {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -412,14 +417,9 @@ CREATE TABLE test.tt (x test.t);
 	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "tt")
 	typLookup := func(ctx context.Context, id descpb.ID) (tree.TypeName, catalog.TypeDescriptor, error) {
 		var typeDesc catalog.TypeDescriptor
-		if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			desc, err := catalogkv.GetDescriptorByID(ctx, txn, keys.SystemSQLCodec, id,
-				catalogkv.Immutable, catalogkv.TypeDescriptorKind, true /* required */)
-			if err != nil {
-				return err
-			}
-			typeDesc = desc.(catalog.TypeDescriptor)
-			return nil
+		if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+			typeDesc, err = catalogkv.MustGetTypeDescByID(ctx, txn, keys.SystemSQLCodec, id)
+			return err
 		}); err != nil {
 			return tree.TypeName{}, nil, err
 		}
@@ -442,47 +442,47 @@ func TestSerializedUDTsInTableDescriptor(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	getDefault := func(desc *tabledesc.Immutable) string {
-		return *desc.Columns[0].DefaultExpr
+	getDefault := func(desc catalog.TableDescriptor) string {
+		return desc.PublicColumns()[0].GetDefaultExpr()
 	}
-	getComputed := func(desc *tabledesc.Immutable) string {
-		return *desc.Columns[0].ComputeExpr
+	getComputed := func(desc catalog.TableDescriptor) string {
+		return desc.PublicColumns()[0].GetComputeExpr()
 	}
-	getCheck := func(desc *tabledesc.Immutable) string {
-		return desc.Checks[0].Expr
+	getCheck := func(desc catalog.TableDescriptor) string {
+		return desc.GetChecks()[0].Expr
 	}
 	testdata := []struct {
 		colSQL       string
 		expectedExpr string
-		getExpr      func(desc *tabledesc.Immutable) string
+		getExpr      func(desc catalog.TableDescriptor) string
 	}{
 		// Test a simple UDT as the default value.
 		{
 			"x greeting DEFAULT ('hello')",
-			`b'\x80':::@100053`,
+			`x'80':::@100053`,
 			getDefault,
 		},
 		{
 			"x greeting DEFAULT ('hello':::greeting)",
-			`b'\x80':::@100053`,
+			`x'80':::@100053`,
 			getDefault,
 		},
 		// Test when a UDT is used in a default value, but isn't the
 		// final type of the column.
 		{
 			"x INT DEFAULT (CASE WHEN 'hello'::greeting = 'hello'::greeting THEN 0 ELSE 1 END)",
-			`CASE WHEN b'\x80':::@100053 = b'\x80':::@100053 THEN 0:::INT8 ELSE 1:::INT8 END`,
+			`CASE WHEN x'80':::@100053 = x'80':::@100053 THEN 0:::INT8 ELSE 1:::INT8 END`,
 			getDefault,
 		},
 		{
 			"x BOOL DEFAULT ('hello'::greeting IS OF (greeting, greeting))",
-			`b'\x80':::@100053 IS OF (@100053, @100053)`,
+			`x'80':::@100053 IS OF (@100053, @100053)`,
 			getDefault,
 		},
 		// Test check constraints.
 		{
 			"x greeting, CHECK (x = 'hello')",
-			`x = b'\x80':::@100053`,
+			`x = x'80':::@100053`,
 			getCheck,
 		},
 		{
@@ -493,12 +493,12 @@ func TestSerializedUDTsInTableDescriptor(t *testing.T) {
 		// Test a computed column in the same cases as above.
 		{
 			"x greeting AS ('hello') STORED",
-			`b'\x80':::@100053`,
+			`x'80':::@100053`,
 			getComputed,
 		},
 		{
 			"x INT AS (CASE WHEN 'hello'::greeting = 'hello'::greeting THEN 0 ELSE 1 END) STORED",
-			`CASE WHEN b'\x80':::@100053 = b'\x80':::@100053 THEN 0:::INT8 ELSE 1:::INT8 END`,
+			`CASE WHEN x'80':::@100053 = x'80':::@100053 THEN 0:::INT8 ELSE 1:::INT8 END`,
 			getComputed,
 		},
 	}
@@ -533,6 +533,7 @@ func TestSerializedUDTsInTableDescriptor(t *testing.T) {
 // for following schema changes in the same transaction.
 func TestJobsCache(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	foundInCache := false

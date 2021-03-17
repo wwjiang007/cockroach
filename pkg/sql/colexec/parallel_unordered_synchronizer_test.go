@@ -20,8 +20,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -51,7 +51,7 @@ func TestParallelUnorderedSynchronizer(t *testing.T) {
 
 	inputs := make([]SynchronizerInput, numInputs)
 	for i := range inputs {
-		source := colexecbase.NewRepeatableBatchSource(
+		source := colexecop.NewRepeatableBatchSource(
 			testAllocator,
 			coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0 /* length */, rng.Float64()),
 			typs,
@@ -66,10 +66,12 @@ func TestParallelUnorderedSynchronizer(t *testing.T) {
 		}
 	}
 
+	ctx, cancelFn := context.WithCancel(context.Background())
+
 	var wg sync.WaitGroup
 	s := NewParallelUnorderedSynchronizer(inputs, &wg)
+	s.Init()
 
-	ctx, cancelFn := context.WithCancel(context.Background())
 	type synchronizerTerminationScenario int
 	const (
 		// synchronizerGracefulTermination is a termination scenario where the
@@ -151,7 +153,7 @@ func TestUnorderedSynchronizerNoLeaksOnError(t *testing.T) {
 	ctx := context.Background()
 
 	inputs := make([]SynchronizerInput, 6)
-	inputs[0].Op = &colexecbase.CallbackOperator{NextCb: func(context.Context) coldata.Batch {
+	inputs[0].Op = &colexecop.CallbackOperator{NextCb: func(context.Context) coldata.Batch {
 		colexecerror.InternalError(errors.New(expectedErr))
 		// This code is unreachable, but the compiler cannot infer that.
 		return nil
@@ -160,7 +162,7 @@ func TestUnorderedSynchronizerNoLeaksOnError(t *testing.T) {
 		acc := testMemMonitor.MakeBoundAccount()
 		defer acc.Close(ctx)
 		func(allocator *colmem.Allocator) {
-			inputs[i].Op = &colexecbase.CallbackOperator{
+			inputs[i].Op = &colexecop.CallbackOperator{
 				NextCb: func(ctx context.Context) coldata.Batch {
 					// All inputs that do not encounter an error will continue to return
 					// batches.
@@ -178,6 +180,7 @@ func TestUnorderedSynchronizerNoLeaksOnError(t *testing.T) {
 
 	var wg sync.WaitGroup
 	s := NewParallelUnorderedSynchronizer(inputs, &wg)
+	s.Init()
 	for {
 		if err := colexecerror.CatchVectorizedRuntimeError(func() { _ = s.Next(ctx) }); err != nil {
 			require.True(t, testutils.IsError(err, expectedErr), err)
@@ -199,11 +202,12 @@ func BenchmarkParallelUnorderedSynchronizer(b *testing.B) {
 	for i := range inputs {
 		batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 		batch.SetLength(coldata.BatchSize())
-		inputs[i].Op = colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
+		inputs[i].Op = colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
 	}
 	var wg sync.WaitGroup
 	ctx, cancelFn := context.WithCancel(context.Background())
 	s := NewParallelUnorderedSynchronizer(inputs, &wg)
+	s.Init()
 	b.SetBytes(8 * int64(coldata.BatchSize()))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

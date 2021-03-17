@@ -11,6 +11,7 @@
 package sql
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/migration"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -30,7 +31,15 @@ type plannerJobExecContext struct {
 func MakeJobExecContext(
 	opName string, user security.SQLUsername, memMetrics *MemoryMetrics, execCfg *ExecutorConfig,
 ) (JobExecContext, func()) {
-	p, close := newInternalPlanner(opName, nil /*txn*/, user, memMetrics, execCfg, sessiondatapb.SessionData{})
+	plannerInterface, close := NewInternalPlanner(
+		opName,
+		nil, /*txn*/
+		user,
+		memMetrics,
+		execCfg,
+		sessiondatapb.SessionData{},
+	)
+	p := plannerInterface.(*planner)
 	return &plannerJobExecContext{p: p}, close
 }
 
@@ -45,6 +54,9 @@ func (e *plannerJobExecContext) ExecCfg() *ExecutorConfig        { return e.p.Ex
 func (e *plannerJobExecContext) DistSQLPlanner() *DistSQLPlanner { return e.p.DistSQLPlanner() }
 func (e *plannerJobExecContext) LeaseMgr() *lease.Manager        { return e.p.LeaseMgr() }
 func (e *plannerJobExecContext) User() security.SQLUsername      { return e.p.User() }
+func (e *plannerJobExecContext) MigrationJobDeps() migration.JobDeps {
+	return e.p.MigrationJobDeps()
+}
 
 // JobExecContext provides the execution environment for a job. It is what is
 // passed to the Resume/OnFailOrCancel/OnPauseRequested methods of a jobs's
@@ -63,4 +75,5 @@ type JobExecContext interface {
 	DistSQLPlanner() *DistSQLPlanner
 	LeaseMgr() *lease.Manager
 	User() security.SQLUsername
+	MigrationJobDeps() migration.JobDeps
 }

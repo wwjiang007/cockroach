@@ -25,9 +25,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -114,6 +114,7 @@ func TestJoinReader(t *testing.T) {
 		// using outputColumnForContinuation.
 		post       execinfrapb.PostProcessSpec
 		onExpr     string
+		lookupExpr string
 		input      [][]tree.Datum
 		lookupCols []uint32
 		joinType   descpb.JoinType
@@ -635,6 +636,95 @@ func TestJoinReader(t *testing.T) {
 			secondJoinInPairedJoin: true,
 			expected:               "[[43 10 5]]",
 		},
+		{
+			description: "Test left outer lookup join on primary index with lookup expr",
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{1, 2, 3},
+			},
+			input: [][]tree.Datum{
+				{aFn(100), bFn(100)},
+				// No match for this row.
+				{tree.NewDInt(tree.DInt(11)), tree.NewDInt(tree.DInt(11))},
+				{aFn(2), bFn(2)},
+				{aFn(2), bFn(2)},
+			},
+			lookupExpr:  "@3 IN (1, 2) AND @2 = @4",
+			joinType:    descpb.LeftOuterJoin,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.ThreeIntCols,
+			expected:    "[[0 1 0] [0 2 0] [11 NULL NULL] [2 1 2] [2 2 2] [2 1 2] [2 2 2]]",
+			expectedWithContinuation: "[[0 1 0 false] [0 2 0 true] [11 NULL NULL false] [2 1 2 false] " +
+				"[2 2 2 true] [2 1 2 false] [2 2 2 true]]",
+			outputColumnForContinuation: 6,
+		},
+		{
+			description: "Test left anti lookup join on primary index with lookup expr",
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{1},
+			},
+			input: [][]tree.Datum{
+				{aFn(100), bFn(100)},
+				{aFn(2), bFn(2)},
+				{aFn(2), bFn(2)},
+				// No match for this row.
+				{tree.NewDInt(tree.DInt(11)), tree.NewDInt(tree.DInt(11))},
+			},
+			lookupExpr:  "@4 = @2 AND @3 IN (1, 2)",
+			joinType:    descpb.LeftAntiJoin,
+			inputTypes:  rowenc.TwoIntCols,
+			outputTypes: rowenc.OneIntCol,
+			expected:    "[[11]]",
+		},
+		{
+			description: "Test left outer lookup join on secondary index with lookup expr",
+			indexIdx:    1,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1, 6},
+			},
+			input: [][]tree.Datum{
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				{aFn(10), tree.DNull, tree.DNull},
+				// No match for this row.
+				{aFn(20), bFn(20), sqlutils.RowEnglishFn(20)},
+				// No match for this row since it's null.
+				{tree.DNull, bFn(1), sqlutils.RowEnglishFn(1)},
+			},
+			lookupExpr:  "@5 IN (1, 2, 5) AND @4 = @1 AND @7 IN ('one', 'two', 'one-two')",
+			joinType:    descpb.LeftOuterJoin,
+			inputTypes:  []*types.T{types.Int, types.Int, types.String},
+			outputTypes: []*types.T{types.Int, types.Int, types.String},
+			expected: "[[0 1 'one'] [0 1 'two'] [0 2 'one'] [0 2 'two'] [1 NULL 'one-two'] " +
+				"[2 0 NULL] [NULL 1 NULL]]",
+			expectedWithContinuation: "[[0 1 'one' false] [0 1 'two' true] [0 2 'one' false] " +
+				"[0 2 'two' true] [1 NULL 'one-two' false] [2 0 NULL false] [NULL 1 NULL false]]",
+			outputColumnForContinuation: 7,
+		},
+		{
+			description: "Test left anti lookup join on secondary index with lookup expr",
+			indexIdx:    1,
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{0, 1},
+			},
+			input: [][]tree.Datum{
+				{aFn(1), bFn(1), sqlutils.RowEnglishFn(1)},
+				// No match for this row.
+				{aFn(20), bFn(20), sqlutils.RowEnglishFn(20)},
+				{aFn(2), bFn(2), sqlutils.RowEnglishFn(2)},
+				{aFn(10), tree.DNull, tree.DNull},
+				// No match for this row since it's null.
+				{tree.DNull, bFn(1), sqlutils.RowEnglishFn(1)},
+			},
+			lookupExpr:  "@5 IN (1, 2, 5) AND @7 IN ('one', 'two', 'one-two') AND @1 = @4",
+			joinType:    descpb.LeftAntiJoin,
+			inputTypes:  []*types.T{types.Int, types.Int, types.String},
+			outputTypes: rowenc.TwoIntCols,
+			expected:    "[[2 0] [NULL 1]]",
+		},
 	}
 	st := cluster.MakeTestingClusterSettings()
 	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
@@ -653,7 +743,7 @@ func TestJoinReader(t *testing.T) {
 	)
 	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
-	for i, td := range []*tabledesc.Immutable{tdSecondary, tdFamily, tdInterleaved} {
+	for i, td := range []catalog.TableDescriptor{tdSecondary, tdFamily, tdInterleaved} {
 		for _, c := range testCases {
 			for _, reqOrdering := range []bool{true, false} {
 				// Small and large batches exercise different paths of interest for
@@ -682,9 +772,9 @@ func TestJoinReader(t *testing.T) {
 								Cfg: &execinfra.ServerConfig{
 									Settings:    st,
 									TempStorage: tempEngine,
-									DiskMonitor: diskMonitor,
 								},
-								Txn: kv.NewTxn(ctx, s.DB(), s.NodeID()),
+								Txn:         kv.NewTxn(ctx, s.DB(), s.NodeID()),
+								DiskMonitor: diskMonitor,
 							}
 							encRows := make(rowenc.EncDatumRows, len(c.input))
 							for rowIdx, row := range c.input {
@@ -708,6 +798,7 @@ func TestJoinReader(t *testing.T) {
 									Table:                             *td.TableDesc(),
 									IndexIdx:                          c.indexIdx,
 									LookupColumns:                     c.lookupCols,
+									LookupExpr:                        execinfrapb.Expression{Expr: c.lookupExpr},
 									OnExpr:                            execinfrapb.Expression{Expr: c.onExpr},
 									Type:                              c.joinType,
 									MaintainOrdering:                  reqOrdering,
@@ -839,9 +930,9 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
-			DiskMonitor: diskMonitor,
 		},
-		Txn: kv.NewTxn(ctx, s.DB(), s.NodeID()),
+		Txn:         kv.NewTxn(ctx, s.DB(), s.NodeID()),
+		DiskMonitor: diskMonitor,
 	}
 	// Set the memory limit to the minimum allocation size so that the row
 	// container can buffer some rows in memory before spilling to disk. This
@@ -941,9 +1032,9 @@ func TestJoinReaderDrain(t *testing.T) {
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
-			DiskMonitor: diskMonitor,
 		},
-		Txn: leafTxn,
+		Txn:         leafTxn,
+		DiskMonitor: diskMonitor,
 	}
 
 	encRow := make(rowenc.EncDatumRow, 1)
@@ -1155,9 +1246,9 @@ func BenchmarkJoinReader(b *testing.B) {
 		flowCtx     = execinfra.FlowCtx{
 			EvalCtx: &evalCtx,
 			Cfg: &execinfra.ServerConfig{
-				DiskMonitor: diskMonitor,
-				Settings:    st,
+				Settings: st,
 			},
+			DiskMonitor: diskMonitor,
 		}
 	)
 	defer logScope.Close(b)
@@ -1273,18 +1364,14 @@ func BenchmarkJoinReader(b *testing.B) {
 							// Get the table descriptor and find the index that will provide us with
 							// the expected match ratio.
 							tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
-							indexIdx := uint32(0)
-							for i := range tableDesc.GetPublicNonPrimaryIndexes() {
-								require.Equal(b, 1, len(tableDesc.GetPublicNonPrimaryIndexes()[i].ColumnNames), "all indexes created in this benchmark should only contain one column")
-								if tableDesc.GetPublicNonPrimaryIndexes()[i].ColumnNames[0] == columnDef.name {
-									// Found indexIdx.
-									indexIdx = uint32(i + 1)
-									break
-								}
-							}
-							if indexIdx == 0 {
+							foundIndex := catalog.FindPublicNonPrimaryIndex(tableDesc, func(idx catalog.Index) bool {
+								require.Equal(b, 1, idx.NumColumns(), "all indexes created in this benchmark should only contain one column")
+								return idx.GetColumnName(0) == columnDef.name
+							})
+							if foundIndex == nil {
 								b.Fatalf("failed to find secondary index for column %s", columnDef.name)
 							}
+							indexIdx := uint32(foundIndex.Ordinal())
 							input := newRowGeneratingSource(rowenc.OneIntCol, sqlutils.ToRowFn(func(rowIdx int) tree.Datum {
 								// Convert to 0-based.
 								return tree.NewDInt(tree.DInt(rowIdx - 1))

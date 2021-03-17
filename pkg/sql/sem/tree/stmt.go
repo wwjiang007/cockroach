@@ -69,6 +69,7 @@ const (
 type Statement interface {
 	fmt.Stringer
 	NodeFormatter
+
 	StatementType() StatementType
 	// StatementTag is a short string identifying the type of statement
 	// (usually a single verb). This is different than the Stringer output,
@@ -149,6 +150,8 @@ var _ CCLOnlyStatement = &CreateChangefeed{}
 var _ CCLOnlyStatement = &Import{}
 var _ CCLOnlyStatement = &Export{}
 var _ CCLOnlyStatement = &ScheduledBackup{}
+var _ CCLOnlyStatement = &StreamIngestion{}
+var _ CCLOnlyStatement = &ReplicationStream{}
 
 // StatementType implements the Statement interface.
 func (*AlterDatabaseOwner) StatementType() StatementType { return DDL }
@@ -210,9 +213,17 @@ func (*AlterTable) hiddenFromShowQueries() {}
 func (*AlterTableLocality) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*AlterTableLocality) StatementTag() string { return "ALTER TABLE REGIONAL AFFINITY" }
+func (*AlterTableLocality) StatementTag() string { return "ALTER TABLE SET LOCALITY" }
 
 func (*AlterTableLocality) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
+func (*AlterTableOwner) StatementType() StatementType { return DDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterTableOwner) StatementTag() string { return "ALTER TABLE OWNER" }
+
+func (*AlterTableOwner) hiddenFromShowQueries() {}
 
 // StatementType implements the Statement interface.
 func (*AlterTableSetSchema) StatementType() StatementType { return DDL }
@@ -667,6 +678,16 @@ func (n *Relocate) StatementTag() string {
 }
 
 // StatementType implements the Statement interface.
+func (*ReplicationStream) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ReplicationStream) StatementTag() string { return "CREATE REPLICATION STREAM" }
+
+func (*ReplicationStream) cclOnlyStatement() {}
+
+func (*ReplicationStream) hiddenFromShowQueries() {}
+
+// StatementType implements the Statement interface.
 func (*Restore) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -806,6 +827,12 @@ func (*ShowCreate) StatementType() StatementType { return Rows }
 func (*ShowCreate) StatementTag() string { return "SHOW CREATE" }
 
 // StatementType implements the Statement interface.
+func (*ShowCreateAllTables) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowCreateAllTables) StatementTag() string { return "SHOW CREATE ALL TABLES" }
+
+// StatementType implements the Statement interface.
 func (*ShowBackup) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -865,7 +892,7 @@ func (*ShowPartitions) StatementTag() string { return "SHOW PARTITIONS" }
 func (*ShowQueries) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*ShowQueries) StatementTag() string { return "SHOW QUERIES" }
+func (*ShowQueries) StatementTag() string { return "SHOW STATEMENTS" }
 
 // StatementType implements the Statement interface.
 func (*ShowJobs) StatementType() StatementType { return Rows }
@@ -1020,6 +1047,14 @@ func (*Split) StatementType() StatementType { return Rows }
 func (*Split) StatementTag() string { return "SPLIT" }
 
 // StatementType implements the Statement interface.
+func (*StreamIngestion) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*StreamIngestion) StatementTag() string { return "RESTORE FROM REPLICATION STREAM" }
+
+func (*StreamIngestion) cclOnlyStatement() {}
+
+// StatementType implements the Statement interface.
 func (*Unsplit) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -1071,6 +1106,7 @@ func (n *AlterTableDropStored) String() string           { return AsString(n) }
 func (n *AlterTableLocality) String() string             { return AsString(n) }
 func (n *AlterTableSetDefault) String() string           { return AsString(n) }
 func (n *AlterTableSetNotNull) String() string           { return AsString(n) }
+func (n *AlterTableOwner) String() string                { return AsString(n) }
 func (n *AlterTableSetSchema) String() string            { return AsString(n) }
 func (n *AlterType) String() string                      { return AsString(n) }
 func (n *AlterRole) String() string                      { return AsString(n) }
@@ -1128,6 +1164,7 @@ func (n *RefreshMaterializedView) String() string        { return AsString(n) }
 func (n *RenameColumn) String() string                   { return AsString(n) }
 func (n *RenameDatabase) String() string                 { return AsString(n) }
 func (n *ReparentDatabase) String() string               { return AsString(n) }
+func (n *ReplicationStream) String() string              { return AsString(n) }
 func (n *RenameIndex) String() string                    { return AsString(n) }
 func (n *RenameTable) String() string                    { return AsString(n) }
 func (n *Restore) String() string                        { return AsString(n) }
@@ -1154,6 +1191,7 @@ func (n *ShowClusterSettingList) String() string         { return AsString(n) }
 func (n *ShowColumns) String() string                    { return AsString(n) }
 func (n *ShowConstraints) String() string                { return AsString(n) }
 func (n *ShowCreate) String() string                     { return AsString(n) }
+func (n *ShowCreateAllTables) String() string            { return AsString(n) }
 func (n *ShowDatabases) String() string                  { return AsString(n) }
 func (n *ShowDatabaseIndexes) String() string            { return AsString(n) }
 func (n *ShowEnums) String() string                      { return AsString(n) }
@@ -1187,6 +1225,7 @@ func (n *ShowVar) String() string                        { return AsString(n) }
 func (n *ShowZoneConfig) String() string                 { return AsString(n) }
 func (n *ShowFingerprints) String() string               { return AsString(n) }
 func (n *Split) String() string                          { return AsString(n) }
+func (n *StreamIngestion) String() string                { return AsString(n) }
 func (n *Unsplit) String() string                        { return AsString(n) }
 func (n *Truncate) String() string                       { return AsString(n) }
 func (n *UnionClause) String() string                    { return AsString(n) }

@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -188,8 +188,23 @@ func RandomVec(args RandomVecArgs) {
 
 	for i := 0; i < args.N; i++ {
 		if args.Rand.Float64() < args.NullProbability {
-			args.Vec.Nulls().SetNull(i)
+			setNull(args.Rand, args.Vec, i)
 		}
+	}
+}
+
+// setNull sets ith element in vec to null and might set the actual value (which
+// should be ignored) to some garbage.
+func setNull(rng *rand.Rand, vec coldata.Vec, i int) {
+	vec.Nulls().SetNull(i)
+	switch vec.CanonicalTypeFamily() {
+	case types.DecimalFamily:
+		_, err := vec.Decimal()[i].SetFloat64(rng.Float64())
+		if err != nil {
+			colexecerror.InternalError(errors.AssertionFailedf("%v", err))
+		}
+	case types.IntervalFamily:
+		vec.Interval()[i] = duration.MakeDuration(rng.Int63(), rng.Int63(), rng.Int63())
 	}
 }
 
@@ -306,7 +321,7 @@ type RandomDataOp struct {
 	nulls            bool
 }
 
-var _ colexecbase.Operator = &RandomDataOp{}
+var _ colexecop.Operator = &RandomDataOp{}
 
 // NewRandomDataOp creates a new RandomDataOp.
 func NewRandomDataOp(

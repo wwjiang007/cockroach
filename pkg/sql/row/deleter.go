@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -42,9 +41,13 @@ type Deleter struct {
 // FetchCols; otherwise, all columns that are part of the key of any index
 // (either primary or secondary) are included in FetchCols.
 func MakeDeleter(
-	codec keys.SQLCodec, tableDesc *tabledesc.Immutable, requestedCols []descpb.ColumnDescriptor,
+	codec keys.SQLCodec, tableDesc catalog.TableDescriptor, requestedCols []descpb.ColumnDescriptor,
 ) Deleter {
-	indexes := tableDesc.DeletableIndexes()
+	indexes := tableDesc.DeletableNonPrimaryIndexes()
+	indexDescs := make([]descpb.IndexDescriptor, len(indexes))
+	for i, index := range indexes {
+		indexDescs[i] = *index.IndexDesc()
+	}
 
 	var fetchCols []descpb.ColumnDescriptor
 	var fetchColIDtoRowIndex catalog.TableColMap
@@ -54,28 +57,31 @@ func MakeDeleter(
 	} else {
 		maybeAddCol := func(colID descpb.ColumnID) error {
 			if _, ok := fetchColIDtoRowIndex.Get(colID); !ok {
-				col, err := tableDesc.FindColumnByID(colID)
+				col, err := tableDesc.FindColumnWithID(colID)
 				if err != nil {
 					return err
 				}
-				fetchColIDtoRowIndex.Set(col.ID, len(fetchCols))
-				fetchCols = append(fetchCols, *col)
+				fetchColIDtoRowIndex.Set(col.GetID(), len(fetchCols))
+				fetchCols = append(fetchCols, *col.ColumnDesc())
 			}
 			return nil
 		}
-		for _, colID := range tableDesc.GetPrimaryIndex().ColumnIDs {
+		for j := 0; j < tableDesc.GetPrimaryIndex().NumColumns(); j++ {
+			colID := tableDesc.GetPrimaryIndex().GetColumnID(j)
 			if err := maybeAddCol(colID); err != nil {
 				return Deleter{}
 			}
 		}
 		for _, index := range indexes {
-			for _, colID := range index.ColumnIDs {
+			for j := 0; j < index.NumColumns(); j++ {
+				colID := index.GetColumnID(j)
 				if err := maybeAddCol(colID); err != nil {
 					return Deleter{}
 				}
 			}
 			// The extra columns are needed to fix #14601.
-			for _, colID := range index.ExtraColumnIDs {
+			for j := 0; j < index.NumExtraColumns(); j++ {
+				colID := index.GetExtraColumnID(j)
 				if err := maybeAddCol(colID); err != nil {
 					return Deleter{}
 				}
@@ -84,7 +90,7 @@ func MakeDeleter(
 	}
 
 	rd := Deleter{
-		Helper:               newRowHelper(codec, tableDesc, indexes),
+		Helper:               newRowHelper(codec, tableDesc, indexDescs),
 		FetchCols:            fetchCols,
 		FetchColIDtoRowIndex: fetchColIDtoRowIndex,
 	}

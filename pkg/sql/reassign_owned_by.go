@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
@@ -42,7 +43,7 @@ func (p *planner) ReassignOwnedBy(ctx context.Context, n *tree.ReassignOwnedBy) 
 	// Check all roles in old roles exist. Checks in authorization.go will confirm that current user
 	// is a member of old roles and new roles and has CREATE privilege.
 	for _, oldRole := range n.OldRoles {
-		roleExists, err := p.RoleExists(ctx, oldRole)
+		roleExists, err := RoleExists(ctx, p.ExecCfg(), p.Txn(), oldRole)
 		if err != nil {
 			return nil, err
 		}
@@ -150,10 +151,10 @@ func (n *reassignOwnedByNode) reassignSchemaOwner(
 }
 
 func (n *reassignOwnedByNode) reassignTableOwner(
-	tbDesc *tabledesc.Immutable, params runParams,
+	tbDesc catalog.TableDescriptor, params runParams,
 ) error {
 	mutableTbDesc, err := params.p.Descriptors().GetMutableDescriptorByID(
-		params.ctx, tbDesc.ID, params.p.txn)
+		params.ctx, tbDesc.GetID(), params.p.txn)
 	if err != nil {
 		return err
 	}

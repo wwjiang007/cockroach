@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
@@ -51,7 +52,7 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
 		GCJob: &sql.GCJobTestingKnobs{
-			RunBeforeResume: func(_ int64) error {
+			RunBeforeResume: func(_ jobspb.JobID) error {
 				<-asyncNotification
 				return nil
 			},
@@ -70,11 +71,11 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 		PARTITION p2 VALUES IN (2)
 	)`)
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	indexDesc, _, err := tableDesc.FindIndexByName("i")
+	index, err := tableDesc.FindIndexWithName("i")
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, indexDesc.ID)
+	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, index.GetID())
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 
 	// Set zone configs on the primary index, secondary index, and one partition
@@ -91,7 +92,7 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 	// All zone configs should still exist.
 	var buf []byte
 	cfg := &zonepb.ZoneConfig{}
-	sqlDB.QueryRow(t, "SELECT config FROM system.zones WHERE id = $1", tableDesc.ID).Scan(&buf)
+	sqlDB.QueryRow(t, "SELECT config FROM system.zones WHERE id = $1", tableDesc.GetID()).Scan(&buf)
 	if err := protoutil.Unmarshal(buf, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +118,7 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 		}
 	}
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	if _, _, err := tableDesc.FindIndexByName("i"); err == nil {
+	if _, err := tableDesc.FindIndexWithName("i"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
 	close(asyncNotification)
@@ -129,7 +130,7 @@ func TestDropIndexWithZoneConfigCCL(t *testing.T) {
 		} else if l := 0; len(kvs) != l {
 			return errors.Errorf("expected %d key value pairs, but got %d", l, len(kvs))
 		}
-		sqlDB.QueryRow(t, "SELECT config FROM system.zones WHERE id = $1", tableDesc.ID).Scan(&buf)
+		sqlDB.QueryRow(t, "SELECT config FROM system.zones WHERE id = $1", tableDesc.GetID()).Scan(&buf)
 		if err := protoutil.Unmarshal(buf, cfg); err != nil {
 			return err
 		}

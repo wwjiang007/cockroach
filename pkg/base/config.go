@@ -74,13 +74,13 @@ const (
 	// rangeLeaseRenewalFraction specifies what fraction the range lease
 	// renewal duration should be of the range lease active time. For example,
 	// with a value of 0.2 and a lease duration of 10 seconds, leases would be
-	// eagerly renewed 2 seconds into each lease.
+	// eagerly renewed 8 seconds into each lease.
 	rangeLeaseRenewalFraction = 0.5
 
 	// livenessRenewalFraction specifies what fraction the node liveness
 	// renewal duration should be of the node liveness duration. For example,
 	// with a value of 0.2 and a liveness duration of 10 seconds, each node's
-	// liveness record would be eagerly renewed after 2 seconds.
+	// liveness record would be eagerly renewed after 8 seconds.
 	livenessRenewalFraction = 0.5
 
 	// DefaultDescriptorLeaseDuration is the default mean duration a
@@ -231,6 +231,18 @@ type Config struct {
 	// The flag exists mostly for the benefit of tests, and for
 	// `cockroach start-single-node`.
 	AutoInitializeCluster bool
+
+	// IdleExistAfter, If nonzero, will cause the server to run normally for the
+	// indicated amount of time, wait for all SQL connections to terminate,
+	// start a `defaultCountdownDuration` countdown and exit upon countdown
+	// reaching zero if no new connections occur. New connections will be
+	// accepted at all times and will effectively delay the exit (indefinitely
+	// if there is always at least one connection or there are no connection
+	// for less than `defaultCountdownDuration`. A new `defaultCountdownDuration`
+	// countdown will start when no more SQL connections exist.
+	// The interval is specified with a suffix of 's' for seconds, 'm' for
+	// minutes, and 'h' for hours.
+	IdleExitAfter time.Duration
 }
 
 // HistogramWindowInterval is used to determine the approximate length of time
@@ -544,6 +556,10 @@ type ExternalIODirConfig struct {
 	// This turns off implicit credentials, and requires the user to provide
 	// necessary access keys.
 	DisableImplicitCredentials bool
+
+	// DisableOutbound disables the use of any external-io that dials out such as
+	// to s3, gcs, or even `nodelocal` as it may need to dial another node.
+	DisableOutbound bool
 }
 
 // TempStorageConfigFromEnv creates a TempStorageConfig.

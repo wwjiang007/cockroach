@@ -19,7 +19,6 @@ go_library(
         "//pkg/sql/catalog/catalogkv",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/lease",
-        "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/catalog/typedesc",
         "//pkg/storage",
         "//pkg/util/encoding",
@@ -33,6 +32,7 @@ go_library(
 
 go_test(
     name = "schemafeed_test",
+    size = "medium",
     srcs = [
         "schema_feed_test.go",
         "table_event_filter_test.go",

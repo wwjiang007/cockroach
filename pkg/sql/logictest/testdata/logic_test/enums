@@ -6,16 +6,16 @@ CREATE TYPE t AS ENUM ()
 statement error pq: relation "t" does not exist
 SELECT * FROM t
 
-statement error pq: type "t" already exists
+statement error pq: type "test.public.t" already exists
 CREATE TABLE t (x INT)
 
-statement error pq: type "t" already exists
+statement error pq: type "test.public.t" already exists
 CREATE TYPE t AS ENUM ()
 
 statement ok
 CREATE TABLE torename (x INT)
 
-statement error pq: type "t" already exists
+statement error pq: type "test.public.t" already exists
 ALTER TABLE torename RENAME TO t
 
 statement ok
@@ -365,7 +365,7 @@ SELECT b'\x80'::as_bytes, b'\x80':::as_bytes
 ----
 bytes bytes
 
-query error pq: could not find \[255\] in enum representation
+query error pq: could not find \[255\] in enum "public.as_bytes" representation
 SELECT b'\xFF'::as_bytes
 
 # Regression for #49300. Ensure that virtual tables have access to hydrated
@@ -375,6 +375,8 @@ SHOW CREATE t1
 ----
 t1  CREATE TABLE public.t1 (
     x public.greeting NULL,
+    rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+    CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
     INDEX i (x ASC),
     FAMILY "primary" (x, rowid)
 )
@@ -386,6 +388,8 @@ SELECT create_statement FROM crdb_internal.create_statements WHERE descriptor_na
 ----
 CREATE TABLE public.t1 (
    x public.greeting NULL,
+   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+   CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
    INDEX i (x ASC),
    FAMILY "primary" (x, rowid)
 )
@@ -489,6 +493,8 @@ enum_default  CREATE TABLE public.enum_default (
               x INT8 NULL,
               y public.greeting NULL DEFAULT 'hello':::public.greeting,
               z BOOL NULL DEFAULT 'hello':::public.greeting IS OF (public.greeting, public.greeting),
+              rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+              CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
               FAMILY fam_0_x_y_z_rowid (x, y, z, rowid)
 )
 
@@ -545,6 +551,8 @@ enum_computed  CREATE TABLE public.enum_computed (
                y public.greeting NULL AS ('hello':::public.greeting) STORED,
                z BOOL NULL AS (w = 'howdy':::public.greeting) STORED,
                w public.greeting NULL,
+               rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+               CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
                FAMILY fam_0_x_y_z_w_rowid (x, y, z, w, rowid)
 )
 
@@ -577,6 +585,8 @@ SHOW CREATE enum_checks
 ----
 enum_checks  CREATE TABLE public.enum_checks (
              x public.greeting NULL,
+             rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+             CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
              FAMILY "primary" (x, rowid),
              CONSTRAINT check_x CHECK (x = 'hello':::public.greeting),
              CONSTRAINT "check" CHECK ('hello':::public.greeting = 'hello':::public.greeting)
@@ -1290,7 +1300,7 @@ subtest if_not_exists
 statement ok
 CREATE TYPE ifne AS ENUM ('hi')
 
-statement error pq: type "ifne" already exists
+statement error pq: type "test_57196.public.ifne" already exists
 CREATE TYPE ifne AS ENUM ('hi')
 
 statement ok
@@ -1299,5 +1309,18 @@ CREATE TYPE IF NOT EXISTS ifne AS ENUM ('hi')
 statement ok
 CREATE TABLE table_ifne (x INT)
 
-statement error pq: relation "table_ifne" already exists
+statement error pq: relation "test_57196.public.table_ifne" already exists
 CREATE TYPE IF NOT EXISTS table_ifne AS ENUM ('hi')
+
+# Regression test for incorrectly serializing NULL expression type annotation in
+# a enum tuple.
+statement ok
+CREATE TYPE greeting58889 AS ENUM ('hello', 'howdy', 'hi', 'good day', 'morning');
+CREATE TABLE t58889 AS SELECT enum_range('hello'::greeting58889)[g] as _enum FROM generate_series(1, 5) as g;
+ALTER TABLE t58889 SPLIT AT SELECT i FROM generate_series(1, 5) as g(i);
+ALTER TABLE t58889 SCATTER;
+
+query T
+SELECT _enum FROM t58889 WHERE _enum::greeting58889 IN (NULL, 'hi':::greeting58889);
+----
+hi

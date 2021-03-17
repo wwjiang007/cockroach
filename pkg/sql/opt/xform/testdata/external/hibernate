@@ -980,24 +980,24 @@ where
 ----
 project
  ├── columns: id1_2_:1!null address2_2_:2 createdo3_2_:3 name4_2_:4 nickname5_2_:5 version6_2_:6!null
- ├── immutable, has-placeholder
+ ├── has-placeholder
  ├── key: (1)
  ├── fd: (1)-->(2-6)
  └── inner-join (lookup person [as=person0_])
       ├── columns: person0_.id:1!null address:2 createdon:3 name:4 nickname:5 version:6!null person_id:11!null
       ├── key columns: [11] = [1]
       ├── lookup columns are key
-      ├── immutable, has-placeholder
+      ├── has-placeholder
       ├── key: (11)
       ├── fd: (1)-->(2-6), (1)==(11), (11)==(1)
       ├── distinct-on
       │    ├── columns: person_id:11
       │    ├── grouping columns: person_id:11
-      │    ├── immutable, has-placeholder
+      │    ├── has-placeholder
       │    ├── key: (11)
       │    └── select
       │         ├── columns: phones1_.id:8!null person_id:11
-      │         ├── immutable, has-placeholder
+      │         ├── has-placeholder
       │         ├── key: (8)
       │         ├── fd: (8)-->(11)
       │         ├── scan phone [as=phones1_]
@@ -1005,7 +1005,7 @@ project
       │         │    ├── key: (8)
       │         │    └── fd: (8)-->(11)
       │         └── filters
-      │              └── phones1_.id:8 = $1::INT8 [outer=(8), immutable, constraints=(/8: (/NULL - ])]
+      │              └── phones1_.id:8 = $1 [outer=(8), constraints=(/8: (/NULL - ])]
       └── filters (true)
 
 opt
@@ -1030,24 +1030,24 @@ where
 ----
 project
  ├── columns: id1_2_:1!null address2_2_:2 createdo3_2_:3 name4_2_:4 nickname5_2_:5 version6_2_:6!null
- ├── immutable, has-placeholder
+ ├── has-placeholder
  ├── key: (1)
  ├── fd: (1)-->(2-6)
  └── inner-join (lookup person [as=person0_])
       ├── columns: person0_.id:1!null address:2 createdon:3 name:4 nickname:5 version:6!null person_id:11!null
       ├── key columns: [11] = [1]
       ├── lookup columns are key
-      ├── immutable, has-placeholder
+      ├── has-placeholder
       ├── key: (11)
       ├── fd: (1)-->(2-6), (1)==(11), (11)==(1)
       ├── distinct-on
       │    ├── columns: person_id:11
       │    ├── grouping columns: person_id:11
-      │    ├── immutable, has-placeholder
+      │    ├── has-placeholder
       │    ├── key: (11)
       │    └── select
       │         ├── columns: phones1_.id:8!null person_id:11
-      │         ├── immutable, has-placeholder
+      │         ├── has-placeholder
       │         ├── key: (8)
       │         ├── fd: (8)-->(11)
       │         ├── scan phone [as=phones1_]
@@ -1055,7 +1055,7 @@ project
       │         │    ├── key: (8)
       │         │    └── fd: (8)-->(11)
       │         └── filters
-      │              └── phones1_.id:8 = $1::INT8 [outer=(8), immutable, constraints=(/8: (/NULL - ])]
+      │              └── phones1_.id:8 = $1 [outer=(8), constraints=(/8: (/NULL - ])]
       └── filters (true)
 
 opt
@@ -1116,7 +1116,7 @@ where
 ----
 anti-join (hash)
  ├── columns: id1_4_:1!null phone_nu2_4_:2 person_i4_4_:4 phone_ty3_4_:3
- ├── stable, has-placeholder
+ ├── immutable, has-placeholder
  ├── key: (1)
  ├── fd: (1)-->(2-4)
  ├── scan phone [as=phone0_]
@@ -1125,11 +1125,11 @@ anti-join (hash)
  │    └── fd: (1)-->(2-4)
  ├── select
  │    ├── columns: phone_id:7!null repairtimestamps:8
- │    ├── stable, has-placeholder
+ │    ├── immutable, has-placeholder
  │    ├── scan phone_repairtimestamps [as=repairtime1_]
  │    │    └── columns: phone_id:7!null repairtimestamps:8
  │    └── filters
- │         └── (repairtimestamps:8 >= $1::DATE) IS NOT false [outer=(8), stable]
+ │         └── (repairtimestamps:8 >= $1) IS NOT false [outer=(8), immutable]
  └── filters
       └── id:1 = phone_id:7 [outer=(1,7), constraints=(/1: (/NULL - ]; /7: (/NULL - ]), fd=(1)==(7), (7)==(1)]
 
@@ -1997,13 +1997,14 @@ project
  │    ├── immutable
  │    ├── key: (7)
  │    ├── fd: ()-->(1-3), (7)-->(1-3,5,6,8,21)
- │    ├── right-join (hash)
- │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null lineitems1_.customerid:5 lineitems1_.ordernumber:6 lineitems1_.productid:7 lineitems1_.quantity:8 li.customerid:10 li.ordernumber:11 column20:20
+ │    ├── project
+ │    │    ├── columns: column20:20 order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null lineitems1_.customerid:5 lineitems1_.ordernumber:6 lineitems1_.productid:7 lineitems1_.quantity:8 li.customerid:10 li.ordernumber:11
  │    │    ├── immutable
  │    │    ├── fd: ()-->(1-3), (7)-->(5,6,8)
- │    │    ├── project
- │    │    │    ├── columns: column20:20 li.customerid:10!null li.ordernumber:11!null
- │    │    │    ├── immutable
+ │    │    ├── right-join (hash)
+ │    │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null lineitems1_.customerid:5 lineitems1_.ordernumber:6 lineitems1_.productid:7 lineitems1_.quantity:8 li.customerid:10 li.ordernumber:11 li.productid:12 li.quantity:13 p.productid:15 cost:17
+ │    │    │    ├── key: (7,10,11,15)
+ │    │    │    ├── fd: ()-->(1-3), (7)-->(5,6,8), (10-12)-->(13), (15)-->(17), (12)==(15), (15)==(12)
  │    │    │    ├── inner-join (hash)
  │    │    │    │    ├── columns: li.customerid:10!null li.ordernumber:11!null li.productid:12!null li.quantity:13 p.productid:15!null cost:17
  │    │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
@@ -2019,29 +2020,29 @@ project
  │    │    │    │    │    └── fd: (15)-->(17)
  │    │    │    │    └── filters
  │    │    │    │         └── li.productid:12 = p.productid:15 [outer=(12,15), constraints=(/12: (/NULL - ]; /15: (/NULL - ]), fd=(12)==(15), (15)==(12)]
- │    │    │    └── projections
- │    │    │         └── li.quantity:13::INT8 * cost:17::DECIMAL [as=column20:20, outer=(13,17), immutable]
- │    │    ├── left-join (merge)
- │    │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null lineitems1_.customerid:5 lineitems1_.ordernumber:6 lineitems1_.productid:7 lineitems1_.quantity:8
- │    │    │    ├── left ordering: +1,+2
- │    │    │    ├── right ordering: +5,+6
- │    │    │    ├── key: (7)
- │    │    │    ├── fd: ()-->(1-3), (7)-->(5,6,8)
- │    │    │    ├── scan customerorder [as=order0_]
- │    │    │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null
- │    │    │    │    ├── constraint: /1/2: [/'c111'/0 - /'c111'/0]
- │    │    │    │    ├── cardinality: [0 - 1]
- │    │    │    │    ├── key: ()
- │    │    │    │    └── fd: ()-->(1-3)
- │    │    │    ├── scan lineitem [as=lineitems1_]
- │    │    │    │    ├── columns: lineitems1_.customerid:5!null lineitems1_.ordernumber:6!null lineitems1_.productid:7!null lineitems1_.quantity:8
- │    │    │    │    ├── constraint: /5/6/7: [/'c111'/0 - /'c111'/0]
+ │    │    │    ├── left-join (merge)
+ │    │    │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null lineitems1_.customerid:5 lineitems1_.ordernumber:6 lineitems1_.productid:7 lineitems1_.quantity:8
+ │    │    │    │    ├── left ordering: +1,+2
+ │    │    │    │    ├── right ordering: +5,+6
  │    │    │    │    ├── key: (7)
- │    │    │    │    └── fd: ()-->(5,6), (7)-->(8)
- │    │    │    └── filters (true)
- │    │    └── filters
- │    │         ├── li.customerid:10 = order0_.customerid:1 [outer=(1,10), constraints=(/1: (/NULL - ]; /10: (/NULL - ]), fd=(1)==(10), (10)==(1)]
- │    │         └── li.ordernumber:11 = order0_.ordernumber:2 [outer=(2,11), constraints=(/2: (/NULL - ]; /11: (/NULL - ]), fd=(2)==(11), (11)==(2)]
+ │    │    │    │    ├── fd: ()-->(1-3), (7)-->(5,6,8)
+ │    │    │    │    ├── scan customerorder [as=order0_]
+ │    │    │    │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null
+ │    │    │    │    │    ├── constraint: /1/2: [/'c111'/0 - /'c111'/0]
+ │    │    │    │    │    ├── cardinality: [0 - 1]
+ │    │    │    │    │    ├── key: ()
+ │    │    │    │    │    └── fd: ()-->(1-3)
+ │    │    │    │    ├── scan lineitem [as=lineitems1_]
+ │    │    │    │    │    ├── columns: lineitems1_.customerid:5!null lineitems1_.ordernumber:6!null lineitems1_.productid:7!null lineitems1_.quantity:8
+ │    │    │    │    │    ├── constraint: /5/6/7: [/'c111'/0 - /'c111'/0]
+ │    │    │    │    │    ├── key: (7)
+ │    │    │    │    │    └── fd: ()-->(5,6), (7)-->(8)
+ │    │    │    │    └── filters (true)
+ │    │    │    └── filters
+ │    │    │         ├── li.customerid:10 = order0_.customerid:1 [outer=(1,10), constraints=(/1: (/NULL - ]; /10: (/NULL - ]), fd=(1)==(10), (10)==(1)]
+ │    │    │         └── li.ordernumber:11 = order0_.ordernumber:2 [outer=(2,11), constraints=(/2: (/NULL - ]; /11: (/NULL - ]), fd=(2)==(11), (11)==(2)]
+ │    │    └── projections
+ │    │         └── CASE li.customerid:10 IS NULL WHEN true THEN CAST(NULL AS DECIMAL) ELSE li.quantity:13::INT8 * cost:17::DECIMAL END [as=column20:20, outer=(10,13,17), immutable]
  │    └── aggregations
  │         ├── sum [as=sum:21, outer=(20)]
  │         │    └── column20:20
@@ -2292,13 +2293,14 @@ project
  │    ├── immutable
  │    ├── key: (7)
  │    ├── fd: ()-->(1-3), (7)-->(1-3,5,6,8,21)
- │    ├── right-join (hash)
- │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null lineitems1_.customerid:5 lineitems1_.ordernumber:6 lineitems1_.productid:7 lineitems1_.quantity:8 li.customerid:10 li.ordernumber:11 column20:20
+ │    ├── project
+ │    │    ├── columns: column20:20 order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null lineitems1_.customerid:5 lineitems1_.ordernumber:6 lineitems1_.productid:7 lineitems1_.quantity:8 li.customerid:10 li.ordernumber:11
  │    │    ├── immutable
  │    │    ├── fd: ()-->(1-3), (7)-->(5,6,8)
- │    │    ├── project
- │    │    │    ├── columns: column20:20 li.customerid:10!null li.ordernumber:11!null
- │    │    │    ├── immutable
+ │    │    ├── right-join (hash)
+ │    │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null lineitems1_.customerid:5 lineitems1_.ordernumber:6 lineitems1_.productid:7 lineitems1_.quantity:8 li.customerid:10 li.ordernumber:11 li.productid:12 li.quantity:13 p.productid:15 cost:17
+ │    │    │    ├── key: (7,10,11,15)
+ │    │    │    ├── fd: ()-->(1-3), (7)-->(5,6,8), (10-12)-->(13), (15)-->(17), (12)==(15), (15)==(12)
  │    │    │    ├── inner-join (hash)
  │    │    │    │    ├── columns: li.customerid:10!null li.ordernumber:11!null li.productid:12!null li.quantity:13 p.productid:15!null cost:17
  │    │    │    │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-more)
@@ -2314,29 +2316,29 @@ project
  │    │    │    │    │    └── fd: (15)-->(17)
  │    │    │    │    └── filters
  │    │    │    │         └── li.productid:12 = p.productid:15 [outer=(12,15), constraints=(/12: (/NULL - ]; /15: (/NULL - ]), fd=(12)==(15), (15)==(12)]
- │    │    │    └── projections
- │    │    │         └── li.quantity:13::INT8 * cost:17::DECIMAL [as=column20:20, outer=(13,17), immutable]
- │    │    ├── left-join (merge)
- │    │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null lineitems1_.customerid:5 lineitems1_.ordernumber:6 lineitems1_.productid:7 lineitems1_.quantity:8
- │    │    │    ├── left ordering: +1,+2
- │    │    │    ├── right ordering: +5,+6
- │    │    │    ├── key: (7)
- │    │    │    ├── fd: ()-->(1-3), (7)-->(5,6,8)
- │    │    │    ├── scan customerorder [as=order0_]
- │    │    │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null
- │    │    │    │    ├── constraint: /1/2: [/'c111'/0 - /'c111'/0]
- │    │    │    │    ├── cardinality: [0 - 1]
- │    │    │    │    ├── key: ()
- │    │    │    │    └── fd: ()-->(1-3)
- │    │    │    ├── scan lineitem [as=lineitems1_]
- │    │    │    │    ├── columns: lineitems1_.customerid:5!null lineitems1_.ordernumber:6!null lineitems1_.productid:7!null lineitems1_.quantity:8
- │    │    │    │    ├── constraint: /5/6/7: [/'c111'/0 - /'c111'/0]
+ │    │    │    ├── left-join (merge)
+ │    │    │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null lineitems1_.customerid:5 lineitems1_.ordernumber:6 lineitems1_.productid:7 lineitems1_.quantity:8
+ │    │    │    │    ├── left ordering: +1,+2
+ │    │    │    │    ├── right ordering: +5,+6
  │    │    │    │    ├── key: (7)
- │    │    │    │    └── fd: ()-->(5,6), (7)-->(8)
- │    │    │    └── filters (true)
- │    │    └── filters
- │    │         ├── li.customerid:10 = order0_.customerid:1 [outer=(1,10), constraints=(/1: (/NULL - ]; /10: (/NULL - ]), fd=(1)==(10), (10)==(1)]
- │    │         └── li.ordernumber:11 = order0_.ordernumber:2 [outer=(2,11), constraints=(/2: (/NULL - ]; /11: (/NULL - ]), fd=(2)==(11), (11)==(2)]
+ │    │    │    │    ├── fd: ()-->(1-3), (7)-->(5,6,8)
+ │    │    │    │    ├── scan customerorder [as=order0_]
+ │    │    │    │    │    ├── columns: order0_.customerid:1!null order0_.ordernumber:2!null orderdate:3!null
+ │    │    │    │    │    ├── constraint: /1/2: [/'c111'/0 - /'c111'/0]
+ │    │    │    │    │    ├── cardinality: [0 - 1]
+ │    │    │    │    │    ├── key: ()
+ │    │    │    │    │    └── fd: ()-->(1-3)
+ │    │    │    │    ├── scan lineitem [as=lineitems1_]
+ │    │    │    │    │    ├── columns: lineitems1_.customerid:5!null lineitems1_.ordernumber:6!null lineitems1_.productid:7!null lineitems1_.quantity:8
+ │    │    │    │    │    ├── constraint: /5/6/7: [/'c111'/0 - /'c111'/0]
+ │    │    │    │    │    ├── key: (7)
+ │    │    │    │    │    └── fd: ()-->(5,6), (7)-->(8)
+ │    │    │    │    └── filters (true)
+ │    │    │    └── filters
+ │    │    │         ├── li.customerid:10 = order0_.customerid:1 [outer=(1,10), constraints=(/1: (/NULL - ]; /10: (/NULL - ]), fd=(1)==(10), (10)==(1)]
+ │    │    │         └── li.ordernumber:11 = order0_.ordernumber:2 [outer=(2,11), constraints=(/2: (/NULL - ]; /11: (/NULL - ]), fd=(2)==(11), (11)==(2)]
+ │    │    └── projections
+ │    │         └── CASE li.customerid:10 IS NULL WHEN true THEN CAST(NULL AS DECIMAL) ELSE li.quantity:13::INT8 * cost:17::DECIMAL END [as=column20:20, outer=(10,13,17), immutable]
  │    └── aggregations
  │         ├── sum [as=sum:21, outer=(20)]
  │         │    └── column20:20

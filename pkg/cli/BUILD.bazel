@@ -1,4 +1,5 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//build:STRINGER.bzl", "stringer")
 
 go_library(
     name = "cli",
@@ -7,6 +8,7 @@ go_library(
         "cert.go",
         "cli.go",
         "client_url.go",
+        "connect.go",
         "context.go",
         "cpuprofile.go",
         "debug.go",
@@ -30,7 +32,6 @@ go_library(
         "import.go",
         "init.go",
         "initial_sql.go",
-        "keytype_string.go",
         "log_flags.go",
         "mt.go",
         "mt_cert.go",
@@ -51,6 +52,11 @@ go_library(
         "tsdump.go",
         "userfile.go",
         "zip.go",
+        "zip_cluster_wide.go",
+        "zip_cmd.go",
+        "zip_helpers.go",
+        "zip_per_node.go",
+        ":gen-keytype-stringer",  # keep
     ],
     # keep
     cdeps = [
@@ -103,20 +109,22 @@ go_library(
         "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/security",
+        "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/server/debug",
         "//pkg/server/dumpstore",
         "//pkg/server/heapprofiler",
         "//pkg/server/serverpb",
         "//pkg/server/status",
-        "//pkg/server/status/statuspb",
+        "//pkg/server/status/statuspb:statuspb_go_proto",
         "//pkg/server/telemetry",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql",
+        "//pkg/sql/catalog",
+        "//pkg/sql/catalog/catalogkv",
         "//pkg/sql/catalog/catconstants",
         "//pkg/sql/catalog/descpb",
-        "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/doctor",
         "//pkg/sql/execinfrapb",
         "//pkg/sql/lex",
@@ -134,6 +142,7 @@ go_library(
         "//pkg/storage/cloud",
         "//pkg/storage/cloudimpl",
         "//pkg/storage/enginepb",
+        "//pkg/testutils/serverutils",
         "//pkg/ts/tspb",
         "//pkg/util",
         "//pkg/util/cgroups",
@@ -183,6 +192,7 @@ go_library(
         "@com_github_cockroachdb_cockroach_go//crdb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_errors//oserror",
+        "@com_github_cockroachdb_logtags//:logtags",
         "@com_github_cockroachdb_pebble//:pebble",
         "@com_github_cockroachdb_pebble//tool",
         "@com_github_cockroachdb_redact//:redact",
@@ -200,7 +210,7 @@ go_library(
         "@com_github_spf13_pflag//:pflag",
         "@in_gopkg_yaml_v2//:yaml_v2",
         "@io_etcd_go_etcd_raft_v3//raftpb",
-        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//:go_default_library",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//status",
         "@org_golang_x_sync//errgroup",
@@ -254,6 +264,7 @@ go_library(
 
 go_test(
     name = "cli_test",
+    size = "large",
     srcs = [
         "cli_debug_test.go",
         "cli_test.go",
@@ -300,7 +311,7 @@ go_test(
         "//pkg/server",
         "//pkg/server/serverpb",
         "//pkg/server/status",
-        "//pkg/server/status/statuspb",
+        "//pkg/server/status/statuspb:statuspb_go_proto",
         "//pkg/sql",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/lex",
@@ -335,4 +346,10 @@ go_test(
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],
+)
+
+stringer(
+    name = "gen-keytype-stringer",
+    src = "flags_util.go",
+    typ = "keyType",
 )

@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "safe_format.go",
         "type_desc.go",
+        "type_desc_builder.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc",
     visibility = ["//visibility:public"],
@@ -29,12 +30,14 @@ go_library(
 
 go_test(
     name = "typedesc_test",
+    size = "small",
     srcs = [
         "main_test.go",
         "safe_format_test.go",
         "type_desc_test.go",
     ],
     deps = [
+        ":typedesc",
         "//pkg/keys",
         "//pkg/security",
         "//pkg/security/securitytest",
@@ -43,7 +46,6 @@ go_test(
         "//pkg/sql/catalog/dbdesc",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/schemadesc",
-        "//pkg/sql/catalog/typedesc",
         "//pkg/sql/privilege",
         "//pkg/sql/types",
         "//pkg/testutils",

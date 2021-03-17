@@ -13,9 +13,15 @@ go_library(
 
 go_test(
     name = "hash_test",
+    size = "small",
     srcs = ["hash_test.go"],
+    data = glob(["testdata/**"]) + [
+        "@go_sdk//:files",
+    ],
     deps = [
-        "//pkg/testutils/lint/passes/hash",
+        ":hash",
+        "//pkg/build/bazel",
+        "//pkg/testutils",
         "//pkg/testutils/skip",
         "@org_golang_x_tools//go/analysis/analysistest",
     ],

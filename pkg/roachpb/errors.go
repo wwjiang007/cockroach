@@ -316,6 +316,7 @@ const (
 	MergeInProgressErrType                  ErrorDetailType = 37
 	RangeFeedRetryErrType                   ErrorDetailType = 38
 	IndeterminateCommitErrType              ErrorDetailType = 39
+	InvalidLeaseErrType                     ErrorDetailType = 40
 	// When adding new error types, don't forget to update NumErrors below.
 
 	// CommunicationErrType indicates a gRPC error; this is not an ErrorDetail.
@@ -325,7 +326,7 @@ const (
 	// detail. The value 25 is chosen because it's reserved in the errors proto.
 	InternalErrType ErrorDetailType = 25
 
-	NumErrors int = 40
+	NumErrors int = 41
 )
 
 // GoError returns a Go error converted from Error. If the error is a transaction
@@ -912,15 +913,15 @@ var _ transactionRestartError = &WriteTooOldError{}
 // The read and existing timestamps as well as the txn are purely informational
 // and used for formatting the error message.
 func NewReadWithinUncertaintyIntervalError(
-	readTS, existingTS hlc.Timestamp, txn *Transaction,
+	readTS, existingTS, localUncertaintyLimit hlc.Timestamp, txn *Transaction,
 ) *ReadWithinUncertaintyIntervalError {
 	rwue := &ReadWithinUncertaintyIntervalError{
-		ReadTimestamp:     readTS,
-		ExistingTimestamp: existingTS,
+		ReadTimestamp:         readTS,
+		ExistingTimestamp:     existingTS,
+		LocalUncertaintyLimit: localUncertaintyLimit,
 	}
 	if txn != nil {
-		maxTS := txn.MaxTimestamp
-		rwue.MaxTimestamp = &maxTS
+		rwue.GlobalUncertaintyLimit = txn.GlobalUncertaintyLimit
 		rwue.ObservedTimestamps = txn.ObservedTimestamps
 	}
 	return rwue
@@ -929,9 +930,10 @@ func NewReadWithinUncertaintyIntervalError(
 // SafeFormat implements redact.SafeFormatter.
 func (e *ReadWithinUncertaintyIntervalError) SafeFormat(s redact.SafePrinter, _ rune) {
 	s.Printf("ReadWithinUncertaintyIntervalError: read at time %s encountered "+
-		"previous write with future timestamp %s within uncertainty interval `t <= %v`; "+
+		"previous write with future timestamp %s within uncertainty interval `t <= "+
+		"(local=%v, global=%v)`; "+
 		"observed timestamps: ",
-		e.ReadTimestamp, e.ExistingTimestamp, e.MaxTimestamp)
+		e.ReadTimestamp, e.ExistingTimestamp, e.LocalUncertaintyLimit, e.GlobalUncertaintyLimit)
 
 	s.SafeRune('[')
 	for i, ot := range observedTimestampSlice(e.ObservedTimestamps) {
@@ -1238,3 +1240,18 @@ func (e *IndeterminateCommitError) Type() ErrorDetailType {
 }
 
 var _ ErrorDetailInterface = &IndeterminateCommitError{}
+
+func (e *InvalidLeaseError) Error() string {
+	return e.message(nil)
+}
+
+func (e *InvalidLeaseError) message(_ *Error) string {
+	return "invalid lease"
+}
+
+// Type is part of the ErrorDetailInterface.
+func (e *InvalidLeaseError) Type() ErrorDetailType {
+	return InvalidLeaseErrType
+}
+
+var _ ErrorDetailInterface = &InvalidLeaseError{}

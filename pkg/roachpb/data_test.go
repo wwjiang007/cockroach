@@ -40,6 +40,13 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
+func makeClockTS(walltime int64, logical int32) hlc.ClockTimestamp {
+	return hlc.ClockTimestamp{
+		WallTime: walltime,
+		Logical:  logical,
+	}
+}
+
 func makeTS(walltime int64, logical int32) hlc.Timestamp {
 	return hlc.Timestamp{
 		WallTime: walltime,
@@ -47,8 +54,12 @@ func makeTS(walltime int64, logical int32) hlc.Timestamp {
 	}
 }
 
-func makeTSWithFlag(walltime int64, logical int32) hlc.Timestamp {
-	return makeTS(walltime, logical).SetFlag(hlc.TimestampFlag_SYNTHETIC)
+func makeSynTS(walltime int64, logical int32) hlc.Timestamp {
+	return hlc.Timestamp{
+		WallTime:  walltime,
+		Logical:   logical,
+		Synthetic: true,
+	}
 }
 
 // TestKeyNext tests that the method for creating lexicographic
@@ -408,9 +419,9 @@ func TestTransactionObservedTimestamp(t *testing.T) {
 	rng, seed := randutil.NewPseudoRand()
 	t.Logf("running with seed %d", seed)
 	ids := append([]int{109, 104, 102, 108, 1000}, rand.Perm(100)...)
-	timestamps := make(map[NodeID]hlc.Timestamp, len(ids))
+	timestamps := make(map[NodeID]hlc.ClockTimestamp, len(ids))
 	for i := 0; i < len(ids); i++ {
-		timestamps[NodeID(i)] = hlc.Timestamp{WallTime: rng.Int63()}
+		timestamps[NodeID(i)] = hlc.ClockTimestamp{WallTime: rng.Int63()}
 	}
 	for i, n := range ids {
 		nodeID := NodeID(n)
@@ -418,7 +429,7 @@ func TestTransactionObservedTimestamp(t *testing.T) {
 			t.Fatalf("%d: false positive hit %s in %v", nodeID, ts, ids[:i+1])
 		}
 		txn.UpdateObservedTimestamp(nodeID, timestamps[nodeID])
-		txn.UpdateObservedTimestamp(nodeID, hlc.MaxTimestamp) // should be noop
+		txn.UpdateObservedTimestamp(nodeID, hlc.MaxClockTimestamp) // should be noop
 		if exp, act := i+1, len(txn.ObservedTimestamps); act != exp {
 			t.Fatalf("%d: expected %d entries, got %d: %v", nodeID, exp, act, txn.ObservedTimestamps)
 		}
@@ -432,7 +443,7 @@ func TestTransactionObservedTimestamp(t *testing.T) {
 	}
 
 	var emptyTxn Transaction
-	ts := hlc.Timestamp{WallTime: 1, Logical: 2}
+	ts := hlc.ClockTimestamp{WallTime: 1, Logical: 2}
 	emptyTxn.UpdateObservedTimestamp(NodeID(1), ts)
 	if actTS, _ := emptyTxn.GetObservedTimestamp(NodeID(1)); actTS != ts {
 		t.Fatalf("unexpected: %s (wanted %s)", actTS, ts)
@@ -445,12 +456,12 @@ func TestFastPathObservedTimestamp(t *testing.T) {
 	if _, ok := txn.GetObservedTimestamp(nodeID); ok {
 		t.Errorf("fetched observed timestamp where none should exist")
 	}
-	expTS := hlc.Timestamp{WallTime: 10}
+	expTS := hlc.ClockTimestamp{WallTime: 10}
 	txn.UpdateObservedTimestamp(nodeID, expTS)
 	if ts, ok := txn.GetObservedTimestamp(nodeID); !ok || !ts.Equal(expTS) {
 		t.Errorf("expected %s; got %s", expTS, ts)
 	}
-	expTS = hlc.Timestamp{WallTime: 9}
+	expTS = hlc.ClockTimestamp{WallTime: 9}
 	txn.UpdateObservedTimestamp(nodeID, expTS)
 	if ts, ok := txn.GetObservedTimestamp(nodeID); !ok || !ts.Equal(expTS) {
 		t.Errorf("expected %s; got %s", expTS, ts)
@@ -462,17 +473,24 @@ var nonZeroTxn = Transaction{
 		Key:            Key("foo"),
 		ID:             uuid.MakeV4(),
 		Epoch:          2,
-		WriteTimestamp: makeTSWithFlag(20, 21),
-		MinTimestamp:   makeTSWithFlag(10, 11),
+		WriteTimestamp: makeSynTS(20, 21),
+		MinTimestamp:   makeSynTS(10, 11),
 		Priority:       957356782,
 		Sequence:       123,
 	},
-	Name:                 "name",
-	Status:               COMMITTED,
-	LastHeartbeat:        makeTSWithFlag(1, 2),
-	ReadTimestamp:        makeTSWithFlag(20, 22),
-	MaxTimestamp:         makeTSWithFlag(40, 41),
-	ObservedTimestamps:   []ObservedTimestamp{{NodeID: 1, Timestamp: makeTSWithFlag(1, 2)}},
+	Name:                   "name",
+	Status:                 COMMITTED,
+	LastHeartbeat:          makeSynTS(1, 2),
+	ReadTimestamp:          makeSynTS(20, 22),
+	GlobalUncertaintyLimit: makeSynTS(40, 41),
+	ObservedTimestamps: []ObservedTimestamp{{
+		NodeID: 1,
+		Timestamp: hlc.ClockTimestamp{
+			WallTime:  1,
+			Logical:   2,
+			Synthetic: true, // normally not set, but needed for zerofields.NoZeroField
+		},
+	}},
 	WriteTooOld:          true,
 	LockSpans:            []Span{{Key: []byte("a"), EndKey: []byte("b")}},
 	InFlightWrites:       []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
@@ -920,23 +938,23 @@ func TestMakePriorityLimits(t *testing.T) {
 func TestLeaseEquivalence(t *testing.T) {
 	r1 := ReplicaDescriptor{NodeID: 1, StoreID: 1, ReplicaID: 1}
 	r2 := ReplicaDescriptor{NodeID: 2, StoreID: 2, ReplicaID: 2}
-	ts1 := makeTS(1, 1)
-	ts2 := makeTS(2, 1)
-	ts3 := makeTS(3, 1)
+	ts1 := makeClockTS(1, 1)
+	ts2 := makeClockTS(2, 1)
+	ts3 := makeClockTS(3, 1)
 
 	epoch1 := Lease{Replica: r1, Start: ts1, Epoch: 1}
 	epoch2 := Lease{Replica: r1, Start: ts1, Epoch: 2}
-	expire1 := Lease{Replica: r1, Start: ts1, Expiration: ts2.Clone()}
-	expire2 := Lease{Replica: r1, Start: ts1, Expiration: ts3.Clone()}
+	expire1 := Lease{Replica: r1, Start: ts1, Expiration: ts2.ToTimestamp().Clone()}
+	expire2 := Lease{Replica: r1, Start: ts1, Expiration: ts3.ToTimestamp().Clone()}
 	epoch2TS2 := Lease{Replica: r2, Start: ts2, Epoch: 2}
-	expire2TS2 := Lease{Replica: r2, Start: ts2, Expiration: ts3.Clone()}
+	expire2TS2 := Lease{Replica: r2, Start: ts2, Expiration: ts3.ToTimestamp().Clone()}
 
-	proposed1 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: ts1.Clone()}
-	proposed2 := Lease{Replica: r1, Start: ts1, Epoch: 2, ProposedTS: ts1.Clone()}
-	proposed3 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: ts2.Clone()}
+	proposed1 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: &ts1}
+	proposed2 := Lease{Replica: r1, Start: ts1, Epoch: 2, ProposedTS: &ts1}
+	proposed3 := Lease{Replica: r1, Start: ts1, Epoch: 1, ProposedTS: &ts2}
 
-	stasis1 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts1.Clone()}
-	stasis2 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts2.Clone()}
+	stasis1 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts1.ToTimestamp().Clone()}
+	stasis2 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts2.ToTimestamp().Clone()}
 
 	r1Voter, r1Learner := r1, r1
 	r1Voter.Type = ReplicaTypeVoterFull()
@@ -976,7 +994,7 @@ func TestLeaseEquivalence(t *testing.T) {
 	// field. It introduced a bug whose regression is caught below where a zero Expiration and a nil
 	// Expiration in an epoch-based lease led to mistakenly considering leases non-equivalent.
 	prePRLease := Lease{
-		Start: hlc.Timestamp{WallTime: 10},
+		Start: hlc.ClockTimestamp{WallTime: 10},
 		Epoch: 123,
 
 		// The bug-trigger.
@@ -984,7 +1002,7 @@ func TestLeaseEquivalence(t *testing.T) {
 
 		// Similar potential bug triggers, but these were actually handled correctly.
 		DeprecatedStartStasis: new(hlc.Timestamp),
-		ProposedTS:            &hlc.Timestamp{WallTime: 10},
+		ProposedTS:            &hlc.ClockTimestamp{WallTime: 10},
 	}
 	postPRLease := prePRLease
 	postPRLease.DeprecatedStartStasis = nil
@@ -997,11 +1015,11 @@ func TestLeaseEquivalence(t *testing.T) {
 
 func TestLeaseEqual(t *testing.T) {
 	type expectedLease struct {
-		Start                 hlc.Timestamp
+		Start                 hlc.ClockTimestamp
 		Expiration            *hlc.Timestamp
 		Replica               ReplicaDescriptor
 		DeprecatedStartStasis *hlc.Timestamp
-		ProposedTS            *hlc.Timestamp
+		ProposedTS            *hlc.ClockTimestamp
 		Epoch                 int64
 		Sequence              LeaseSequence
 	}
@@ -1040,13 +1058,14 @@ func TestLeaseEqual(t *testing.T) {
 		t.Fatalf("expectedly compared equal")
 	}
 
-	ts := hlc.Timestamp{Logical: 1}
+	clockTS := hlc.ClockTimestamp{Logical: 1}
+	ts := clockTS.ToTimestamp()
 	testCases := []Lease{
-		{Start: ts},
+		{Start: clockTS},
 		{Expiration: &ts},
 		{Replica: ReplicaDescriptor{NodeID: 1}},
 		{DeprecatedStartStasis: &ts},
-		{ProposedTS: &ts},
+		{ProposedTS: &clockTS},
 		{Epoch: 1},
 		{Sequence: 1},
 	}
@@ -1616,7 +1635,7 @@ func TestUpdateObservedTimestamps(t *testing.T) {
 	f := func(nodeID NodeID, walltime int64) ObservedTimestamp {
 		return ObservedTimestamp{
 			NodeID: nodeID,
-			Timestamp: hlc.Timestamp{
+			Timestamp: hlc.ClockTimestamp{
 				WallTime: walltime,
 			},
 		}
@@ -1678,7 +1697,7 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 
 	vi := VOTER_INCOMING
 	vo := VOTER_OUTGOING
-	vd := VOTER_DEMOTING
+	vd := VOTER_DEMOTING_LEARNER
 	l := LEARNER
 	repl1 := ReplicaDescriptor{NodeID: 1, StoreID: 2, ReplicaID: 3, Type: &vi}
 	repl2 := ReplicaDescriptor{NodeID: 4, StoreID: 5, ReplicaID: 6, Type: &vo}
@@ -1703,15 +1722,15 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 	}
 	act := crt.String()
 	exp := "ENTER_JOINT(r6 r12 l12 v3) [(n1,s2):3VOTER_INCOMING], " +
-		"[(n4,s5):6VOTER_OUTGOING (n10,s11):12VOTER_DEMOTING]: " +
+		"[(n4,s5):6VOTER_OUTGOING (n10,s11):12VOTER_DEMOTING_LEARNER]: " +
 		"after=[(n1,s2):3VOTER_INCOMING (n4,s5):6VOTER_OUTGOING (n7,s8):9LEARNER " +
-		"(n10,s11):12VOTER_DEMOTING] next=10"
+		"(n10,s11):12VOTER_DEMOTING_LEARNER] next=10"
 	require.Equal(t, exp, act)
 
 	crt.InternalRemovedReplicas = nil
 	crt.InternalAddedReplicas = nil
 	repl1.Type = ReplicaTypeVoterFull()
-	crt.Desc.SetReplicas(MakeReplicaDescriptors([]ReplicaDescriptor{repl1, learner}))
+	crt.Desc.SetReplicas(MakeReplicaSet([]ReplicaDescriptor{repl1, learner}))
 	act = crt.String()
 	require.Empty(t, crt.Added())
 	require.Empty(t, crt.Removed())
@@ -1760,7 +1779,7 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 		m.ChangeReplicasTrigger.InternalAddedReplicas = in.add
 		m.ChangeReplicasTrigger.InternalRemovedReplicas = in.del
 		m.Desc = &RangeDescriptor{}
-		m.Desc.SetReplicas(MakeReplicaDescriptors(in.repls))
+		m.Desc.SetReplicas(MakeReplicaSet(in.repls))
 		return m
 	}
 
@@ -1874,14 +1893,14 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			),
 			del: sl(
 				// Voter removals.
-				LEARNER, 2, VOTER_OUTGOING, 8, VOTER_DEMOTING, 9,
+				LEARNER, 2, VOTER_OUTGOING, 8, VOTER_DEMOTING_LEARNER, 9,
 			),
 			repls: sl(
 				// Replicas.
 				VOTER_FULL, 1,
 				VOTER_INCOMING, 6, // added
 				VOTER_INCOMING, 3, // added
-				VOTER_DEMOTING, 9, // removing
+				VOTER_DEMOTING_LEARNER, 9, // removing
 				LEARNER, 4, // added
 				VOTER_OUTGOING, 8, // removing
 				VOTER_FULL, 10,

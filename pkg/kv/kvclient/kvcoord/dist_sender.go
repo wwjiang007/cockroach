@@ -20,7 +20,6 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -129,7 +128,11 @@ var (
 // followerreadsccl code to inject logic to check if follower reads are enabled.
 // By default, without CCL code, this function returns false.
 var CanSendToFollower = func(
-	clusterID uuid.UUID, st *cluster.Settings, ba roachpb.BatchRequest,
+	_ uuid.UUID,
+	_ *cluster.Settings,
+	_ *hlc.Clock,
+	_ roachpb.RangeClosedTimestampPolicy,
+	_ roachpb.BatchRequest,
 ) bool {
 	return false
 }
@@ -153,7 +156,7 @@ var rangeDescriptorCacheSize = settings.RegisterIntSetting(
 var senderConcurrencyLimit = settings.RegisterIntSetting(
 	"kv.dist_sender.concurrency_limit",
 	"maximum number of asynchronous send requests",
-	max(defaultSenderConcurrency, int64(64*runtime.NumCPU())),
+	max(defaultSenderConcurrency, int64(64*runtime.GOMAXPROCS(0))),
 	settings.NonNegativeInt,
 )
 
@@ -601,7 +604,7 @@ func (ds *DistSender) initAndVerifyBatch(
 			inner := req.GetInner()
 			switch inner.(type) {
 			case *roachpb.ScanRequest, *roachpb.ResolveIntentRangeRequest,
-				*roachpb.DeleteRangeRequest, *roachpb.RevertRangeRequest:
+				*roachpb.DeleteRangeRequest, *roachpb.RevertRangeRequest, *roachpb.ExportRequest:
 				// Accepted forward range requests.
 				if isReverse {
 					return roachpb.NewErrorf("batch with limit contains both forward and reverse scans")
@@ -717,7 +720,6 @@ func unsetCanForwardReadTimestampFlag(ctx context.Context, ba *roachpb.BatchRequ
 func (ds *DistSender) Send(
 	ctx context.Context, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
-	tracing.AnnotateTrace()
 	ds.incrementBatchCounters(&ba)
 
 	// TODO(nvanbenschoten): This causes ba to escape to the heap. Either
@@ -1555,17 +1557,6 @@ func (ds *DistSender) sendPartialBatch(
 
 		// If sending succeeded, return immediately.
 		if reply.Error == nil {
-			// 20.1 nodes return RangeInfos in individual responses. Let's move it to
-			// the br.
-			if ba.ReturnRangeInfo &&
-				len(reply.RangeInfos) == 0 &&
-				!ds.st.Version.IsActive(ctx, clusterversion.ClientRangeInfosOnBatchResponse) {
-				// All the responses have the same RangeInfos in them, so just look at the
-				// first one.
-				firstRes := reply.Responses[0].GetInner()
-				reply.RangeInfos = append(reply.RangeInfos, firstRes.Header().DeprecatedRangeInfos...)
-			}
-
 			return response{reply: reply, positions: positions}
 		}
 
@@ -1784,7 +1775,14 @@ func (ds *DistSender) sendToReplicas(
 	desc := routing.Desc()
 	ba.RangeID = desc.RangeID
 	leaseholder := routing.Leaseholder()
-	replicas, err := NewReplicaSlice(ctx, ds.nodeDescs, desc, leaseholder)
+	canFollowerRead := CanSendToFollower(ds.clusterID.Get(), ds.st, ds.clock, routing.ClosedTimestampPolicy(), ba)
+	var replicas ReplicaSlice
+	var err error
+	if canFollowerRead {
+		replicas, err = NewReplicaSlice(ctx, ds.nodeDescs, desc, leaseholder, AllExtantReplicas)
+	} else {
+		replicas, err = NewReplicaSlice(ctx, ds.nodeDescs, desc, leaseholder, OnlyPotentialLeaseholders)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1796,18 +1794,15 @@ func (ds *DistSender) sendToReplicas(
 	}
 
 	// Try the leaseholder first, if the request wants it.
-	{
-		canFollowerRead := (ds.clusterID != nil) && CanSendToFollower(ds.clusterID.Get(), ds.st, ba)
-		sendToLeaseholder := (leaseholder != nil) && !canFollowerRead && ba.RequiresLeaseHolder()
-		if sendToLeaseholder {
-			idx := replicas.Find(leaseholder.ReplicaID)
-			if idx != -1 {
-				replicas.MoveToFront(idx)
-			} else {
-				// The leaseholder node's info must have been missing from gossip when
-				// we created replicas.
-				log.Eventf(ctx, "leaseholder %s missing from replicas", leaseholder)
-			}
+	sendToLeaseholder := (leaseholder != nil) && !canFollowerRead && ba.RequiresLeaseHolder()
+	if sendToLeaseholder {
+		idx := replicas.Find(leaseholder.ReplicaID)
+		if idx != -1 {
+			replicas.MoveToFront(idx)
+		} else {
+			// The leaseholder node's info must have been missing from gossip when
+			// we created replicas.
+			log.Eventf(ctx, "leaseholder %s missing from replicas", leaseholder)
 		}
 	}
 
@@ -1823,6 +1818,9 @@ func (ds *DistSender) sendToReplicas(
 
 	// inTransferRetry is used to slow down retries in cases where an ongoing
 	// lease transfer is suspected.
+	// TODO(andrei): now that requests wait on lease transfers to complete on
+	// outgoing leaseholders instead of immediately redirecting, we should
+	// rethink this backoff policy.
 	inTransferRetry := retry.StartWithCtx(ctx, ds.rpcRetryOptions)
 	inTransferRetry.Next() // The first call to Next does not block.
 	var sameReplicaRetries int
@@ -1869,25 +1867,29 @@ func (ds *DistSender) sendToReplicas(
 			}
 		}
 		prevReplica = curReplica
-		// Communicate to the server the information our cache has about the range.
-		// If it's stale, the serve will return an update.
-		ba.ClientRangeInfo = &roachpb.ClientRangeInfo{
-			// Note that DescriptorGeneration will be 0 if the cached descriptor is
-			// "speculative" (see DescSpeculative()). Even if the speculation is
-			// correct, we want the serve to return an update, at which point the
-			// cached entry will no longer be "speculative".
+		// Communicate to the server the information our cache has about the
+		// range. If it's stale, the serve will return an update.
+		ba.ClientRangeInfo = roachpb.ClientRangeInfo{
+			// Note that DescriptorGeneration will be 0 if the cached descriptor
+			// is "speculative" (see DescSpeculative()). Even if the speculation
+			// is correct, we want the serve to return an update, at which point
+			// the cached entry will no longer be "speculative".
 			DescriptorGeneration: routing.Desc().Generation,
-			// The LeaseSequence will be 0 if the cache doen't have lease info, or has
-			// a speculative lease. Like above, this asks the server to return an
-			// update.
+			// The LeaseSequence will be 0 if the cache doen't have lease info,
+			// or has a speculative lease. Like above, this asks the server to
+			// return an update.
 			LeaseSequence: routing.LeaseSeq(),
+			// The ClosedTimestampPolicy will be the default if the cache
+			// doesn't have info. Like above, this asks the server to return an
+			// update.
+			ClosedTimestampPolicy: routing.ClosedTimestampPolicy(),
 		}
 		br, err = transport.SendNext(ctx, ba)
 		ds.maybeIncrementErrCounters(br, err)
 
 		if err != nil {
-			if grpcutil.IsAuthenticationError(err) {
-				// Authentication error. Propagate.
+			if grpcutil.IsAuthError(err) {
+				// Authentication or authorization error. Propagate.
 				if ambiguousError != nil {
 					return nil, roachpb.NewAmbiguousResultErrorf("error=%s [propagate]", ambiguousError)
 				}
@@ -1974,12 +1976,12 @@ func (ds *DistSender) sendToReplicas(
 
 			if br.Error == nil {
 				// If the server gave us updated range info, lets update our cache with it.
-				//
-				// TODO(andreimatei): shouldn't we do this unconditionally? Our cache knows how
-				// to disregard stale information.
 				if len(br.RangeInfos) > 0 {
 					log.VEventf(ctx, 2, "received updated range info: %s", br.RangeInfos)
 					routing.EvictAndReplace(ctx, br.RangeInfos...)
+					// The field is cleared by the DistSender because it refers
+					// routing information not exposed by the KV API.
+					br.RangeInfos = nil
 				}
 				return br, nil
 			}
@@ -2008,13 +2010,13 @@ func (ds *DistSender) sendToReplicas(
 					// happen when the next RPC comes back, but we don't want to wait out
 					// the additional RPC latency.
 
-					var ok bool
+					var updatedLeaseholder bool
 					if tErr.Lease != nil {
-						ok = routing.UpdateLease(ctx, tErr.Lease)
+						updatedLeaseholder = routing.UpdateLease(ctx, tErr.Lease)
 					} else if tErr.LeaseHolder != nil {
 						// tErr.LeaseHolder might be set when tErr.Lease isn't.
 						routing.UpdateLeaseholder(ctx, *tErr.LeaseHolder)
-						ok = true
+						updatedLeaseholder = true
 					}
 					// Move the new leaseholder to the head of the queue for the next
 					// retry. Note that the leaseholder might not be the one indicated by
@@ -2031,15 +2033,24 @@ func (ds *DistSender) sendToReplicas(
 							transport.MoveToFront(*lh)
 						}
 					}
-					// See if we want to backoff a little before the next attempt. If the lease info
-					// we got is stale, we backoff because it might be the case that there's a
-					// lease transfer in progress and the would-be leaseholder has not yet
-					// applied the new lease.
-					if ok {
-						inTransferRetry.Reset() // The following Next() call will not block.
-					} else {
+					// Check whether the request was intentionally sent to a follower
+					// replica to perform a follower read. In such cases, the follower
+					// may reject the request with a NotLeaseHolderError if it does not
+					// have a sufficient closed timestamp. In response, we should
+					// immediately redirect to the leaseholder, without a backoff
+					// period.
+					intentionallySentToFollower := first && !sendToLeaseholder
+					// See if we want to backoff a little before the next attempt. If
+					// the lease info we got is stale and we were intending to send to
+					// the leaseholder, we backoff because it might be the case that
+					// there's a lease transfer in progress and the would-be leaseholder
+					// has not yet applied the new lease.
+					shouldBackoff := !updatedLeaseholder && !intentionallySentToFollower
+					if shouldBackoff {
 						ds.metrics.InLeaseTransferBackoffs.Inc(1)
 						log.VErrEventf(ctx, 2, "backing off due to NotLeaseHolderErr with stale info")
+					} else {
+						inTransferRetry.Reset() // The following Next() call will not block.
 					}
 					inTransferRetry.Next()
 				}

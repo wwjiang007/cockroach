@@ -57,7 +57,7 @@ type Config struct {
 	// been seen.
 	NeedsInitialScan bool
 
-	// InitialHighWater is the timestamp from which new events are guaranteed to
+	// InitialHighWater is the timestamp after which new events are guaranteed to
 	// be produced.
 	InitialHighWater hlc.Timestamp
 }
@@ -67,13 +67,17 @@ type Config struct {
 func Run(ctx context.Context, cfg Config) error {
 	g := ctxgroup.WithContext(ctx)
 	var sf schemaFeed
-	{
+
+	if cfg.SchemaChangePolicy == changefeedbase.OptSchemaChangePolicyIgnore {
+		sf = &doNothingSchemaFeed{}
+	} else {
 		rawSF := schemafeed.New(makeTablefeedConfig(cfg))
 		// Start polling the schemafeed, which must be done concurrently with
 		// the individual rangefeed routines.
 		g.GoCtx(rawSF.Run)
 		sf = rawSF
 	}
+
 	var sc kvScanner
 	{
 		sc = &scanRequestScanner{
@@ -126,6 +130,24 @@ func (e schemaChangeDetectedError) Error() string {
 type schemaFeed interface {
 	Peek(ctx context.Context, atOrBefore hlc.Timestamp) (events []schemafeed.TableEvent, err error)
 	Pop(ctx context.Context, atOrBefore hlc.Timestamp) (events []schemafeed.TableEvent, err error)
+}
+
+type doNothingSchemaFeed struct{}
+
+var _ schemaFeed = &doNothingSchemaFeed{}
+
+// Peek implements schemaFeed
+func (f *doNothingSchemaFeed) Peek(
+	ctx context.Context, atOrBefore hlc.Timestamp,
+) (events []schemafeed.TableEvent, err error) {
+	return nil, nil
+}
+
+// Pop implements schemaFeed
+func (f *doNothingSchemaFeed) Pop(
+	ctx context.Context, atOrBefore hlc.Timestamp,
+) (events []schemafeed.TableEvent, err error) {
+	return nil, nil
 }
 
 type kvFeed struct {
@@ -189,20 +211,38 @@ func (f *kvFeed) run(ctx context.Context) (err error) {
 			return err
 		}
 
+		boundaryType := jobspb.ResolvedSpan_BACKFILL
+		if f.schemaChangePolicy == changefeedbase.OptSchemaChangePolicyStop {
+			boundaryType = jobspb.ResolvedSpan_EXIT
+		} else if events, err := f.tableFeed.Peek(ctx, highWater.Next()); err == nil && isPrimaryKeyChange(events) {
+			boundaryType = jobspb.ResolvedSpan_RESTART
+		} else if err != nil {
+			return err
+		}
 		// Resolve all of the spans as a boundary if the policy indicates that
 		// we should do so.
-		if f.schemaChangePolicy != changefeedbase.OptSchemaChangePolicyNoBackfill {
+		if f.schemaChangePolicy != changefeedbase.OptSchemaChangePolicyNoBackfill ||
+			boundaryType == jobspb.ResolvedSpan_RESTART {
 			for _, span := range f.spans {
-				if err := f.sink.AddResolved(ctx, span, highWater, true); err != nil {
+				if err := f.sink.AddResolved(ctx, span, highWater, boundaryType); err != nil {
 					return err
 				}
 			}
 		}
 		// Exit if the policy says we should.
-		if f.schemaChangePolicy == changefeedbase.OptSchemaChangePolicyStop {
+		if boundaryType == jobspb.ResolvedSpan_RESTART || boundaryType == jobspb.ResolvedSpan_EXIT {
 			return schemaChangeDetectedError{highWater.Next()}
 		}
 	}
+}
+
+func isPrimaryKeyChange(events []schemafeed.TableEvent) bool {
+	for _, ev := range events {
+		if schemafeed.IsPrimaryIndexChange(ev) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *kvFeed) scanIfShould(
@@ -226,14 +266,25 @@ func (f *kvFeed) scanIfShould(
 		// Only backfill for the tables which have events which may not be all
 		// of the targets.
 		for _, ev := range events {
-			tablePrefix := f.codec.TablePrefix(uint32(ev.After.ID))
+			// If the event corresponds to a primary index change, it does not
+			// indicate a need for a backfill. Furthermore, if the changefeed was
+			// started at this timestamp because of a restart due to a primary index
+			// change, then a backfill should not be performed for that table.
+			// Below the code detects whether the set of spans to backfill is empty
+			// and returns early. This is important because a change to a primary
+			// index may occur in the same transaction as a change requiring a
+			// backfill.
+			if schemafeed.IsPrimaryIndexChange(ev) {
+				continue
+			}
+			tablePrefix := f.codec.TablePrefix(uint32(ev.After.GetID()))
 			tableSpan := roachpb.Span{Key: tablePrefix, EndKey: tablePrefix.PrefixEnd()}
 			for _, sp := range f.spans {
 				if tableSpan.Overlaps(sp) {
 					spansToBackfill = append(spansToBackfill, sp)
 				}
 			}
-			if !scanTime.Equal(ev.After.ModificationTime) {
+			if !scanTime.Equal(ev.After.GetModificationTime()) {
 				log.Fatalf(ctx, "found event in shouldScan which did not occur at the scan time %v: %v",
 					scanTime, ev)
 			}
@@ -247,7 +298,8 @@ func (f *kvFeed) scanIfShould(
 		return err
 	}
 
-	if !isInitialScan && f.schemaChangePolicy == changefeedbase.OptSchemaChangePolicyNoBackfill {
+	if (!isInitialScan && f.schemaChangePolicy == changefeedbase.OptSchemaChangePolicyNoBackfill) ||
+		len(spansToBackfill) == 0 {
 		return nil
 	}
 
@@ -379,7 +431,7 @@ func copyFromSourceToSinkUntilTableEvent(
 				// The logic currently doesn't make this clean.
 				resolved := e.Resolved()
 				frontier.Forward(resolved.Span, resolved.Timestamp)
-				return sink.AddResolved(ctx, resolved.Span, resolved.Timestamp, false)
+				return sink.AddResolved(ctx, resolved.Span, resolved.Timestamp, jobspb.ResolvedSpan_NONE)
 			default:
 				log.Fatal(ctx, "unknown event type")
 				return nil

@@ -296,9 +296,9 @@ func (s *Store) processRaftSnapshotRequest(
 			defer s.mu.Unlock()
 			placeholder, err := s.canApplySnapshotLocked(ctx, snapHeader)
 			if err != nil {
-				// If the storage cannot accept the snapshot, return an
-				// error before passing it to RawNode.Step, since our
-				// error handling options past that point are limited.
+				// If we cannot accept the snapshot, return an error before
+				// passing it to RawNode.Step, since our error handling options
+				// past that point are limited.
 				log.Infof(ctx, "cannot apply snapshot: %s", err)
 				return err
 			}
@@ -608,12 +608,34 @@ func (s *Store) processRaft(ctx context.Context) {
 
 	s.scheduler.Start(ctx, s.stopper)
 	// Wait for the scheduler worker goroutines to finish.
-	s.stopper.RunWorker(ctx, s.scheduler.Wait)
+	if err := s.stopper.RunAsyncTask(ctx, "sched-wait", s.scheduler.Wait); err != nil {
+		s.scheduler.Wait(ctx)
+	}
 
-	s.stopper.RunWorker(ctx, s.raftTickLoop)
-	s.stopper.RunWorker(ctx, s.coalescedHeartbeatsLoop)
+	_ = s.stopper.RunAsyncTask(ctx, "sched-tick-loop", s.raftTickLoop)
+	_ = s.stopper.RunAsyncTask(ctx, "coalesced-hb-loop", s.coalescedHeartbeatsLoop)
 	s.stopper.AddCloser(stop.CloserFn(func() {
 		s.cfg.Transport.Stop(s.StoreID())
+	}))
+
+	// We'll want to cancel all in-flight proposals. Proposals embed tracing
+	// spans in them, and we don't want to be leaking any.
+	s.stopper.AddCloser(stop.CloserFn(func() {
+		s.VisitReplicas(func(r *Replica) (more bool) {
+			r.mu.proposalBuf.FlushLockedWithoutProposing(ctx)
+			r.mu.Lock()
+			for k, prop := range r.mu.proposals {
+				delete(r.mu.proposals, k)
+				prop.finishApplication(
+					context.Background(),
+					proposalResult{
+						Err: roachpb.NewError(roachpb.NewAmbiguousResultError("store is stopping")),
+					},
+				)
+			}
+			r.mu.Unlock()
+			return true
+		})
 	}))
 }
 
@@ -646,7 +668,7 @@ func (s *Store) raftTickLoop(ctx context.Context) {
 			s.scheduler.EnqueueRaftTicks(rangeIDs...)
 			s.metrics.RaftTicks.Inc(1)
 
-		case <-s.stopper.ShouldStop():
+		case <-s.stopper.ShouldQuiesce():
 			return
 		}
 	}
@@ -689,7 +711,7 @@ func (s *Store) coalescedHeartbeatsLoop(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			s.sendQueuedHeartbeats(ctx)
-		case <-s.stopper.ShouldStop():
+		case <-s.stopper.ShouldQuiesce():
 			return
 		}
 	}

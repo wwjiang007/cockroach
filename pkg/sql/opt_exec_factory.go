@@ -26,13 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -129,13 +128,14 @@ func (ef *execFactory) ConstructScan(
 		scan.lockingStrength = descpb.ToScanLockingStrength(params.Locking.Strength)
 		scan.lockingWaitPolicy = descpb.ToScanLockingWaitPolicy(params.Locking.WaitPolicy)
 	}
+	scan.localityOptimized = params.LocalityOptimized
 	return scan, nil
 }
 
 func generateScanSpans(
 	evalCtx *tree.EvalContext,
 	codec keys.SQLCodec,
-	tabDesc *tabledesc.Immutable,
+	tabDesc catalog.TableDescriptor,
 	indexDesc *descpb.IndexDescriptor,
 	params exec.ScanParams,
 ) (roachpb.Spans, error) {
@@ -192,7 +192,7 @@ func (ef *execFactory) ConstructFilter(
 // ConstructInvertedFilter is part of the exec.Factory interface.
 func (ef *execFactory) ConstructInvertedFilter(
 	n exec.Node,
-	invFilter *invertedexpr.SpanExpression,
+	invFilter *inverted.SpanExpression,
 	preFiltererExpr tree.TypedExpr,
 	preFiltererType *types.T,
 	invColumn exec.NodeColumnOrdinal,
@@ -497,9 +497,17 @@ func (ef *execFactory) ConstructDistinct(
 
 // ConstructSetOp is part of the exec.Factory interface.
 func (ef *execFactory) ConstructSetOp(
-	typ tree.UnionType, all bool, left, right exec.Node,
+	typ tree.UnionType, all bool, left, right exec.Node, hardLimit uint64,
 ) (exec.Node, error) {
-	return ef.planner.newUnionNode(typ, all, left.(planNode), right.(planNode))
+	if hardLimit != 0 && (typ != tree.UnionOp || !all) {
+		return nil, errors.AssertionFailedf("a hard limit on a set operator is only supported for UNION ALL")
+	}
+	if hardLimit > 1 {
+		return nil, errors.AssertionFailedf(
+			"locality optimized search is not yet supported for more than one row at a time",
+		)
+	}
+	return ef.planner.newUnionNode(typ, all, left.(planNode), right.(planNode), hardLimit)
 }
 
 // ConstructSort is part of the exec.Factory interface.
@@ -548,7 +556,7 @@ func (ef *execFactory) ConstructIndexJoin(
 	}
 
 	primaryIndex := tabDesc.GetPrimaryIndex()
-	tableScan.index = primaryIndex
+	tableScan.index = primaryIndex.IndexDesc()
 	tableScan.disableBatchLimit()
 
 	n := &indexJoinNode{
@@ -575,6 +583,7 @@ func (ef *execFactory) ConstructLookupJoin(
 	index cat.Index,
 	eqCols []exec.NodeColumnOrdinal,
 	eqColsAreKey bool,
+	lookupExpr tree.TypedExpr,
 	lookupCols exec.TableColumnOrdinalSet,
 	onCond tree.TypedExpr,
 	isSecondJoinInPairedJoiner bool,
@@ -612,6 +621,9 @@ func (ef *execFactory) ConstructLookupJoin(
 		n.eqCols[i] = int(c)
 	}
 	pred := makePredicate(joinType, planColumns(input.(planNode)), planColumns(tableScan))
+	if lookupExpr != nil {
+		n.lookupExpr = pred.iVarHelper.Rebind(lookupExpr)
+	}
 	if onCond != nil && onCond != tree.DBoolTrue {
 		n.onCond = pred.iVarHelper.Rebind(onCond)
 	}
@@ -658,7 +670,11 @@ func (ef *execFactory) constructVirtualTableLookupJoin(
 		return nil, err
 	}
 	tableScan.index = indexDesc
-	vtableCols := colinfo.ResultColumnsFromColDescs(tableDesc.ID, tableDesc.Columns)
+	publicColDescs := make([]descpb.ColumnDescriptor, len(tableDesc.PublicColumns()))
+	for i, col := range tableDesc.PublicColumns() {
+		publicColDescs[i] = *col.ColumnDesc()
+	}
+	vtableCols := colinfo.ResultColumnsFromColDescs(tableDesc.GetID(), publicColDescs)
 	projectedVtableCols := planColumns(&tableScan)
 	outputCols := make(colinfo.ResultColumns, 0, len(inputCols)+len(projectedVtableCols))
 	outputCols = append(outputCols, inputCols...)
@@ -689,6 +705,7 @@ func (ef *execFactory) ConstructInvertedJoin(
 	input exec.Node,
 	table cat.Table,
 	index cat.Index,
+	prefixEqCols []exec.NodeColumnOrdinal,
 	lookupCols exec.TableColumnOrdinalSet,
 	onCond tree.TypedExpr,
 	isFirstJoinInPairedJoiner bool,
@@ -717,6 +734,12 @@ func (ef *execFactory) ConstructInvertedJoin(
 		isFirstJoinInPairedJoiner: isFirstJoinInPairedJoiner,
 		reqOrdering:               ReqOrdering(reqOrdering),
 	}
+	if len(prefixEqCols) > 0 {
+		n.prefixEqCols = make([]int, len(prefixEqCols))
+		for i, c := range prefixEqCols {
+			n.prefixEqCols[i] = int(c)
+		}
+	}
 	if onCond != nil && onCond != tree.DBoolTrue {
 		n.onExpr = onCond
 	}
@@ -743,7 +766,7 @@ func (ef *execFactory) ConstructInvertedJoin(
 // and requested cols.
 func (ef *execFactory) constructScanForZigzag(
 	indexDesc *descpb.IndexDescriptor,
-	tableDesc *tabledesc.Immutable,
+	tableDesc catalog.TableDescriptor,
 	cols exec.TableColumnOrdinalSet,
 ) (*scanNode, error) {
 
@@ -752,7 +775,7 @@ func (ef *execFactory) constructScanForZigzag(
 	}
 
 	for c, ok := cols.Next(0); ok; c, ok = cols.Next(c + 1) {
-		colCfg.wantedColumns = append(colCfg.wantedColumns, tree.ColumnID(tableDesc.Columns[c].ID))
+		colCfg.wantedColumns = append(colCfg.wantedColumns, tree.ColumnID(tableDesc.PublicColumns()[c].GetID()))
 	}
 
 	scan := ef.planner.Scan()
@@ -1042,7 +1065,7 @@ func (ef *execFactory) showEnv(plan string, envOpts exec.ExplainEnvData) (exec.N
 	out.writef("")
 	// Show the values of any non-default session variables that can impact
 	// planning decisions.
-	if err := c.PrintSettings(&out.buf); err != nil {
+	if err := c.PrintSessionSettings(&out.buf); err != nil {
 		return nil, err
 	}
 
@@ -1143,7 +1166,8 @@ func (ef *execFactory) ConstructShowTrace(typ tree.ShowTraceType, compact bool) 
 func (ef *execFactory) ConstructInsert(
 	input exec.Node,
 	table cat.Table,
-	arbiters cat.IndexOrdinals,
+	arbiterIndexes cat.IndexOrdinals,
+	arbiterConstraints cat.UniqueOrdinals,
 	insertColOrdSet exec.TableColumnOrdinalSet,
 	returnColOrdSet exec.TableColumnOrdinalSet,
 	checkOrdSet exec.CheckOrdinalSet,
@@ -1186,7 +1210,7 @@ func (ef *execFactory) ConstructInsert(
 
 		// Set the tabColIdxToRetIdx for the mutation. Insert always returns
 		// non-mutation columns in the same order they are defined in the table.
-		ins.run.tabColIdxToRetIdx = row.ColMapping(tabDesc.Columns, returnColDescs)
+		ins.run.tabColIdxToRetIdx = makePublicToReturnColumnIndexMapping(tabDesc, returnColDescs)
 		ins.run.rowsNeeded = true
 	}
 
@@ -1261,7 +1285,7 @@ func (ef *execFactory) ConstructInsertFastPath(
 
 		// Set the tabColIdxToRetIdx for the mutation. Insert always returns
 		// non-mutation columns in the same order they are defined in the table.
-		ins.run.tabColIdxToRetIdx = row.ColMapping(tabDesc.Columns, returnColDescs)
+		ins.run.tabColIdxToRetIdx = makePublicToReturnColumnIndexMapping(tabDesc, returnColDescs)
 		ins.run.rowsNeeded = true
 	}
 
@@ -1296,6 +1320,14 @@ func (ef *execFactory) ConstructUpdate(
 	autoCommit bool,
 ) (exec.Node, error) {
 	ctx := ef.planner.extendedEvalCtx.Context
+
+	// TODO(radu): the execution code has an annoying limitation that the fetch
+	// columns must be a superset of the update columns, even when the "old" value
+	// of a column is not necessary. The optimizer code for pruning columns is
+	// aware of this limitation.
+	if !updateColOrdSet.SubsetOf(fetchColOrdSet) {
+		return nil, errors.AssertionFailedf("execution requires all update columns have a fetch column")
+	}
 
 	// Derive table and column descriptors.
 	rowsNeeded := !returnColOrdSet.Empty()
@@ -1394,7 +1426,8 @@ func (ef *execFactory) ConstructUpdate(
 func (ef *execFactory) ConstructUpsert(
 	input exec.Node,
 	table cat.Table,
-	arbiters cat.IndexOrdinals,
+	arbiterIndexes cat.IndexOrdinals,
+	arbiterConstraints cat.UniqueOrdinals,
 	canaryCol exec.NodeColumnOrdinal,
 	insertColOrdSet exec.TableColumnOrdinalSet,
 	fetchColOrdSet exec.TableColumnOrdinalSet,
@@ -1469,7 +1502,7 @@ func (ef *execFactory) ConstructUpsert(
 		// Update the tabColIdxToRetIdx for the mutation. Upsert returns
 		// non-mutation columns specified, in the same order they are defined
 		// in the table.
-		ups.run.tw.tabColIdxToRetIdx = row.ColMapping(tabDesc.Columns, returnColDescs)
+		ups.run.tw.tabColIdxToRetIdx = makePublicToReturnColumnIndexMapping(tabDesc, returnColDescs)
 		ups.run.tw.returnCols = returnColDescs
 		ups.run.tw.rowsNeeded = true
 	}
@@ -1557,7 +1590,7 @@ func (ef *execFactory) ConstructDeleteRange(
 	autoCommit bool,
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
-	indexDesc := tabDesc.GetPrimaryIndex()
+	indexDesc := tabDesc.GetPrimaryIndex().IndexDesc()
 	sb := span.MakeBuilder(ef.planner.EvalContext(), ef.planner.ExecCfg().Codec, tabDesc, indexDesc)
 
 	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
@@ -1580,7 +1613,7 @@ func (ef *execFactory) ConstructDeleteRange(
 
 	if len(interleavedTables) > 0 {
 		dr.interleavedFastPath = true
-		dr.interleavedDesc = make([]*tabledesc.Immutable, len(interleavedTables))
+		dr.interleavedDesc = make([]catalog.TableDescriptor, len(interleavedTables))
 		for i := range dr.interleavedDesc {
 			dr.interleavedDesc[i] = interleavedTables[i].(*optTable).desc
 		}
@@ -1659,13 +1692,13 @@ func (ef *execFactory) ConstructCreateView(
 		if !d.ColumnOrdinals.Empty() {
 			ref.ColumnIDs = make([]descpb.ColumnID, 0, d.ColumnOrdinals.Len())
 			d.ColumnOrdinals.ForEach(func(ord int) {
-				ref.ColumnIDs = append(ref.ColumnIDs, desc.Columns[ord].ID)
+				ref.ColumnIDs = append(ref.ColumnIDs, desc.PublicColumns()[ord].GetID())
 			})
 		}
-		entry := planDeps[desc.ID]
+		entry := planDeps[desc.GetID()]
 		entry.desc = desc
 		entry.deps = append(entry.deps, ref)
-		planDeps[desc.ID] = entry
+		planDeps[desc.GetID()] = entry
 	}
 
 	return &createViewNode{
@@ -1877,7 +1910,17 @@ func (ef *execFactory) ConstructExplain(
 			plan:    *wrappedPlan,
 		}, nil
 	}
+	if options.Mode == tree.ExplainDDL {
+		wrappedPlan := plan.(*explain.Plan).WrappedPlan.(*planComponents)
+		return &explainDDLNode{
+			options: options,
+			plan:    *wrappedPlan,
+		}, nil
+	}
 	flags := explain.MakeFlags(options)
+	if ef.planner.execCfg.TestingKnobs.DeterministicExplain {
+		flags.Redact = explain.RedactVolatile
+	}
 	n := &explainPlanNode{
 		options: options,
 		flags:   flags,
@@ -1928,7 +1971,24 @@ func makeColDescList(table cat.Table, cols exec.TableColumnOrdinalSet) []descpb.
 		if !cols.Contains(i) {
 			continue
 		}
-		colDescs = append(colDescs, *tab.getColDesc(i))
+		colDescs = append(colDescs, *tab.getCol(i).ColumnDesc())
 	}
 	return colDescs
+}
+
+// makePublicToReturnColumnIndexMapping returns a map from the ordinals
+// of the table's public columns to ordinals in the returnColDescs slice.
+//  More precisely, for 0 <= i < len(tableDesc.PublicColumns()):
+//   result[i] = j such that returnColDescs[j].ID is the ID of
+//                   the i'th public column, or
+//              -1 if the i'th public column is not found in returnColDescs.
+func makePublicToReturnColumnIndexMapping(
+	tableDesc catalog.TableDescriptor, returnColDescs []descpb.ColumnDescriptor,
+) []int {
+	publicCols := tableDesc.PublicColumns()
+	publicColDescs := make([]descpb.ColumnDescriptor, len(publicCols))
+	for i, col := range publicCols {
+		publicColDescs[i] = *col.ColumnDesc()
+	}
+	return row.ColMapping(publicColDescs, returnColDescs)
 }

@@ -19,6 +19,8 @@ import "roachpb/io-formats.proto";
 import "sql/catalog/descpb/structured.proto";
 import "sql/catalog/descpb/tenant.proto";
 import "util/hlc/timestamp.proto";
+import "sql/schemachanger/scpb/scpb.proto";
+import "clusterversion/cluster_version.proto";
 
 message Lease {
   option (gogoproto.equal) = true;
@@ -77,6 +79,27 @@ message EncryptionInfo {
   map<string, bytes> encryptedDataKeyByKMSMasterKeyID = 3;
 }
 
+message StreamIngestionDetails {
+  // StreamAddress locates the stream. It enables the client to find the
+  // addresses of the stream's partitions.
+  string stream_address = 1;
+  // Span is the keyspan into which this job will ingest KVs.
+  //
+  // The stream should emit all changes for a given span, and no changes outside
+  // a span. Note that KVs received from the stream may need to be re-keyed into
+  // this span.
+  roachpb.Span span = 2 [(gogoproto.nullable) = false];
+  // The job will ingest events from StartTime onwards.
+  util.hlc.Timestamp start_time = 3 [(gogoproto.nullable) = false];
+}
+
+message StreamIngestionProgress {
+  // CutoverTime is set to signal to the stream ingestion job to complete its
+  // ingestion. This involves stopping any subsequent ingestion, and rolling
+  // back any additional ingested data, to bring the ingested cluster to a
+  // consistent state as of the CutoverTime.
+  util.hlc.Timestamp cutover_time = 1 [(gogoproto.nullable) = false];
+}
 
 message BackupDetails {
   util.hlc.Timestamp start_time = 1 [(gogoproto.nullable) = false];
@@ -161,6 +184,12 @@ message RestoreDetails {
   // stages have completed via these flags.
   bool prepare_completed = 8;
   bool stats_inserted = 9;
+  // SystemTablesRestored keeps track of dynamic states that need to happen only
+  // once during the lifetime of a job. Note, that this state may be shared
+  // between job versions, so updates to this map must be considered carefully.
+  // It maps system table names to whether or not they have already been
+  // restored.
+  map<string, bool> system_tables_restored = 17;
   // DescriptorsPublished indicates whether or not the descriptors written in
   // the job have been transactionally updated after the data was restored.
   bool descriptors_published = 10;
@@ -168,7 +197,7 @@ message RestoreDetails {
     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/sem/tree.DescriptorCoverage"
   ];
   BackupEncryptionOptions encryption = 12;
-  // NEXT ID: 17.
+  // NEXT ID: 18.
 }
 
 message RestoreProgress {
@@ -185,7 +214,11 @@ message ImportDetails {
     repeated string target_cols = 21;
     reserved 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17;
   }
+  message Schema {
+    sqlbase.SchemaDescriptor desc = 1;
+  }
   repeated Table tables = 1 [(gogoproto.nullable) = false];
+  repeated Schema schemas = 23 [(gogoproto.nullable) = false];
   repeated string uris = 2 [(gogoproto.customname) = "URIs"];
   roachpb.IOFileFormat format = 3 [(gogoproto.nullable) = false];
 
@@ -214,6 +247,7 @@ message ImportDetails {
   bool ingest_directly = 11;
 
   bool prepare_complete = 12;
+  bool schemas_published = 24;
   bool tables_published = 13;
 
   bool parse_bundle_schema = 14;
@@ -227,6 +261,8 @@ message ImportDetails {
     (gogoproto.customname) = "ProtectedTimestampRecord",
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"
   ];
+
+  // next val: 25
 }
 
 // SequenceValChunks represents a single chunk of sequence values allocated
@@ -278,12 +314,32 @@ message ImportProgress {
 // TypeSchemaChangeDetails is the job detail information for a type schema change job.
 message TypeSchemaChangeDetails {
   uint32 type_id = 1 [(gogoproto.customname) = "TypeID", (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
+  // TransitioningMembers is a list of enum members, represented by their
+  // physical representation, that are transitioning in the current job. This
+  // is used to group transitions together and ensure that rollback is limited
+  // to this list in the face of job failure. It is also worth noting that we
+  // cannot use the logical representation or index of the member to identify
+  // a member, as both of these may change due to a concurrent rename or
+  // addition with a specified placement. Physical representations are
+  // guaranteed to be stable.
+  repeated bytes transitioning_members = 2;
 }
 
 // TypeSchemaChangeProgress is the persisted progress for a type schema change job.
 message TypeSchemaChangeProgress {
 
 }
+
+// TypeSchemaChangeDetails is the job detail information for the new schema change job.
+message NewSchemaChangeDetails {
+  repeated cockroach.sql.schemachanger.scpb.Target targets = 1;
+}
+
+// NewSchemaChangeProgress is the persisted progress for the new schema change job.
+message NewSchemaChangeProgress {
+  repeated cockroach.sql.schemachanger.scpb.State states = 1;
+}
+
 
 message ResumeSpanList {
   repeated roachpb.Span resume_spans = 1 [(gogoproto.nullable) = false];
@@ -316,6 +372,9 @@ message DroppedTableDetails {
 // 3. Database deletions: The deletion of a database and therefore all its tables.
 //      details.Tables -> the IDs of the tables to GC.
 //      details.ParentID -> the ID of the database to drop.
+//
+// 4. Tenant deletion: The deletion of a tenant key range.
+//      details.TenantID -> the ID of the tenant to delete.
 message SchemaChangeGCDetails {
   message DroppedIndex {
     int64 index_id = 1 [(gogoproto.customname) = "IndexID",
@@ -348,6 +407,14 @@ message SchemaChangeGCDetails {
   // database, the database ID.
   int64 parent_id = 3 [(gogoproto.customname) = "ParentID",
                       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ID"];
+
+  message DroppedTenant {
+    uint64 id = 1 [(gogoproto.customname) = "ID"];
+    int64 drop_time = 2;
+  }
+
+  // Tenant to GC.
+  DroppedTenant tenant = 6;
 }
 
 message SchemaChangeDetails {
@@ -416,11 +483,18 @@ message SchemaChangeGCProgress {
     Status status = 2;
   }
 
+  message TenantProgress {
+    Status status = 1;
+  }
+
   // Indexes to GC.
   repeated IndexProgress indexes = 1 [(gogoproto.nullable) = false];
 
   // Entire tables to GC.
   repeated TableProgress tables = 2 [(gogoproto.nullable) = false];
+
+  // The status of the tenant to be deleted.
+ TenantProgress tenant = 3;
 }
 
 message ChangefeedTarget {
@@ -462,7 +536,38 @@ message ChangefeedDetails {
 message ResolvedSpan {
   roachpb.Span span = 1 [(gogoproto.nullable) = false];
   util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false];
-  bool boundary_reached = 3;
+
+  // BoundaryReached indicates that this resolved timestamp
+  // corresponds to a schema change boundary. A schema change boundary is a
+  // timestamp at which a new version of a table has been committed that either
+  // indicates a logical backfill or a need for the changefeed to exit.
+  bool deprecated_boundary_reached = 3;
+
+  enum BoundaryType {
+
+    // NONE indicates that this resolved span does not correspond to a
+    // boundary.
+    NONE = 0;
+
+    // BACKFILL indicates that this resolved span corresponds to a boundary
+    // requiring a backfill internally and perhaps indicates the need for a
+    // protected timestamp.
+    BACKFILL = 1;
+
+    // EXIT indicates that this resolved span corresponds to a boundary which
+    // should result in the changefeed exiting.
+    EXIT = 2;
+
+    // RESTART indicates that this resolved span corresponds to a boundary which
+    // should result in the changefeed restarting.
+    RESTART = 3;
+  }
+
+  BoundaryType boundary_type = 4;
+}
+
+message ResolvedSpans {
+  repeated ResolvedSpan resolved_spans = 1 [(gogoproto.nullable) = false];
 }
 
 message ChangefeedProgress {
@@ -522,6 +627,14 @@ message CreateStatsProgress {
 
 }
 
+message MigrationDetails {
+  clusterversion.ClusterVersion cluster_version = 1;
+}
+
+message MigrationProgress {
+
+}
+
 message Payload {
   string description = 1;
   // If empty, the description is assumed to be the statement.
@@ -562,6 +675,9 @@ message Payload {
     CreateStatsDetails createStats = 15;
     SchemaChangeGCDetails schemaChangeGC = 21;
     TypeSchemaChangeDetails typeSchemaChange = 22;
+    StreamIngestionDetails streamIngestion = 23;
+    NewSchemaChangeDetails newSchemaChange = 24;
+    MigrationDetails migration = 25;
   }
 }
 
@@ -582,6 +698,9 @@ message Progress {
     CreateStatsProgress createStats = 15;
     SchemaChangeGCProgress schemaChangeGC = 16;
     TypeSchemaChangeProgress typeSchemaChange = 17;
+    StreamIngestionProgress streamIngest = 18;
+    NewSchemaChangeProgress newSchemaChange = 19;
+    MigrationProgress migration = 20;
   }
 }
 
@@ -601,10 +720,13 @@ enum Type {
   // We can't name this TYPE_SCHEMA_CHANGE due to how proto generates actual
   // names for this enum, which cause a conflict with the SCHEMA_CHANGE entry.
   TYPEDESC_SCHEMA_CHANGE = 9 [(gogoproto.enumvalue_customname) = "TypeTypeSchemaChange"];
+  STREAM_INGESTION = 10 [(gogoproto.enumvalue_customname) = "TypeStreamIngestion"];
+  NEW_SCHEMA_CHANGE = 11 [(gogoproto.enumvalue_customname) = "TypeNewSchemaChange"];
+  MIGRATION = 12 [(gogoproto.enumvalue_customname) = "TypeMigration"];
 }
 
 message Job {
-  int64 id = 1;
+  int64 id = 1 [(gogoproto.nullable) = false, (gogoproto.customtype) = "JobID"];
   // Keep progress first as it may bre more relevant to see when looking at a
   // running job.
   Progress progress = 2;

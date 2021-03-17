@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -158,6 +159,36 @@ type FetcherTableArgs struct {
 	ValNeededForCol util.FastIntSet
 }
 
+// InitCols initializes the columns in FetcherTableArgs.
+func (fta *FetcherTableArgs) InitCols(
+	desc catalog.TableDescriptor,
+	scanVisibility execinfrapb.ScanVisibility,
+	withSystemColumns bool,
+	virtualColumn catalog.Column,
+) {
+	cols := make([]catalog.Column, 0, len(desc.AllColumns()))
+	if scanVisibility == execinfra.ScanVisibilityPublicAndNotPublic {
+		cols = append(cols, desc.ReadableColumns()...)
+	} else {
+		cols = append(cols, desc.PublicColumns()...)
+	}
+	if virtualColumn != nil {
+		for i, col := range cols {
+			if col.GetID() == virtualColumn.GetID() {
+				cols[i] = virtualColumn
+				break
+			}
+		}
+	}
+	if withSystemColumns {
+		cols = append(cols, desc.SystemColumns()...)
+	}
+	fta.Cols = make([]descpb.ColumnDescriptor, len(cols))
+	for i, col := range cols {
+		fta.Cols[i] = *col.ColumnDesc()
+	}
+}
+
 // Fetcher handles fetching kvs and forming table rows for an
 // arbitrary number of tables.
 // Usage:
@@ -227,14 +258,9 @@ type Fetcher struct {
 
 	// -- Fields updated during a scan --
 
-	// testingGenerateMockContentionEvents is a field that specifies whether
-	// a kvFetcher generates mock contention events. See
-	// kvFetcher.TestingEnableMockContentionEventGeneration.
-	// TODO(asubiotto): Remove once KV layer produces real contention events.
-	testingGenerateMockContentionEvents bool
-	kvFetcher                           *KVFetcher
-	indexKey                            []byte // the index key of the current row
-	prettyValueBuf                      *bytes.Buffer
+	kvFetcher      *KVFetcher
+	indexKey       []byte // the index key of the current row
+	prettyValueBuf *bytes.Buffer
 
 	valueColsFound int // how many needed cols we've found so far in the value
 
@@ -537,6 +563,7 @@ func (rf *Fetcher) StartScan(
 	limitBatches bool,
 	limitHint int64,
 	traceKV bool,
+	forceProductionKVBatchSize bool,
 ) error {
 	if len(spans) == 0 {
 		return errors.AssertionFailedf("no spans")
@@ -552,6 +579,7 @@ func (rf *Fetcher) StartScan(
 		rf.lockStrength,
 		rf.lockWaitPolicy,
 		rf.mon,
+		forceProductionKVBatchSize,
 	)
 	if err != nil {
 		return err
@@ -577,6 +605,7 @@ func (rf *Fetcher) StartInconsistentScan(
 	limitBatches bool,
 	limitHint int64,
 	traceKV bool,
+	forceProductionKVBatchSize bool,
 ) error {
 	if len(spans) == 0 {
 		return errors.AssertionFailedf("no spans")
@@ -633,6 +662,7 @@ func (rf *Fetcher) StartInconsistentScan(
 		rf.lockStrength,
 		rf.lockWaitPolicy,
 		rf.mon,
+		forceProductionKVBatchSize,
 	)
 	if err != nil {
 		return err
@@ -663,7 +693,6 @@ func (rf *Fetcher) StartScanFrom(ctx context.Context, f kvBatchFetcher) error {
 		rf.kvFetcher.Close(ctx)
 	}
 	rf.kvFetcher = newKVFetcher(f)
-	rf.kvFetcher.testingGenerateMockContentionEvents = rf.testingGenerateMockContentionEvents
 	// Retrieve the first key.
 	_, err := rf.NextKey(ctx)
 	return err
@@ -1114,7 +1143,7 @@ func (rf *Fetcher) processValueSingle(
 	if rf.traceKV || table.neededCols.Contains(int(colID)) {
 		if idx, ok := table.colIdxMap.Get(colID); ok {
 			if rf.traceKV {
-				prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.DeletableColumns()[idx].Name)
+				prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.DeletableColumns()[idx].GetName())
 			}
 			if len(kv.Value.RawBytes) == 0 {
 				return prettyKey, "", nil
@@ -1189,7 +1218,7 @@ func (rf *Fetcher) processValueBytes(
 		idx := table.colIdxMap.GetDefault(colID)
 
 		if rf.traceKV {
-			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.DeletableColumns()[idx].Name)
+			prettyKey = fmt.Sprintf("%s/%s", prettyKey, table.desc.DeletableColumns()[idx].GetName())
 		}
 
 		var encValue rowenc.EncDatum
@@ -1380,13 +1409,17 @@ func (rf *Fetcher) NextRowWithErrors(ctx context.Context) (rowenc.EncDatumRow, e
 func (rf *Fetcher) checkPrimaryIndexDatumEncodings(ctx context.Context) error {
 	table := rf.rowReadyTable
 	scratch := make([]byte, 1024)
-	colIDToColumn := make(map[descpb.ColumnID]*descpb.ColumnDescriptor)
-	_ = table.desc.ForeachPublicColumn(func(col *descpb.ColumnDescriptor) error {
-		colIDToColumn[col.ID] = col
-		return nil
-	})
+	colIDToColumn := make(map[descpb.ColumnID]catalog.Column)
+	for _, col := range table.desc.PublicColumns() {
+		colIDToColumn[col.GetID()] = col
+	}
 
-	rh := rowHelper{TableDesc: table.desc, Indexes: table.desc.GetPublicNonPrimaryIndexes()}
+	indexes := make([]descpb.IndexDescriptor, len(table.desc.PublicNonPrimaryIndexes()))
+	for i, idx := range table.desc.PublicNonPrimaryIndexes() {
+		indexes[i] = *idx.IndexDesc()
+	}
+
+	rh := rowHelper{TableDesc: table.desc, Indexes: indexes}
 
 	return table.desc.ForeachFamily(func(family *descpb.ColumnFamilyDescriptor) error {
 		var lastColID descpb.ColumnID
@@ -1414,20 +1447,20 @@ func (rf *Fetcher) checkPrimaryIndexDatumEncodings(ctx context.Context) error {
 				return errors.AssertionFailedf("column mapping not found for column %d", colID)
 			}
 
-			if lastColID > col.ID {
-				return errors.AssertionFailedf("cannot write column id %d after %d", col.ID, lastColID)
+			if lastColID > col.GetID() {
+				return errors.AssertionFailedf("cannot write column id %d after %d", col.GetID(), lastColID)
 			}
-			colIDDiff := col.ID - lastColID
-			lastColID = col.ID
+			colIDDiff := col.GetID() - lastColID
+			lastColID = col.GetID()
 
 			if result, err := rowenc.EncodeTableValue([]byte(nil), colIDDiff, rowVal.Datum,
 				scratch); err != nil {
 				return errors.NewAssertionErrorWithWrappedErrf(err, "could not re-encode column %s, value was %#v",
-					col.Name, rowVal.Datum)
+					col.GetName(), rowVal.Datum)
 			} else if !rowVal.BytesEqual(result) {
 				return scrub.WrapError(scrub.IndexValueDecodingError, errors.Errorf(
 					"value failed to round-trip encode. Column=%s colIDDiff=%d Key=%s expected %#v, got: %#v",
-					col.Name, colIDDiff, rf.kv.Key, rowVal.EncodedString(), result))
+					col.GetName(), colIDDiff, rf.kv.Key, rowVal.EncodedString(), result))
 			}
 		}
 		return nil
@@ -1590,28 +1623,7 @@ func (rf *Fetcher) PartialKey(nCols int) (roachpb.Key, error) {
 
 // GetBytesRead returns total number of bytes read by the underlying KVFetcher.
 func (rf *Fetcher) GetBytesRead() int64 {
-	if f := rf.kvFetcher; f != nil {
-		return f.bytesRead
-	}
-	// Not yet initialized.
-	return 0
-}
-
-// TestingEnableMockContentionEventGeneration signals the underlying kv fetcher
-// to generate mock roachpb.ContentionEvents. Refer to the KVFetcher's method
-// of the same name for more information.
-func (rf *Fetcher) TestingEnableMockContentionEventGeneration() {
-	rf.testingGenerateMockContentionEvents = true
-}
-
-// GetContentionEvents returns a slice of contention events that occurred during
-// the lifetime of this Fetcher. A nil slice indicates that no contention
-// events occurred.
-func (rf *Fetcher) GetContentionEvents() []roachpb.ContentionEvent {
-	if f := rf.kvFetcher; f != nil {
-		return f.GetContentionEvents()
-	}
-	return nil
+	return rf.kvFetcher.GetBytesRead()
 }
 
 // Only unique secondary indexes have extra columns to decode (namely the

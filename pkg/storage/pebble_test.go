@@ -160,7 +160,11 @@ func TestPebbleIterReuse(t *testing.T) {
 	// previous iterator should get zeroed.
 	iter2 := batch.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{UpperBound: []byte{10}})
 	valuesCount = 0
-	iter2.SeekGE(MVCCKey{Key: []byte{0}})
+	// This is a peculiar test that is disregarding how local and global keys
+	// affect the behavior of MVCCIterators. This test is writing []byte{0}
+	// which precedes the localPrefix. Ignore the local and preceding keys in
+	// this seek.
+	iter2.SeekGE(MVCCKey{Key: []byte{2}})
 	for ; ; iter2.Next() {
 		ok, err := iter2.Valid()
 		if err != nil {
@@ -176,10 +180,144 @@ func TestPebbleIterReuse(t *testing.T) {
 		valuesCount++
 	}
 
-	if valuesCount != 10 {
-		t.Fatalf("expected 10 values, got %d", valuesCount)
+	if valuesCount != 8 {
+		t.Fatalf("expected 8 values, got %d", valuesCount)
 	}
 	iter2.Close()
+}
+
+type iterBoundsChecker struct {
+	t                  *testing.T
+	expectSetBounds    bool
+	boundsSlices       [2][]byte
+	boundsSlicesCopied [2][]byte
+}
+
+func (ibc *iterBoundsChecker) postSetBounds(lower, upper []byte) {
+	require.True(ibc.t, ibc.expectSetBounds)
+	ibc.expectSetBounds = false
+	// The slices passed in the second from last SetBounds call
+	// must still be the same.
+	for i := range ibc.boundsSlices {
+		if ibc.boundsSlices[i] != nil {
+			if !bytes.Equal(ibc.boundsSlices[i], ibc.boundsSlicesCopied[i]) {
+				ibc.t.Fatalf("bound slice changed: expected: %x, actual: %x",
+					ibc.boundsSlicesCopied[i], ibc.boundsSlices[i])
+			}
+		}
+	}
+	// Stash the bounds for later checking.
+	for i, bound := range [][]byte{lower, upper} {
+		ibc.boundsSlices[i] = bound
+		if bound != nil {
+			ibc.boundsSlicesCopied[i] = append(ibc.boundsSlicesCopied[i][:0], bound...)
+		} else {
+			ibc.boundsSlicesCopied[i] = nil
+		}
+	}
+}
+
+func TestPebbleIterBoundSliceStabilityAndNoop(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	eng := createTestPebbleEngine().(*Pebble)
+	defer eng.Close()
+	iter := newPebbleIterator(eng.db, nil, IterOptions{UpperBound: roachpb.Key("foo")})
+	defer iter.Close()
+	checker := &iterBoundsChecker{t: t}
+	iter.testingSetBoundsListener = checker
+
+	tc := []struct {
+		expectSetBounds bool
+		setUpperOnly    bool
+		lb              roachpb.Key
+		ub              roachpb.Key
+	}{
+		{
+			// [nil, www)
+			expectSetBounds: true,
+			ub:              roachpb.Key("www"),
+		},
+		{
+			// [nil, www)
+			expectSetBounds: false,
+			ub:              roachpb.Key("www"),
+		},
+		{
+			// [nil, www)
+			expectSetBounds: false,
+			setUpperOnly:    true,
+			ub:              roachpb.Key("www"),
+		},
+		{
+			// [ddd, www)
+			expectSetBounds: true,
+			lb:              roachpb.Key("ddd"),
+			ub:              roachpb.Key("www"),
+		},
+		{
+			// [ddd, www)
+			expectSetBounds: false,
+			setUpperOnly:    true,
+			ub:              roachpb.Key("www"),
+		},
+		{
+			// [ddd, xxx)
+			expectSetBounds: true,
+			setUpperOnly:    true,
+			ub:              roachpb.Key("xxx"),
+		},
+		{
+			// [aaa, bbb)
+			expectSetBounds: true,
+			lb:              roachpb.Key("aaa"),
+			ub:              roachpb.Key("bbb"),
+		},
+		{
+			// [ccc, ddd)
+			expectSetBounds: true,
+			lb:              roachpb.Key("ccc"),
+			ub:              roachpb.Key("ddd"),
+		},
+		{
+			// [ccc, nil)
+			expectSetBounds: true,
+			lb:              roachpb.Key("ccc"),
+		},
+		{
+			// [ccc, nil)
+			expectSetBounds: false,
+			lb:              roachpb.Key("ccc"),
+		},
+	}
+	var lb, ub roachpb.Key
+	for _, c := range tc {
+		t.Run(fmt.Sprintf("%v", c), func(t *testing.T) {
+			checker.expectSetBounds = c.expectSetBounds
+			checker.t = t
+			if c.setUpperOnly {
+				iter.SetUpperBound(c.ub)
+				ub = c.ub
+			} else {
+				iter.setBounds(c.lb, c.ub)
+				lb, ub = c.lb, c.ub
+			}
+			require.False(t, checker.expectSetBounds)
+			for i, bound := range [][]byte{lb, ub} {
+				if (bound == nil) != (checker.boundsSlicesCopied[i] == nil) {
+					t.Fatalf("inconsistent nil %d", i)
+				}
+				if bound != nil {
+					expected := append([]byte(nil), bound...)
+					expected = append(expected, 0x00)
+					if !bytes.Equal(expected, checker.boundsSlicesCopied[i]) {
+						t.Fatalf("expected: %x, actual: %x", expected, checker.boundsSlicesCopied[i])
+					}
+				}
+			}
+		})
+	}
 }
 
 func makeMVCCKey(a string) MVCCKey {
@@ -296,6 +434,90 @@ func TestPebbleDiskSlowEmit(t *testing.T) {
 	p.eventListener.DiskSlow(pebble.DiskSlowInfo{Duration: 70 * time.Second})
 	require.Equal(t, uint64(1), p.diskSlowCount)
 	require.Equal(t, uint64(1), p.diskStallCount)
+}
+
+func TestPebbleIterConsistency(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	eng := createTestPebbleEngine()
+	defer eng.Close()
+	ts1 := hlc.Timestamp{WallTime: 1}
+	ts2 := hlc.Timestamp{WallTime: 2}
+	k1 := MVCCKey{[]byte("a"), ts1}
+	require.NoError(t, eng.PutMVCC(k1, []byte("a1")))
+
+	roEngine := eng.NewReadOnly()
+	batch := eng.NewBatch()
+
+	require.False(t, eng.ConsistentIterators())
+	require.True(t, roEngine.ConsistentIterators())
+	require.True(t, batch.ConsistentIterators())
+
+	// Since an iterator is created on pebbleReadOnly, pebbleBatch before
+	// writing a newer version of "a", the newer version will not be visible to
+	// iterators that are created later.
+	roEngine.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("a")}).Close()
+	batch.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("a")}).Close()
+	eng.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("a")}).Close()
+
+	// Write a newer version of "a"
+	require.NoError(t, eng.PutMVCC(MVCCKey{[]byte("a"), ts2}, []byte("a2")))
+
+	checkMVCCIter := func(iter MVCCIterator) {
+		iter.SeekGE(MVCCKey{Key: []byte("a")})
+		valid, err := iter.Valid()
+		require.Equal(t, true, valid)
+		require.NoError(t, err)
+		k := iter.UnsafeKey()
+		require.True(t, k1.Equal(k), "expected %s != actual %s", k1.String(), k.String())
+		iter.Next()
+		valid, err = iter.Valid()
+		require.False(t, valid)
+		require.NoError(t, err)
+		iter.Close()
+	}
+	checkEngineIter := func(iter EngineIterator) {
+		valid, err := iter.SeekEngineKeyGE(EngineKey{Key: []byte("a")})
+		require.Equal(t, true, valid)
+		require.NoError(t, err)
+		k, err := iter.UnsafeEngineKey()
+		require.NoError(t, err)
+		require.True(t, k.IsMVCCKey())
+		mvccKey, err := k.ToMVCCKey()
+		require.NoError(t, err)
+		require.True(
+			t, k1.Equal(mvccKey), "expected %s != actual %s", k1.String(), mvccKey.String())
+		valid, err = iter.NextEngineKey()
+		require.False(t, valid)
+		require.NoError(t, err)
+		iter.Close()
+	}
+
+	checkMVCCIter(roEngine.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("b")}))
+	checkMVCCIter(roEngine.NewMVCCIterator(MVCCKeyIterKind, IterOptions{Prefix: true}))
+	checkMVCCIter(batch.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("b")}))
+	checkMVCCIter(batch.NewMVCCIterator(MVCCKeyIterKind, IterOptions{Prefix: true}))
+
+	checkEngineIter(roEngine.NewEngineIterator(IterOptions{UpperBound: []byte("b")}))
+	checkEngineIter(roEngine.NewEngineIterator(IterOptions{Prefix: true}))
+	checkEngineIter(batch.NewEngineIterator(IterOptions{UpperBound: []byte("b")}))
+	checkEngineIter(batch.NewEngineIterator(IterOptions{Prefix: true}))
+
+	// The eng iterator will see both values.
+	iter := eng.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: []byte("b")})
+	defer iter.Close()
+	iter.SeekGE(MVCCKey{Key: []byte("a")})
+	count := 0
+	for ; ; iter.Next() {
+		valid, err := iter.Valid()
+		require.NoError(t, err)
+		if !valid {
+			break
+		}
+		count++
+	}
+	require.Equal(t, 2, count)
 }
 
 func BenchmarkMVCCKeyCompare(b *testing.B) {

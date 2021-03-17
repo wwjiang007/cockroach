@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -93,18 +94,27 @@ func (p *planner) AlterSchema(ctx context.Context, n *tree.AlterSchema) (planNod
 func (n *alterSchemaNode) startExec(params runParams) error {
 	switch t := n.n.Cmd.(type) {
 	case *tree.AlterSchemaRename:
-		oldName := n.desc.Name
 		newName := string(t.NewName)
+
+		oldQualifiedSchemaName, err := params.p.getQualifiedSchemaName(params.ctx, n.desc)
+		if err != nil {
+			return err
+		}
+
 		if err := params.p.renameSchema(
 			params.ctx, n.db, n.desc, newName, tree.AsStringWithFQNames(n.n, params.Ann()),
 		); err != nil {
 			return err
 		}
+
+		newQualifiedSchemaName, err := params.p.getQualifiedSchemaName(params.ctx, n.desc)
+		if err != nil {
+			return err
+		}
+
 		return params.p.logEvent(params.ctx, n.desc.ID, &eventpb.RenameSchema{
-			// TODO(knz): This name is insufficiently qualified.
-			// See: https://github.com/cockroachdb/cockroach/issues/57738
-			SchemaName:    oldName,
-			NewSchemaName: newName,
+			SchemaName:    oldQualifiedSchemaName.String(),
+			NewSchemaName: newQualifiedSchemaName.String(),
 		})
 	case *tree.AlterSchemaOwner:
 		newOwner := t.Owner
@@ -122,15 +132,15 @@ func (p *planner) alterSchemaOwner(
 	newOwner security.SQLUsername,
 	jobDescription string,
 ) error {
-	privs := scDesc.GetPrivileges()
-
-	// If the owner we want to set to is the current owner, do a no-op.
-	if newOwner == privs.Owner() {
-		return nil
-	}
+	oldOwner := scDesc.GetPrivileges().Owner()
 
 	if err := p.checkCanAlterSchemaAndSetNewOwner(ctx, scDesc, newOwner); err != nil {
 		return err
+	}
+
+	// If the owner we want to set to is the current owner, do a no-op.
+	if newOwner == oldOwner {
+		return nil
 	}
 
 	return p.writeSchemaDescChange(ctx, scDesc, jobDescription)
@@ -158,12 +168,15 @@ func (p *planner) checkCanAlterSchemaAndSetNewOwner(
 	privs := scDesc.GetPrivileges()
 	privs.SetOwner(newOwner)
 
+	qualifiedSchemaName, err := p.getQualifiedSchemaName(ctx, scDesc)
+	if err != nil {
+		return err
+	}
+
 	return p.logEvent(ctx,
 		scDesc.GetID(),
 		&eventpb.AlterSchemaOwner{
-			// TODO(knz): This name is insufficiently qualified.
-			// See: https://github.com/cockroachdb/cockroach/issues/57738
-			SchemaName: scDesc.GetName(),
+			SchemaName: qualifiedSchemaName.String(),
 			Owner:      newOwner.Normalized(),
 		})
 }
@@ -172,12 +185,12 @@ func (p *planner) renameSchema(
 	ctx context.Context, db *dbdesc.Mutable, desc *schemadesc.Mutable, newName string, jobDesc string,
 ) error {
 	// Check that there isn't a name collision with the new name.
-	found, err := p.schemaExists(ctx, db.ID, newName)
+	found, _, err := schemaExists(ctx, p.txn, p.ExecCfg().Codec, db.ID, newName)
 	if err != nil {
 		return err
 	}
 	if found {
-		return pgerror.Newf(pgcode.DuplicateSchema, "schema %q already exists", newName)
+		return sqlerrors.NewSchemaAlreadyExistsError(newName)
 	}
 
 	// Ensure that the new name is a valid schema name.

@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/errors"
@@ -303,6 +304,9 @@ func MakeExternalStorage(
 	ie *sql.InternalExecutor,
 	kvDB *kv.DB,
 ) (cloud.ExternalStorage, error) {
+	if conf.DisableOutbound && dest.Provider != roachpb.ExternalStorageProvider_FileTable {
+		return nil, errors.New("external network access is disabled")
+	}
 	switch dest.Provider {
 	case roachpb.ExternalStorageProvider_LocalFile:
 		telemetry.Count("external-io.nodelocal")
@@ -376,7 +380,7 @@ func AccessIsWithExplicitAuth(path string) (bool, string, error) {
 	switch uri.Scheme {
 	case "s3":
 		auth := uri.Query().Get(AuthParam)
-		hasExplicitAuth = auth == AuthParamSpecified
+		hasExplicitAuth = auth == AuthParamSpecified || auth == ""
 
 		// If a custom endpoint has been specified in the S3 URI then this is no
 		// longer an explicit AUTH.
@@ -407,7 +411,9 @@ var (
 	// operations.
 	GcsDefault = settings.RegisterStringSetting(
 		CloudstorageGSDefaultKey,
-		"if set, JSON key to use during Google Cloud Storage operations",
+		"[deprecated] if set, JSON key to use during Google Cloud Storage operations. "+
+			"This setting will be removed in "+
+			"21.2, as we will no longer support the `default` AUTH mode for GCS operations.",
 		"",
 	).WithPublic()
 	httpCustomCA = settings.RegisterStringSetting(
@@ -492,3 +498,67 @@ const MaxDelayedRetryAttempts = 3
 // Maximum number of times we can attempt to retry reading from external storage,
 // without making any progress.
 const maxNoProgressReads = 3
+
+type openStreamAt func(ctx context.Context, pos int64) (io.ReadCloser, error)
+
+// resumingReader is a reader which retries reads in case of a transient errors.
+type resumingReader struct {
+	ctx    context.Context // Reader context
+	opener openStreamAt    // Get additional content
+	reader io.ReadCloser   // Currently opened reader
+	pos    int64           // How much data was received so far
+}
+
+var _ io.ReadCloser = &resumingReader{}
+
+func (r *resumingReader) openStream() error {
+	return delayedRetry(r.ctx, func() error {
+		var readErr error
+		r.reader, readErr = r.opener(r.ctx, r.pos)
+		return readErr
+	})
+}
+
+func (r *resumingReader) Read(p []byte) (int, error) {
+	var lastErr error
+	for retries := 0; lastErr == nil; retries++ {
+		if r.reader == nil {
+			lastErr = r.openStream()
+		}
+
+		if lastErr == nil {
+			n, readErr := r.reader.Read(p)
+			if readErr == nil || readErr == io.EOF {
+				r.pos += int64(n)
+				return n, readErr
+			}
+			lastErr = readErr
+		}
+
+		if !errors.IsAny(lastErr, io.EOF, io.ErrUnexpectedEOF) {
+			log.Errorf(r.ctx, "Read err: %s", lastErr)
+		}
+
+		if isResumableHTTPError(lastErr) {
+			if retries >= maxNoProgressReads {
+				return 0, errors.Wrap(lastErr, "multiple Read calls return no data")
+			}
+			log.Errorf(r.ctx, "Retry IO: error %s", lastErr)
+			lastErr = nil
+			r.reader = nil
+		}
+	}
+
+	// NB: Go says Read() callers need to expect n > 0 *and* non-nil error, and do
+	// something with what was read before the error, but this mostly applies to
+	// err = EOF case which we handle above, so likely OK that we're discarding n
+	// here and pretending it was zero.
+	return 0, lastErr
+}
+
+func (r *resumingReader) Close() error {
+	if r.reader != nil {
+		return r.reader.Close()
+	}
+	return nil
+}

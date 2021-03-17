@@ -9,7 +9,9 @@ go_library(
         "//pkg/keys",
         "//pkg/roachpb",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/contentionpb",
         "//pkg/util/cache",
+        "//pkg/util/syncutil",
         "//pkg/util/uuid",
         "@com_github_biogo_store//llrb",
     ],
@@ -17,15 +19,24 @@ go_library(
 
 go_test(
     name = "contention_test",
-    srcs = ["registry_test.go"],
+    size = "small",
+    srcs = [
+        "registry_test.go",
+        "utils_test.go",
+    ],
     data = glob(["testdata/**"]),
     embed = [":contention"],
     deps = [
         "//pkg/keys",
         "//pkg/roachpb",
+        "//pkg/sql/contentionpb",
         "//pkg/storage/enginepb",
+        "//pkg/util/cache",
         "//pkg/util/encoding",
+        "//pkg/util/leaktest",
+        "//pkg/util/randutil",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_datadriven//:datadriven",
+        "@com_github_stretchr_testify//require",
     ],
 )

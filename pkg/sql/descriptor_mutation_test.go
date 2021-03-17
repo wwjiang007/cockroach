@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -85,7 +86,7 @@ func (mt mutationTest) makeMutationsActive(ctx context.Context) {
 	}
 	mt.tableDesc.Mutations = nil
 	mt.tableDesc.Version++
-	if err := mt.tableDesc.ValidateTable(ctx); err != nil {
+	if err := catalog.ValidateSelf(mt.tableDesc); err != nil {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
@@ -102,19 +103,19 @@ func (mt mutationTest) makeMutationsActive(ctx context.Context) {
 func (mt mutationTest) writeColumnMutation(
 	ctx context.Context, column string, m descpb.DescriptorMutation,
 ) {
-	col, _, err := mt.tableDesc.FindColumnByName(tree.Name(column))
+	col, err := mt.tableDesc.FindColumnWithName(tree.Name(column))
 	if err != nil {
 		mt.Fatal(err)
 	}
 	for i := range mt.tableDesc.Columns {
-		if col.ID == mt.tableDesc.Columns[i].ID {
+		if col.GetID() == mt.tableDesc.Columns[i].ID {
 			// Use [:i:i] to prevent reuse of existing slice, or outstanding refs
 			// to ColumnDescriptors may unexpectedly change.
 			mt.tableDesc.Columns = append(mt.tableDesc.Columns[:i:i], mt.tableDesc.Columns[i+1:]...)
 			break
 		}
 	}
-	m.Descriptor_ = &descpb.DescriptorMutation_Column{Column: col}
+	m.Descriptor_ = &descpb.DescriptorMutation_Column{Column: col.ColumnDesc()}
 	mt.writeMutation(ctx, m)
 }
 
@@ -145,7 +146,7 @@ func (mt mutationTest) writeMutation(ctx context.Context, m descpb.DescriptorMut
 	}
 	mt.tableDesc.Mutations = append(mt.tableDesc.Mutations, m)
 	mt.tableDesc.Version++
-	if err := mt.tableDesc.ValidateTable(ctx); err != nil {
+	if err := catalog.ValidateSelf(mt.tableDesc); err != nil {
 		mt.Fatal(err)
 	}
 	if err := mt.kvDB.Put(
@@ -455,21 +456,21 @@ CREATE INDEX allidx ON t.test (k, v);
 	// Check that a mutation can only be inserted with an explicit mutation state, and direction.
 	tableDesc = mTest.tableDesc
 	tableDesc.Mutations = []descpb.DescriptorMutation{{}}
-	if err := tableDesc.ValidateTable(ctx); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, and no column/index descriptor") {
+	if err := catalog.ValidateSelf(tableDesc); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, and no column/index descriptor") {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations = []descpb.DescriptorMutation{{Descriptor_: &descpb.DescriptorMutation_Column{Column: &tableDesc.Columns[len(tableDesc.Columns)-1]}}}
 	tableDesc.Columns = tableDesc.Columns[:len(tableDesc.Columns)-1]
-	if err := tableDesc.ValidateTable(ctx); !testutils.IsError(err, `mutation in state UNKNOWN, direction NONE, col "i", id 3`) {
+	if err := catalog.ValidateSelf(tableDesc); !testutils.IsError(err, `mutation in state UNKNOWN, direction NONE, col "i", id 3`) {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = descpb.DescriptorMutation_DELETE_ONLY
-	if err := tableDesc.ValidateTable(ctx); !testutils.IsError(err, `mutation in state DELETE_ONLY, direction NONE, col "i", id 3`) {
+	if err := catalog.ValidateSelf(tableDesc); !testutils.IsError(err, `mutation in state DELETE_ONLY, direction NONE, col "i", id 3`) {
 		t.Fatal(err)
 	}
 	tableDesc.Mutations[0].State = descpb.DescriptorMutation_UNKNOWN
 	tableDesc.Mutations[0].Direction = descpb.DescriptorMutation_DROP
-	if err := tableDesc.ValidateTable(ctx); !testutils.IsError(err, `mutation in state UNKNOWN, direction DROP, col "i", id 3`) {
+	if err := catalog.ValidateSelf(tableDesc); !testutils.IsError(err, `mutation in state UNKNOWN, direction DROP, col "i", id 3`) {
 		t.Fatal(err)
 	}
 }
@@ -480,20 +481,14 @@ func (mt mutationTest) writeIndexMutation(
 	ctx context.Context, index string, m descpb.DescriptorMutation,
 ) {
 	tableDesc := mt.tableDesc
-	idx, _, err := tableDesc.FindIndexByName(index)
+	idx, err := tableDesc.FindIndexWithName(index)
 	if err != nil {
 		mt.Fatal(err)
 	}
 	// The rewrite below potentially invalidates the original object with an overwrite.
 	// Clarify what's going on.
-	idxCopy := *idx
-	for i, index := range tableDesc.GetPublicNonPrimaryIndexes() {
-		if idxCopy.ID == index.ID {
-			tableDesc.RemovePublicNonPrimaryIndex(i + 1)
-			break
-		}
-	}
-
+	idxCopy := *idx.IndexDesc()
+	tableDesc.RemovePublicNonPrimaryIndex(idx.Ordinal())
 	m.Descriptor_ = &descpb.DescriptorMutation_Index{Index: &idxCopy}
 	mt.writeMutation(ctx, m)
 }
@@ -648,10 +643,10 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 
 	// Check that a mutation can only be inserted with an explicit mutation state.
 	tableDesc = mTest.tableDesc
-	indexIdx := len(tableDesc.GetPublicNonPrimaryIndexes())
-	tableDesc.Mutations = []descpb.DescriptorMutation{{Descriptor_: &descpb.DescriptorMutation_Index{Index: &tableDesc.GetPublicNonPrimaryIndexes()[indexIdx-1]}}}
-	tableDesc.RemovePublicNonPrimaryIndex(indexIdx)
-	if err := tableDesc.ValidateTable(ctx); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
+	index := tableDesc.PublicNonPrimaryIndexes()[len(tableDesc.PublicNonPrimaryIndexes())-1]
+	tableDesc.Mutations = []descpb.DescriptorMutation{{Descriptor_: &descpb.DescriptorMutation_Index{Index: index.IndexDesc()}}}
+	tableDesc.RemovePublicNonPrimaryIndex(index.Ordinal())
+	if err := catalog.ValidateSelf(tableDesc); !testutils.IsError(err, "mutation in state UNKNOWN, direction NONE, index foo, id 2") {
 		t.Fatal(err)
 	}
 }
@@ -1160,27 +1155,33 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR UNIQUE);
 		{"v", 4, descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY},
 	}
 
-	if len(tableDesc.Mutations) != len(expected) {
-		t.Fatalf("%d mutations, instead of expected %d", len(tableDesc.Mutations), len(expected))
+	if len(tableDesc.AllMutations()) != len(expected) {
+		t.Fatalf("%d mutations, instead of expected %d", len(tableDesc.AllMutations()), len(expected))
 	}
 
-	for i, m := range tableDesc.Mutations {
+	for i, m := range tableDesc.AllMutations() {
 		name := expected[i].name
-		if col := m.GetColumn(); col != nil {
-			if col.Name != name {
-				t.Errorf("%d entry: name %s, expected %s", i, col.Name, name)
+		if col := m.AsColumn(); col != nil {
+			if col.GetName() != name {
+				t.Errorf("%d entry: name %s, expected %s", i, col.GetName(), name)
 			}
 		}
-		if idx := m.GetIndex(); idx != nil {
-			if idx.Name != name {
-				t.Errorf("%d entry: name %s, expected %s", i, idx.Name, name)
+		if idx := m.AsIndex(); idx != nil {
+			if idx.GetName() != name {
+				t.Errorf("%d entry: name %s, expected %s", i, idx.GetName(), name)
 			}
 		}
-		if id := expected[i].id; m.MutationID != id {
-			t.Errorf("%d entry: id %d, expected %d", i, m.MutationID, id)
+		if id := expected[i].id; m.MutationID() != id {
+			t.Errorf("%d entry: id %d, expected %d", i, m.MutationID(), id)
 		}
-		if state := expected[i].state; m.State != state {
-			t.Errorf("%d entry: state %s, expected %s", i, m.State, state)
+		actualState := descpb.DescriptorMutation_UNKNOWN
+		if m.WriteAndDeleteOnly() {
+			actualState = descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY
+		} else if m.DeleteOnly() {
+			actualState = descpb.DescriptorMutation_DELETE_ONLY
+		}
+		if state := expected[i].state; actualState != state {
+			t.Errorf("%d entry: state %s, expected %s", i, actualState, state)
 		}
 	}
 }

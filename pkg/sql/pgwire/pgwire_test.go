@@ -556,7 +556,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.Results("users", "primary", false, 1, "username", "ASC", false, false),
 		}},
 		{"SHOW TABLES FROM system", []preparedQueryTest{
-			baseTest.Results("public", "comments", "table", gosql.NullString{}, gosql.NullString{}, gosql.NullString{}).Others(28),
+			baseTest.Results("public", "comments", "table", gosql.NullString{}, 0, gosql.NullString{}).Others(29),
 		}},
 		{"SHOW SCHEMAS FROM system", []preparedQueryTest{
 			baseTest.Results("crdb_internal", gosql.NullString{}).Others(4),
@@ -837,6 +837,14 @@ func TestPGPreparedQuery(t *testing.T) {
 	}
 	defer db.Close()
 
+	// Update the default AS OF time for querying the system.table_statistics
+	// table to create the crdb_internal.table_row_statistics table.
+	if _, err := db.Exec(
+		"SET CLUSTER SETTING sql.crdb_internal.table_row_statistics.as_of_time = '-1µs'",
+	); err != nil {
+		t.Fatal(err)
+	}
+
 	runTests := func(
 		t *testing.T,
 		query string,
@@ -1053,7 +1061,7 @@ func TestPGPreparedExec(t *testing.T) {
 			"CREATE TABLE d.public.t (i INT, s STRING, d INT)",
 			[]preparedExecTest{
 				baseTest,
-				baseTest.Error(`pq: relation "t" already exists`),
+				baseTest.Error(`pq: relation "d.public.t" already exists`),
 			},
 		},
 		{

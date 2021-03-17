@@ -11,7 +11,7 @@ go_library(
     deps = [
         "//pkg/col/coldata",
         "//pkg/col/colserde",
-        "//pkg/sql/colexecbase/colexecerror",
+        "//pkg/sql/colexecerror",
         "//pkg/sql/types",
         "//pkg/storage/fs",
         "//pkg/util/mon",
@@ -24,20 +24,23 @@ go_library(
 
 go_test(
     name = "colcontainer_test",
+    size = "small",
     srcs = [
         "diskqueue_test.go",
         "main_test.go",
         "partitionedqueue_test.go",
     ],
     deps = [
+        ":colcontainer",
         "//pkg/col/coldata",
         "//pkg/col/coldataext",
         "//pkg/col/coldatatestutils",
         "//pkg/settings/cluster",
-        "//pkg/sql/colcontainer",
-        "//pkg/sql/colexecbase",
+        "//pkg/sql/colexecop",
         "//pkg/sql/colmem",
         "//pkg/sql/execinfra",
+        "//pkg/sql/pgwire/pgcode",
+        "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/types",
         "//pkg/storage/fs",
         "//pkg/testutils/colcontainerutils",

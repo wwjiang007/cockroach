@@ -10,7 +10,7 @@ CREATE TABLE test."" (id INT PRIMARY KEY)
 statement ok
 CREATE TABLE test.a (id INT PRIMARY KEY)
 
-statement error pgcode 42P07 relation "a" already exists
+statement error pgcode 42P07 relation "test.public.a" already exists
 CREATE TABLE test.a (id INT PRIMARY KEY)
 
 statement ok
@@ -19,7 +19,7 @@ SET DATABASE = test
 statement error invalid table name: ""
 CREATE TABLE "" (id INT PRIMARY KEY)
 
-statement error pgcode 42P07 relation "a" already exists
+statement error pgcode 42P07 relation "test.public.a" already exists
 CREATE TABLE a (id INT PRIMARY KEY)
 
 statement error duplicate column name: "id"
@@ -481,6 +481,8 @@ SHOW CREATE TABLE test.null_default
 ----
 test.public.null_default  CREATE TABLE public.null_default (
                           ts TIMESTAMP NULL,
+                          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+                          CONSTRAINT "primary" PRIMARY KEY (rowid ASC),
                           FAMILY "primary" (ts, rowid)
 )
 
@@ -535,6 +537,7 @@ select table_name, estimated_row_count from crdb_internal.table_row_statistics;
 ----
 backward_dependencies                  NULL
 builtin_functions                      NULL
+cluster_contention_events              NULL
 cluster_database_privileges            NULL
 cluster_queries                        NULL
 cluster_sessions                       NULL
@@ -542,6 +545,7 @@ cluster_settings                       NULL
 cluster_transactions                   NULL
 create_statements                      NULL
 create_type_statements                 NULL
+cross_db_references                    NULL
 databases                              NULL
 feature_usage                          NULL
 forward_dependencies                   NULL
@@ -550,12 +554,15 @@ gossip_liveness                        NULL
 gossip_network                         NULL
 gossip_nodes                           NULL
 index_columns                          NULL
+interleaved                            NULL
 invalid_objects                        NULL
 jobs                                   NULL
 kv_node_status                         NULL
 kv_store_status                        NULL
 leases                                 NULL
 node_build_info                        NULL
+node_contention_events                 NULL
+node_inflight_trace_spans              NULL
 node_metrics                           NULL
 node_queries                           NULL
 node_runtime_info                      NULL
@@ -605,55 +612,85 @@ user_privileges                        NULL
 views                                  NULL
 pg_aggregate                           NULL
 pg_am                                  NULL
+pg_amop                                NULL
+pg_amproc                              NULL
 pg_attrdef                             NULL
 pg_attribute                           NULL
 pg_auth_members                        NULL
 pg_authid                              NULL
+pg_available_extension_versions        NULL
 pg_available_extensions                NULL
 pg_cast                                NULL
 pg_class                               NULL
 pg_collation                           NULL
+pg_config                              NULL
 pg_constraint                          NULL
 pg_conversion                          NULL
+pg_cursors                             NULL
 pg_database                            NULL
+pg_db_role_setting                     NULL
 pg_default_acl                         NULL
 pg_depend                              NULL
 pg_description                         NULL
 pg_enum                                NULL
 pg_event_trigger                       NULL
 pg_extension                           NULL
+pg_file_settings                       NULL
 pg_foreign_data_wrapper                NULL
 pg_foreign_server                      NULL
 pg_foreign_table                       NULL
+pg_group                               NULL
+pg_hba_file_rules                      NULL
 pg_index                               NULL
 pg_indexes                             NULL
 pg_inherits                            NULL
 pg_language                            NULL
+pg_largeobject                         NULL
 pg_locks                               NULL
 pg_matviews                            NULL
 pg_namespace                           NULL
 pg_opclass                             NULL
 pg_operator                            NULL
+pg_opfamily                            NULL
+pg_policies                            NULL
 pg_prepared_statements                 NULL
 pg_prepared_xacts                      NULL
 pg_proc                                NULL
+pg_publication                         NULL
+pg_publication_rel                     NULL
+pg_publication_tables                  NULL
 pg_range                               NULL
+pg_replication_origin                  NULL
 pg_rewrite                             NULL
 pg_roles                               NULL
+pg_rules                               NULL
 pg_seclabel                            NULL
 pg_seclabels                           NULL
 pg_sequence                            NULL
 pg_settings                            NULL
+pg_shadow                              NULL
 pg_shdepend                            NULL
 pg_shdescription                       NULL
+pg_shmem_allocations                   NULL
 pg_shseclabel                          NULL
 pg_stat_activity                       NULL
+pg_statistic_ext                       NULL
+pg_subscription                        NULL
 pg_tables                              NULL
 pg_tablespace                          NULL
+pg_timezone_abbrevs                    NULL
+pg_timezone_names                      NULL
+pg_transform                           NULL
 pg_trigger                             NULL
+pg_ts_config                           NULL
+pg_ts_config_map                       NULL
+pg_ts_dict                             NULL
+pg_ts_parser                           NULL
+pg_ts_template                         NULL
 pg_type                                NULL
 pg_user                                NULL
 pg_user_mapping                        NULL
+pg_user_mappings                       NULL
 pg_views                               NULL
 geography_columns                      NULL
 geometry_columns                       NULL
@@ -680,3 +717,53 @@ SELECT estimated_row_count FROM [SHOW TABLES from rowtest] where table_name = 't
 1000
 
 user root
+
+# Unit test for #60737
+
+statement ok
+CREATE TABLE t1  (a INT PRIMARY KEY, b INT)
+
+statement ok
+CREATE TYPE t2 as enum('foo')
+
+# Case 1: Both t1's are tables and the old one is being dropped.
+statement ok
+BEGIN
+
+statement ok
+DROP TABLE t1
+
+statement error pgcode 55000 table "t1" is being dropped, try again later
+CREATE TABLE IF NOT EXISTS t1 (a INT PRIMARY KEY, b INT)
+
+statement ok
+END
+
+# Case 2: Both t2's are different types and the old one is being dropped.
+statement ok
+BEGIN
+
+statement ok
+DROP TYPE t2
+
+statement error pgcode 42809 "t2" is not a table
+CREATE TABLE IF NOT EXISTS t2 (a INT PRIMARY KEY, b INT)
+
+statement ok
+END
+
+# Case 3: Both s2's are a different type
+statement ok
+BEGIN
+
+statement error pgcode 42809 "t2" is not a table
+CREATE TABLE IF NOT EXISTS t2 (a INT PRIMARY KEY, b INT)
+
+statement ok
+END
+
+statement ok
+DROP table t1
+
+statement ok
+DROP TYPE t2

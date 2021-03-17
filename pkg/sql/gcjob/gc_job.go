@@ -12,6 +12,7 @@ package gcjob
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -20,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -45,7 +45,7 @@ func SetSmallMaxGCIntervalForTest() func() {
 }
 
 type schemaChangeGCResumer struct {
-	jobID int64
+	jobID jobspb.JobID
 }
 
 // performGC GCs any schema elements that are in the DELETING state and returns
@@ -56,6 +56,12 @@ func performGC(
 	details *jobspb.SchemaChangeGCDetails,
 	progress *jobspb.SchemaChangeGCProgress,
 ) error {
+	if details.Tenant != nil {
+		return errors.Wrapf(
+			gcTenant(ctx, execCfg, details.Tenant.ID, progress),
+			"attempting to GC tenant %+v", details.Tenant,
+		)
+	}
 	if details.Indexes != nil {
 		return errors.Wrap(gcIndexes(ctx, execCfg, details.ParentID, progress), "attempting to GC indexes")
 	} else if details.Tables != nil {
@@ -74,9 +80,7 @@ func performGC(
 }
 
 // Resume is part of the jobs.Resumer interface.
-func (r schemaChangeGCResumer) Resume(
-	ctx context.Context, execCtx interface{}, _ chan<- tree.Datums,
-) error {
+func (r schemaChangeGCResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	p := execCtx.(sql.JobExecContext)
 	// TODO(pbardea): Wait for no versions.
 	execCfg := p.ExecCfg()
@@ -101,7 +105,7 @@ func (r schemaChangeGCResumer) Resume(
 		if err := sql.TruncateInterleavedIndexes(
 			ctx,
 			execCfg,
-			tabledesc.NewImmutable(*details.InterleavedTable),
+			tabledesc.NewBuilder(details.InterleavedTable).BuildImmutableTable(),
 			details.InterleavedIndexes,
 		); err != nil {
 			return err
@@ -130,18 +134,31 @@ func (r schemaChangeGCResumer) Resume(
 			return ctx.Err()
 		}
 
-		// Refresh the status of all tables in case any GC TTLs have changed.
-		remainingTables := getAllTablesWaitingForGC(details, progress)
-		expired, earliestDeadline := refreshTables(ctx, execCfg, remainingTables, tableDropTimes, indexDropTimes, r.jobID, progress)
+		// Refresh the status of all elements in case any GC TTLs have changed.
+		var expired bool
+		earliestDeadline := timeutil.Unix(0, math.MaxInt64)
+		if details.Tenant == nil {
+			remainingTables := getAllTablesWaitingForGC(details, progress)
+			expired, earliestDeadline = refreshTables(
+				ctx, execCfg, remainingTables, tableDropTimes, indexDropTimes, r.jobID, progress,
+			)
+		} else {
+			expired, earliestDeadline = refreshTenant(ctx, execCfg, details.Tenant.DropTime, details, progress)
+		}
 		timerDuration := time.Until(earliestDeadline)
 
 		if expired {
 			// Some elements have been marked as DELETING so save the progress.
-			persistProgress(ctx, execCfg, r.jobID, progress)
+			persistProgress(ctx, execCfg, r.jobID, progress, runningStatusGC(progress))
+			if fn := execCfg.GCJobTestingKnobs.RunBeforePerformGC; fn != nil {
+				if err := fn(r.jobID); err != nil {
+					return err
+				}
+			}
 			if err := performGC(ctx, execCfg, details, progress); err != nil {
 				return err
 			}
-			persistProgress(ctx, execCfg, r.jobID, progress)
+			persistProgress(ctx, execCfg, r.jobID, progress, sql.RunningStatusWaitingGC)
 
 			// Trigger immediate re-run in case of more expired elements.
 			timerDuration = 0
@@ -167,7 +184,7 @@ func (r schemaChangeGCResumer) OnFailOrCancel(context.Context, interface{}) erro
 func init() {
 	createResumerFn := func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
 		return &schemaChangeGCResumer{
-			jobID: *job.ID(),
+			jobID: job.ID(),
 		}
 	}
 	jobs.RegisterConstructor(jobspb.TypeSchemaChangeGC, createResumerFn)

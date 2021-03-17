@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -98,7 +99,8 @@ func newReadImportDataProcessor(
 }
 
 // Start is part of the RowSource interface.
-func (idp *readImportDataProcessor) Start(ctx context.Context) context.Context {
+func (idp *readImportDataProcessor) Start(ctx context.Context) {
+	ctx = idp.StartInternal(ctx, readImportDataProcessorName)
 	// We don't have to worry about this go routine leaking because next we loop over progCh
 	// which is closed only after the go routine returns.
 	go func() {
@@ -106,7 +108,6 @@ func (idp *readImportDataProcessor) Start(ctx context.Context) context.Context {
 		idp.summary, idp.importErr = runImport(ctx, idp.flowCtx, &idp.spec, idp.progCh,
 			idp.seqChunkProvider)
 	}()
-	return idp.StartInternal(ctx, readImportDataProcessorName)
 }
 
 // Next is part of the RowSource interface.
@@ -134,21 +135,15 @@ func (idp *readImportDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Pro
 	// Once the import is done, send back to the controller the serialized
 	// summary of the import operation. For more info see roachpb.BulkOpSummary.
 	countsBytes, err := protoutil.Marshal(idp.summary)
+	idp.MoveToDraining(err)
 	if err != nil {
-		idp.MoveToDraining(err)
 		return nil, idp.DrainHelper()
 	}
 
-	idp.MoveToDraining(nil /* err */)
 	return rowenc.EncDatumRow{
 		rowenc.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(countsBytes))),
 		rowenc.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes([]byte{}))),
-	}, idp.DrainHelper()
-}
-
-// ConsumerDone is part of the RowSource interface.
-func (idp *readImportDataProcessor) ConsumerDone() {
-	idp.MoveToDraining(nil /* err */)
+	}, nil
 }
 
 // ConsumerClosed is part of the RowSource interface.
@@ -173,11 +168,11 @@ func makeInputConverter(
 	seqChunkProvider *row.SeqChunkProvider,
 ) (inputConverter, error) {
 	injectTimeIntoEvalCtx(evalCtx, spec.WalltimeNanos)
-	var singleTable *tabledesc.Immutable
+	var singleTable catalog.TableDescriptor
 	var singleTableTargetCols tree.NameList
 	if len(spec.Tables) == 1 {
 		for _, table := range spec.Tables {
-			singleTable = tabledesc.NewImmutable(*table.Desc)
+			singleTable = tabledesc.NewBuilder(table.Desc).BuildImmutableTable()
 			singleTableTargetCols = make(tree.NameList, len(table.TargetCols))
 			for i, colName := range table.TargetCols {
 				singleTableTargetCols[i] = tree.Name(colName)
@@ -190,11 +185,10 @@ func makeInputConverter(
 	}
 
 	if singleTable != nil {
-		indexes := singleTable.DeletableIndexes()
-		for _, idx := range indexes {
-			if idx.IsPartial() {
-				return nil, unimplemented.NewWithIssue(50225, "cannot import into table with partial indexes")
-			}
+		if idx := catalog.FindDeletableNonPrimaryIndex(singleTable, func(idx catalog.Index) bool {
+			return idx.IsPartial()
+		}); idx != nil {
+			return nil, unimplemented.NewWithIssue(50225, "cannot import into table with partial indexes")
 		}
 
 		// If we're using a format like CSV where data columns are not "named", and

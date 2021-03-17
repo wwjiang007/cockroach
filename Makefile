@@ -20,6 +20,10 @@
 # double-hash (##) comments throughout this Makefile. Please submit
 # improvements!
 
+ifneq (,$(findstring v3.,v$(MAKE_VERSION)))
+$(info $(yellow)Warning: your version of `make` seems old; your build may fail!$(term-reset))
+endif
+
 # We need to define $(GO) early because it's needed for defs.mk.
 GO      ?= go
 # xgo is needed also for defs.mk.
@@ -625,8 +629,9 @@ $(KRB5_DIR)/Makefile: $(C_DEPS_DIR)/krb5-rebuild $(KRB5_SRC_DIR)/src/configure
 	mkdir -p $(KRB5_DIR)
 	@# NOTE: If you change the configure flags below, bump the version in
 	@# $(C_DEPS_DIR)/krb5-rebuild. See above for rationale.
-	@# If CFLAGS is set to -g1 then make will fail. Use "env -" to clear the environment.
-	cd $(KRB5_DIR) && env -u CFLAGS -u CXXFLAGS $(KRB5_SRC_DIR)/src/configure $(xconfigure-flags) --enable-static --disable-shared
+	@# If CFLAGS is set to -g1 then make will fail.
+	@# We specify -fcommon to get around duplicate definition errors in recent gcc.
+	cd $(KRB5_DIR) && env -u CXXFLAGS CFLAGS="-fcommon"  $(KRB5_SRC_DIR)/src/configure $(xconfigure-flags) --enable-static --disable-shared
 
 $(PROTOBUF_DIR)/Makefile: $(C_DEPS_DIR)/protobuf-rebuild | bin/.submodules-initialized
 	rm -rf $(PROTOBUF_DIR)
@@ -815,6 +820,9 @@ SQLPARSER_TARGETS = \
 	pkg/sql/lex/keywords.go \
 	pkg/sql/lexbase/reserved_keywords.go
 
+WKTPARSER_TARGETS = \
+	pkg/geo/wkt/wkt.go
+
 PROTOBUF_TARGETS := bin/.go_protobuf_sources bin/.gw_protobuf_sources
 
 DOCGEN_TARGETS := \
@@ -822,6 +830,8 @@ DOCGEN_TARGETS := \
 	bin/.docgen_functions \
 	docs/generated/redact_safe.md \
 	bin/.docgen_http \
+	bin/.docgen_logformats \
+	docs/generated/logsinks.md \
 	docs/generated/logging.md \
 	docs/generated/eventlog.md
 
@@ -830,47 +840,17 @@ EXECGEN_TARGETS = \
   pkg/sql/colconv/datum_to_vec.eg.go \
   pkg/sql/colconv/vec_to_datum.eg.go \
   pkg/sql/colexec/and_or_projection.eg.go \
-  pkg/sql/colexec/cast.eg.go \
-  pkg/sql/colexec/const.eg.go \
-  pkg/sql/colexec/default_cmp_expr.eg.go \
-  pkg/sql/colexec/default_cmp_proj_ops.eg.go \
-  pkg/sql/colexec/default_cmp_sel_ops.eg.go \
-  pkg/sql/colexec/distinct.eg.go \
-  pkg/sql/colexec/hashjoiner.eg.go \
-  pkg/sql/colexec/hashtable_distinct.eg.go \
-  pkg/sql/colexec/hashtable_full_default.eg.go \
-  pkg/sql/colexec/hashtable_full_deleting.eg.go \
   pkg/sql/colexec/hash_aggregator.eg.go \
-  pkg/sql/colexec/hash_utils.eg.go \
   pkg/sql/colexec/is_null_ops.eg.go \
-  pkg/sql/colexec/like_ops.eg.go \
-  pkg/sql/colexec/mergejoinbase.eg.go \
-  pkg/sql/colexec/mergejoiner_exceptall.eg.go \
-  pkg/sql/colexec/mergejoiner_fullouter.eg.go \
-  pkg/sql/colexec/mergejoiner_inner.eg.go \
-  pkg/sql/colexec/mergejoiner_intersectall.eg.go \
-  pkg/sql/colexec/mergejoiner_leftanti.eg.go \
-  pkg/sql/colexec/mergejoiner_leftouter.eg.go \
-  pkg/sql/colexec/mergejoiner_leftsemi.eg.go \
-  pkg/sql/colexec/mergejoiner_rightanti.eg.go \
-  pkg/sql/colexec/mergejoiner_rightouter.eg.go \
-  pkg/sql/colexec/mergejoiner_rightsemi.eg.go \
   pkg/sql/colexec/ordered_synchronizer.eg.go \
-  pkg/sql/colexec/proj_const_left_ops.eg.go \
-  pkg/sql/colexec/proj_const_right_ops.eg.go \
-  pkg/sql/colexec/proj_non_const_ops.eg.go \
   pkg/sql/colexec/quicksort.eg.go \
-  pkg/sql/colexec/rank.eg.go \
-  pkg/sql/colexec/relative_rank.eg.go \
-  pkg/sql/colexec/row_number.eg.go \
   pkg/sql/colexec/rowstovec.eg.go \
-  pkg/sql/colexec/selection_ops.eg.go \
   pkg/sql/colexec/select_in.eg.go \
   pkg/sql/colexec/sort.eg.go \
+  pkg/sql/colexec/sort_partitioner.eg.go \
   pkg/sql/colexec/substring.eg.go \
   pkg/sql/colexec/values_differ.eg.go \
   pkg/sql/colexec/vec_comparators.eg.go \
-  pkg/sql/colexec/window_peer_grouper.eg.go \
   pkg/sql/colexec/colexecagg/hash_any_not_null_agg.eg.go \
   pkg/sql/colexec/colexecagg/hash_avg_agg.eg.go \
   pkg/sql/colexec/colexecagg/hash_bool_and_or_agg.eg.go \
@@ -888,7 +868,40 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/colexecagg/ordered_default_agg.eg.go \
   pkg/sql/colexec/colexecagg/ordered_min_max_agg.eg.go \
   pkg/sql/colexec/colexecagg/ordered_sum_agg.eg.go \
-  pkg/sql/colexec/colexecagg/ordered_sum_int_agg.eg.go
+  pkg/sql/colexec/colexecagg/ordered_sum_int_agg.eg.go \
+  pkg/sql/colexec/colexecbase/cast.eg.go \
+  pkg/sql/colexec/colexecbase/const.eg.go \
+  pkg/sql/colexec/colexecbase/distinct.eg.go \
+  pkg/sql/colexec/colexeccmp/default_cmp_expr.eg.go \
+  pkg/sql/colexec/colexechash/hashtable_distinct.eg.go \
+  pkg/sql/colexec/colexechash/hashtable_full_default.eg.go \
+  pkg/sql/colexec/colexechash/hashtable_full_deleting.eg.go \
+  pkg/sql/colexec/colexechash/hash_utils.eg.go \
+  pkg/sql/colexec/colexecjoin/crossjoiner.eg.go \
+  pkg/sql/colexec/colexecjoin/hashjoiner.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoinbase.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoiner_exceptall.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoiner_fullouter.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoiner_inner.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoiner_intersectall.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoiner_leftanti.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoiner_leftouter.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoiner_leftsemi.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoiner_rightanti.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoiner_rightouter.eg.go \
+  pkg/sql/colexec/colexecjoin/mergejoiner_rightsemi.eg.go \
+  pkg/sql/colexec/colexecproj/default_cmp_proj_ops.eg.go \
+  pkg/sql/colexec/colexecproj/proj_const_left_ops.eg.go \
+  pkg/sql/colexec/colexecproj/proj_const_right_ops.eg.go \
+  pkg/sql/colexec/colexecproj/proj_like_ops.eg.go \
+  pkg/sql/colexec/colexecproj/proj_non_const_ops.eg.go \
+  pkg/sql/colexec/colexecsel/default_cmp_sel_ops.eg.go \
+  pkg/sql/colexec/colexecsel/selection_ops.eg.go \
+  pkg/sql/colexec/colexecsel/sel_like_ops.eg.go \
+  pkg/sql/colexec/colexecwindow/rank.eg.go \
+  pkg/sql/colexec/colexecwindow/relative_rank.eg.go \
+  pkg/sql/colexec/colexecwindow/row_number.eg.go \
+  pkg/sql/colexec/colexecwindow/window_peer_grouper.eg.go
 
 OPTGEN_TARGETS = \
 	pkg/sql/opt/memo/expr.og.go \
@@ -903,7 +916,8 @@ OPTGEN_TARGETS = \
 test-targets := \
 	check test testshort testslow testrace testraceslow testbuild \
 	stress stressrace \
-	roachprod-stress roachprod-stressrace
+	roachprod-stress roachprod-stressrace \
+	testlogic testbaselogic testccllogic testoptlogic
 
 go-targets-ccl := \
 	$(COCKROACH) \
@@ -963,7 +977,15 @@ $(go-targets): override LINKFLAGS += \
 $(COCKROACH) $(COCKROACHOSS) go-install: override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.utcTime=$(shell date -u '+%Y/%m/%d %H:%M:%S')"
 
-SETTINGS_DOC_PAGE := docs/generated/settings/settings.html
+settings-doc-gen = $(if $(filter buildshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),$(COCKROACH))
+
+docs/generated/settings/settings.html: $(settings-doc-gen)
+	@$(settings-doc-gen) gen settings-list --format=html > $@
+
+docs/generated/settings/settings-for-tenants.txt:  $(settings-doc-gen)
+	@$(settings-doc-gen) gen settings-list --without-system-only > $@
+
+SETTINGS_DOC_PAGES := docs/generated/settings/settings.html docs/generated/settings/settings-for-tenants.txt
 
 # Note: We pass `-v` to `go build` and `go test -i` so that warnings
 # from the linker aren't suppressed. The usage of `-v` also shows when
@@ -994,7 +1016,7 @@ build: $(COCKROACH)
 buildoss: $(COCKROACHOSS)
 buildshort: $(COCKROACHSHORT)
 build buildoss buildshort: $(if $(is-cross-compile),,$(DOCGEN_TARGETS))
-build buildshort: $(if $(is-cross-compile),,$(SETTINGS_DOC_PAGE))
+build buildshort: $(if $(is-cross-compile),,$(SETTINGS_DOC_PAGES))
 
 # For historical reasons, symlink cockroach to cockroachshort.
 # TODO(benesch): see if it would break anyone's workflow to remove this.
@@ -1061,7 +1083,7 @@ roachprod-stress roachprod-stressrace: bin/roachprod-stress
 		exit 1; \
 	fi
 	build/builder.sh make bin/.bootstrap
-	build/builder.sh mkrelease amd64-linux-gnu test GOFLAGS="$(GOFLAGS)" TESTFLAGS="-v -c -o $(notdir $(patsubst %/,%,$(PKG))).test" PKG=$(PKG)
+	build/builder.sh mkrelease amd64-linux-gnu test GOFLAGS="$(GOFLAGS)" TESTFLAGS="-v -c -o $(notdir $(patsubst %/,%,$(PKG))).test" PKG=$(PKG) TAGS="$(TAGS)"
 	bin/roachprod-stress $(CLUSTER) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) $(STRESSFLAGS) -- \
 	  -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
 
@@ -1131,7 +1153,7 @@ dupl: bin/.bootstrap
 
 .PHONY: generate
 generate: ## Regenerate generated code.
-generate: protobuf $(DOCGEN_TARGETS) $(OPTGEN_TARGETS) $(LOG_TARGETS) $(SQLPARSER_TARGETS) $(SETTINGS_DOC_PAGE) bin/langgen bin/terraformgen
+generate: protobuf $(DOCGEN_TARGETS) $(OPTGEN_TARGETS) $(LOG_TARGETS) $(SQLPARSER_TARGETS) $(WKTPARSER_TARGETS) $(SETTINGS_DOC_PAGES) bin/langgen bin/terraformgen
 	$(GO) generate $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
 	$(MAKE) execgen
 
@@ -1311,7 +1333,6 @@ protos%.d.ts: protos%.js pkg/ui/yarn.installed
 	$(PBTS) $< >> $@
 
 STYLINT            := ./node_modules/.bin/stylint
-TSLINT             := ./node_modules/.bin/tslint
 TSC                := ./node_modules/.bin/tsc
 KARMA              := ./node_modules/.bin/karma
 WEBPACK            := ./node_modules/.bin/webpack
@@ -1332,10 +1353,8 @@ ui-topo: pkg/ui/yarn.installed
 .PHONY: ui-lint
 ui-lint: pkg/ui/yarn.installed $(UI_PROTOS_OSS) $(UI_PROTOS_CCL)
 	$(NODE_RUN) -C pkg/ui $(STYLINT) -c .stylintrc styl
-	$(NODE_RUN) -C pkg/ui $(TSLINT) -c tslint.json -p tsconfig.json
-	@# TODO(benesch): Invoke tslint just once when palantir/tslint#2827 is fixed.
-	$(NODE_RUN) -C pkg/ui $(TSLINT) -c tslint.json *.js
 	$(NODE_RUN) -C pkg/ui $(TSC)
+	$(NODE_RUN) -C pkg/ui yarn lint
 	@if $(NODE_RUN) -C pkg/ui yarn list | grep phantomjs; then echo ^ forbidden UI dependency >&2; exit 1; fi
 
 # DLLs are Webpack bundles, not Windows shared libraries. See "DLLs for speedy
@@ -1484,7 +1503,7 @@ pkg/sql/lexbase/reserved_keywords.go: pkg/sql/parser/sql.y pkg/sql/parser/reserv
 	gofmt -s -w $@
 
 pkg/sql/lex/keywords.go: pkg/sql/parser/sql.y pkg/sql/lex/allkeywords/main.go | bin/.bootstrap
-	go run -tags all-keywords pkg/sql/lex/allkeywords/main.go < $< > $@.tmp || rm $@.tmp
+	$(GO) run $(GOMODVENDORFLAGS) -tags all-keywords pkg/sql/lex/allkeywords/main.go < $< > $@.tmp || rm $@.tmp
 	mv -f $@.tmp $@
 	gofmt -s -w $@
 
@@ -1516,12 +1535,16 @@ bin/.docgen_functions: bin/docgen
 	docgen functions docs/generated/sql --quiet
 	touch $@
 
+bin/.docgen_logformats: bin/docgen
+	docgen logformats docs/generated/logformats.md
+	touch $@
+
 bin/.docgen_http: bin/docgen $(PROTOC)
 	docgen http \
 	--protoc $(PROTOC) \
 	--gendoc ./bin/protoc-gen-doc \
 	--out docs/generated/http \
-	--protobuf pkg:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH):$(ERRORS_PATH)
+	--protobuf pkg:./vendor/github.com:$(GOGO_PROTOBUF_PATH):$(PROTOBUF_PATH):$(COREOS_PATH):$(GRPC_GATEWAY_GOOGLEAPIS_PATH):$(ERRORS_PATH)
 	touch $@
 
 .PHONY: docs/generated/redact_safe.md
@@ -1544,40 +1567,43 @@ EVENTLOG_PROTOS = \
 	pkg/util/log/eventpb/privilege_events.proto \
 	pkg/util/log/eventpb/role_events.proto \
 	pkg/util/log/eventpb/zone_events.proto \
+	pkg/util/log/eventpb/session_events.proto \
+	pkg/util/log/eventpb/sql_audit_events.proto \
 	pkg/util/log/eventpb/cluster_events.proto
 
+LOGSINKDOC_DEP = pkg/util/log/logconfig/config.go
+
+docs/generated/logsinks.md: pkg/util/log/logconfig/gen.go $(LOGSINKDOC_DEP)
+	$(GO) run $(GOMODVENDORFLAGS) $< <$(LOGSINKDOC_DEP) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	mv -f $@.tmp $@
+
 docs/generated/eventlog.md: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
-	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $< eventlog.md $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	$(GO) run $(GOMODVENDORFLAGS) $< eventlog.md $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
 pkg/util/log/eventpb/eventlog_channels_generated.go: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
-	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $< eventlog_channels_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	$(GO) run $(GOMODVENDORFLAGS) $< eventlog_channels_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
 pkg/util/log/eventpb/json_encode_generated.go: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
-	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $< json_encode_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	$(GO) run $(GOMODVENDORFLAGS) $< json_encode_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
-docs/generated/logging.md: pkg/util/log/gen.go pkg/util/log/logpb/log.proto
-	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $^ logging.md $@.tmp || { rm -f $@.tmp; exit 1; }
+docs/generated/logging.md: pkg/util/log/gen/main.go pkg/util/log/logpb/log.proto
+	$(GO) run $(GOMODVENDORFLAGS) $^ logging.md $@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
-pkg/util/log/severity/severity_generated.go: pkg/util/log/gen.go pkg/util/log/logpb/log.proto
-	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $^ severity.go $@.tmp || { rm -f $@.tmp; exit 1; }
+pkg/util/log/severity/severity_generated.go: pkg/util/log/gen/main.go pkg/util/log/logpb/log.proto
+	$(GO) run $(GOMODVENDORFLAGS) $^ severity.go $@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
-pkg/util/log/channel/channel_generated.go: pkg/util/log/gen.go pkg/util/log/logpb/log.proto
-	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $^ channel.go $@.tmp || { rm -f $@.tmp; exit 1; }
+pkg/util/log/channel/channel_generated.go: pkg/util/log/gen/main.go pkg/util/log/logpb/log.proto
+	$(GO) run $(GOMODVENDORFLAGS) $^ channel.go $@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
-pkg/util/log/log_channels_generated.go: pkg/util/log/gen.go pkg/util/log/logpb/log.proto
-	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $^ log_channels.go $@.tmp || { rm -f $@.tmp; exit 1; }
+pkg/util/log/log_channels_generated.go: pkg/util/log/gen/main.go pkg/util/log/logpb/log.proto
+	$(GO) run $(GOMODVENDORFLAGS) $^ log_channels.go $@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
-
-settings-doc-gen := $(if $(filter buildshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),$(COCKROACH))
-
-$(SETTINGS_DOC_PAGE): $(settings-doc-gen)
-	@$(settings-doc-gen) gen settings-list --format=html > $@
 
 .PHONY: execgen
 execgen: ## Regenerate generated code for the vectorized execution engine.
@@ -1705,8 +1731,12 @@ bins = \
   bin/uptodate \
   bin/urlcheck \
 	bin/whoownsit \
-  bin/workload \
   bin/zerosum
+
+# `xbins` contains binaries that should be compiled for the target architecture
+# (not the host), and should therefore be built with `xgo`.
+xbins = \
+  bin/workload
 
 testbins = \
   bin/logictest \
@@ -1737,6 +1767,12 @@ $(bins): bin/%: bin/%.d | bin/prereqs bin/.submodules-initialized
 	mv -f $@.d.tmp $@.d
 	@$(GO_INSTALL) -v $(if $($*-package),$($*-package),./pkg/cmd/$*)
 
+$(xbins): bin/%: bin/%.d | bin/prereqs bin/.submodules-initialized
+	@echo go build -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -o $@ $*
+	bin/prereqs $(if $($*-package),$($*-package),./pkg/cmd/$*) > $@.d.tmp
+	mv -f $@.d.tmp $@.d
+	$(xgo) build -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -o $@ $(if $($*-package),$($*-package),./pkg/cmd/$*)
+
 $(testbins): bin/%: bin/%.d | bin/prereqs $(SUBMODULES_TARGET)
 	@echo go test -c $($*-package)
 	bin/prereqs -bin-name=$* -test $($*-package) > $@.d.tmp
@@ -1755,8 +1791,7 @@ fuzz: bin/fuzz
 # Short hand to re-generate all bazel BUILD files.
 bazel-generate: ## Generate all bazel BUILD files.
 	@echo 'Generating DEPS.bzl and BUILD files using gazelle'
-	@bazel run //:gazelle -- update-repos -from_file=go.mod -build_file_proto_mode=disable -to_macro=DEPS.bzl%go_deps
-	@bazel run //:gazelle -- -index=false
+	./build/bazelutil/bazel-generate.sh
 
 # No need to include all the dependency files if the user is just
 # requesting help or cleanup.

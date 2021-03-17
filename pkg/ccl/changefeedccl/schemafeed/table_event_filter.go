@@ -12,8 +12,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/errors"
 )
 
@@ -25,6 +24,7 @@ const (
 	tableEventTypeAddColumnWithBackfill
 	tableEventTypeDropColumn
 	tableEventTruncate
+	tableEventPrimaryKeyChange
 )
 
 var (
@@ -33,6 +33,7 @@ var (
 		tableEventTypeAddColumnWithBackfill: false,
 		tableEventTypeAddColumnNoBackfill:   true,
 		tableEventTypeUnknown:               true,
+		tableEventPrimaryKeyChange:          false,
 	}
 
 	columnChangeTableEventFilter = tableEventFilter{
@@ -40,6 +41,7 @@ var (
 		tableEventTypeAddColumnWithBackfill: false,
 		tableEventTypeAddColumnNoBackfill:   false,
 		tableEventTypeUnknown:               true,
+		tableEventPrimaryKeyChange:          false,
 	}
 
 	schemaChangeEventFilters = map[changefeedbase.SchemaChangeEventClass]tableEventFilter{
@@ -58,6 +60,8 @@ func classifyTableEvent(e TableEvent) tableEventType {
 		return tableEventTypeDropColumn
 	case tableTruncated(e):
 		return tableEventTruncate
+	case primaryKeyChanged(e):
+		return tableEventPrimaryKeyChange
 	default:
 		return tableEventTypeUnknown
 	}
@@ -71,7 +75,7 @@ func (b tableEventFilter) shouldFilter(ctx context.Context, e TableEvent) (bool,
 	et := classifyTableEvent(e)
 	// Truncation events are not ignored and return an error.
 	if et == tableEventTruncate {
-		return false, errors.Errorf(`"%s" was truncated`, e.Before.Name)
+		return false, errors.Errorf(`"%s" was truncated`, e.Before.GetName())
 	}
 	shouldFilter, ok := b[et]
 	if !ok {
@@ -83,13 +87,15 @@ func (b tableEventFilter) shouldFilter(ctx context.Context, e TableEvent) (bool,
 func hasNewColumnDropBackfillMutation(e TableEvent) (res bool) {
 	// Make sure that the old descriptor *doesn't* have the same mutation to avoid adding
 	// the same scan boundary more than once.
-	return !dropMutationExists(e.Before) && dropMutationExists(e.After)
+	return !dropColumnMutationExists(e.Before) && dropColumnMutationExists(e.After)
 }
 
-func dropMutationExists(desc *tabledesc.Immutable) bool {
-	for _, m := range desc.Mutations {
-		if m.Direction == descpb.DescriptorMutation_DROP &&
-			m.State == descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY {
+func dropColumnMutationExists(desc catalog.TableDescriptor) bool {
+	for _, m := range desc.AllMutations() {
+		if m.AsColumn() == nil {
+			continue
+		}
+		if m.Dropped() && m.WriteAndDeleteOnly() {
 			return true
 		}
 	}
@@ -99,18 +105,18 @@ func dropMutationExists(desc *tabledesc.Immutable) bool {
 func newColumnBackfillComplete(e TableEvent) (res bool) {
 	// TODO(ajwerner): What is the case where the before has a backfill mutation
 	// and the After doesn't? What about other queued mutations?
-	return len(e.Before.Columns) < len(e.After.Columns) &&
+	return len(e.Before.PublicColumns()) < len(e.After.PublicColumns()) &&
 		e.Before.HasColumnBackfillMutation() && !e.After.HasColumnBackfillMutation()
 }
 
 func newColumnNoBackfill(e TableEvent) (res bool) {
-	return len(e.Before.Columns) < len(e.After.Columns) &&
+	return len(e.Before.PublicColumns()) < len(e.After.PublicColumns()) &&
 		!e.Before.HasColumnBackfillMutation()
 }
 
-func pkChangeMutationExists(desc *tabledesc.Immutable) bool {
-	for _, m := range desc.Mutations {
-		if m.Direction == descpb.DescriptorMutation_ADD && m.GetPrimaryKeySwap() != nil {
+func pkChangeMutationExists(desc catalog.TableDescriptor) bool {
+	for _, m := range desc.AllMutations() {
+		if m.Adding() && m.AsPrimaryKeySwap() != nil {
 			return true
 		}
 	}
@@ -122,4 +128,15 @@ func tableTruncated(e TableEvent) bool {
 	// PRIMARY KEY statement was not performed. TRUNCATE operates by creating
 	// a new set of indexes for the table, including a new primary index.
 	return e.Before.GetPrimaryIndexID() != e.After.GetPrimaryIndexID() && !pkChangeMutationExists(e.Before)
+}
+
+func primaryKeyChanged(e TableEvent) bool {
+	return e.Before.GetPrimaryIndexID() != e.After.GetPrimaryIndexID() &&
+		pkChangeMutationExists(e.Before)
+}
+
+// IsPrimaryIndexChange returns true if the event corresponds to a change
+// in the primary index.
+func IsPrimaryIndexChange(e TableEvent) bool {
+	return classifyTableEvent(e) == tableEventPrimaryKeyChange
 }

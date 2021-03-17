@@ -98,6 +98,7 @@ var validCasts = []castInfo{
 	{from: types.IntervalFamily, to: types.IntFamily, volatility: VolatilityImmutable},
 	{from: types.OidFamily, to: types.IntFamily, volatility: VolatilityImmutable},
 	{from: types.BitFamily, to: types.IntFamily, volatility: VolatilityImmutable},
+	{from: types.JsonFamily, to: types.IntFamily, volatility: VolatilityImmutable},
 
 	// Casts to FloatFamily.
 	{from: types.UnknownFamily, to: types.FloatFamily, volatility: VolatilityImmutable},
@@ -111,6 +112,7 @@ var validCasts = []castInfo{
 	{from: types.TimestampTZFamily, to: types.FloatFamily, volatility: VolatilityImmutable},
 	{from: types.DateFamily, to: types.FloatFamily, volatility: VolatilityImmutable},
 	{from: types.IntervalFamily, to: types.FloatFamily, volatility: VolatilityImmutable},
+	{from: types.JsonFamily, to: types.FloatFamily, volatility: VolatilityImmutable},
 
 	// Casts to Box2D Family.
 	{from: types.UnknownFamily, to: types.Box2DFamily, volatility: VolatilityImmutable},
@@ -150,6 +152,7 @@ var validCasts = []castInfo{
 	{from: types.TimestampTZFamily, to: types.DecimalFamily, volatility: VolatilityImmutable},
 	{from: types.DateFamily, to: types.DecimalFamily, volatility: VolatilityImmutable},
 	{from: types.IntervalFamily, to: types.DecimalFamily, volatility: VolatilityImmutable},
+	{from: types.JsonFamily, to: types.DecimalFamily, volatility: VolatilityImmutable},
 
 	// Casts to StringFamily.
 	{from: types.UnknownFamily, to: types.StringFamily, volatility: VolatilityImmutable},
@@ -697,6 +700,13 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 			res = NewDInt(DInt(iv))
 		case *DOid:
 			res = &v.DInt
+		case *DJSON:
+			if dec, ok := v.AsDecimal(); ok {
+				asInt, err := dec.Int64()
+				if err == nil {
+					res = NewDInt(DInt(asInt))
+				}
+			}
 		}
 		if res != nil {
 			return res, nil
@@ -747,6 +757,14 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 			return NewDFloat(DFloat(float64(v.UnixEpochDays()))), nil
 		case *DInterval:
 			return NewDFloat(DFloat(v.AsFloat64())), nil
+		case *DJSON:
+			if dec, ok := v.AsDecimal(); ok {
+				fl, err := dec.Float64()
+				if err != nil {
+					return nil, ErrFloatOutOfRange
+				}
+				return NewDFloat(DFloat(fl)), nil
+			}
 		}
 
 	case types.DecimalFamily:
@@ -795,6 +813,12 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 		case *DInterval:
 			v.AsBigInt(&dd.Coeff)
 			dd.Exponent = -9
+		case *DJSON:
+			if dec, ok := v.AsDecimal(); ok {
+				dd.Set(dec)
+			} else {
+				unset = false
+			}
 		default:
 			unset = true
 		}
@@ -1247,39 +1271,13 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 	case types.OidFamily:
 		switch v := d.(type) {
 		case *DOid:
-			switch t.Oid() {
-			case oid.T_oid:
-				return &DOid{semanticType: t, DInt: v.DInt}, nil
-			case oid.T_regtype:
-				// Mapping an oid to a regtype is easy: we have a hardcoded map.
-				typ, ok := types.OidToType[oid.Oid(v.DInt)]
-				ret := &DOid{semanticType: t, DInt: v.DInt}
-				if !ok {
-					return ret, nil
-				}
-				ret.name = typ.PGName()
-				return ret, nil
-			default:
-				oid, err := queryOid(ctx, t, v)
-				if err != nil {
-					oid = NewDOid(v.DInt)
-					oid.semanticType = t
-				}
-				return oid, nil
-			}
+			return performIntToOidCast(ctx, t, v.DInt)
 		case *DInt:
-			switch t.Oid() {
-			case oid.T_oid:
-				return &DOid{semanticType: t, DInt: *v}, nil
-			default:
-				tmpOid := NewDOid(*v)
-				oid, err := queryOid(ctx, t, tmpOid)
-				if err != nil {
-					oid = tmpOid
-					oid.semanticType = t
-				}
-				return oid, nil
-			}
+			// OIDs are always unsigned 32-bit integers. Some languages, like Java,
+			// store OIDs as signed 32-bit integers, so we implement the cast
+			// by converting to a uint32 first. This matches Postgres behavior.
+			i := DInt(uint32(*v))
+			return performIntToOidCast(ctx, t, i)
 		case *DString:
 			return ParseDOid(ctx, string(*v), t)
 		}
@@ -1287,4 +1285,40 @@ func performCastWithoutPrecisionTruncation(ctx *EvalContext, d Datum, t *types.T
 
 	return nil, pgerror.Newf(
 		pgcode.CannotCoerce, "invalid cast: %s -> %s", d.ResolvedType(), t)
+}
+
+// performIntToOidCast casts the input integer to the OID type given by the
+// input types.T.
+func performIntToOidCast(ctx *EvalContext, t *types.T, v DInt) (Datum, error) {
+	switch t.Oid() {
+	case oid.T_oid:
+		return &DOid{semanticType: t, DInt: v}, nil
+	case oid.T_regtype:
+		// Mapping an oid to a regtype is easy: we have a hardcoded map.
+		typ, ok := types.OidToType[oid.Oid(v)]
+		ret := &DOid{semanticType: t, DInt: v}
+		if !ok {
+			return ret, nil
+		}
+		ret.name = typ.PGName()
+		return ret, nil
+
+	case oid.T_regproc, oid.T_regprocedure:
+		// Mapping an oid to a regproc is easy: we have a hardcoded map.
+		name, ok := OidToBuiltinName[oid.Oid(v)]
+		ret := &DOid{semanticType: t, DInt: v}
+		if !ok {
+			return ret, nil
+		}
+		ret.name = name
+		return ret, nil
+
+	default:
+		oid, err := queryOid(ctx, t, NewDOid(v))
+		if err != nil {
+			oid = NewDOid(v)
+			oid.semanticType = t
+		}
+		return oid, nil
+	}
 }

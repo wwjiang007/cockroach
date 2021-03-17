@@ -99,7 +99,8 @@ func (b *Builder) buildInsert(ins *memo.InsertExpr) (execPlan, error) {
 	node, err := b.factory.ConstructInsert(
 		input.root,
 		tab,
-		ins.Arbiters,
+		ins.ArbiterIndexes,
+		ins.ArbiterConstraints,
 		insertOrds,
 		returnOrds,
 		checkOrds,
@@ -146,7 +147,7 @@ func (b *Builder) tryBuildFastPathInsert(ins *memo.InsertExpr) (_ execPlan, ok b
 	//     that we send, not a number of rows. We use this as a guideline only,
 	//     and there is no guarantee that we won't produce a bigger batch.)
 	values, ok := ins.Input.(*memo.ValuesExpr)
-	if !ok || values.ChildCount() > mutations.MaxBatchSize() || values.Relational().HasSubquery {
+	if !ok || values.ChildCount() > mutations.MaxBatchSize(false /* forceProductionMaxBatchSize */) || values.Relational().HasSubquery {
 		return execPlan{}, false, nil
 	}
 
@@ -174,7 +175,9 @@ func (b *Builder) tryBuildFastPathInsert(ins *memo.InsertExpr) (_ execPlan, ok b
 			// Not a lookup anti-join.
 			return execPlan{}, false, nil
 		}
-		if len(lookupJoin.On) > 0 ||
+		// TODO(rytaft): see if we can remove the requirement that LookupExpr is
+		// empty.
+		if len(lookupJoin.On) > 0 || len(lookupJoin.LookupExpr) > 0 ||
 			len(lookupJoin.KeyCols) != fk.ColumnCount() {
 			return execPlan{}, false, nil
 		}
@@ -417,7 +420,8 @@ func (b *Builder) buildUpsert(ups *memo.UpsertExpr) (execPlan, error) {
 	node, err := b.factory.ConstructUpsert(
 		input.root,
 		tab,
-		ups.Arbiters,
+		ups.ArbiterIndexes,
+		ups.ArbiterConstraints,
 		canaryCol,
 		insertColOrds,
 		fetchColOrds,

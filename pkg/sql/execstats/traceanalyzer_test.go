@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -63,12 +64,15 @@ func TestTraceAnalyzer(t *testing.T) {
 							return func(map[roachpb.NodeID]*execinfrapb.FlowSpec) error { return nil }
 						}
 						return func(flows map[roachpb.NodeID]*execinfrapb.FlowSpec) error {
-							flowMetadata := execstats.NewFlowMetadata(flows)
-							analyzer := execstats.MakeTraceAnalyzer(flowMetadata)
+							flowsMetadata := execstats.NewFlowsMetadata(flows)
+							analyzer := execstats.NewTraceAnalyzer(flowsMetadata)
 							analyzerChan <- analyzer
 							return nil
 						}
 					},
+				},
+				DistSQL: &execinfra.TestingKnobs{
+					ForceDiskSpill: true,
 				},
 			},
 		}})
@@ -115,7 +119,7 @@ func TestTraceAnalyzer(t *testing.T) {
 				},
 			},
 		)
-		_, err := ie.QueryEx(
+		_, err := ie.ExecEx(
 			ctx,
 			t.Name(),
 			nil, /* txn */
@@ -139,75 +143,197 @@ func TestTraceAnalyzer(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		analyzer            *execstats.TraceAnalyzer
-		expectedMaxMemUsage int64
+		name     string
+		analyzer *execstats.TraceAnalyzer
 	}{
 		{
-			analyzer:            rowexecTraceAnalyzer,
-			expectedMaxMemUsage: int64(20480),
+			name:     "RowExec",
+			analyzer: rowexecTraceAnalyzer,
 		},
 		{
-			analyzer:            colexecTraceAnalyzer,
-			expectedMaxMemUsage: int64(30720),
+			name:     "ColExec",
+			analyzer: colexecTraceAnalyzer,
 		},
 	} {
-		nodeLevelStats := tc.analyzer.GetNodeLevelStats()
-		require.Equal(
-			t, numNodes-1, len(nodeLevelStats.NetworkBytesSentGroupedByNode), "expected all nodes minus the gateway node to have sent bytes",
-		)
+		t.Run(tc.name, func(t *testing.T) {
+			nodeLevelStats := tc.analyzer.GetNodeLevelStats()
+			require.Equal(
+				t, numNodes-1, len(nodeLevelStats.NetworkBytesSentGroupedByNode), "expected all nodes minus the gateway node to have sent bytes",
+			)
+			require.Equal(
+				t, numNodes, len(nodeLevelStats.MaxMemoryUsageGroupedByNode), "expected all nodes to have specified maximum memory usage",
+			)
+			require.Equal(
+				t, numNodes, len(nodeLevelStats.MaxDiskUsageGroupedByNode), "expected all nodes to have specified maximum disk usage",
+			)
 
-		queryLevelStats := tc.analyzer.GetQueryLevelStats()
+			queryLevelStats := tc.analyzer.GetQueryLevelStats()
 
-		// The stats don't count the actual bytes, but they are a synthetic value
-		// based on the number of tuples. In this test 21 tuples flow over the
-		// network.
-		require.Equal(t, int64(21*8), queryLevelStats.NetworkBytesSent)
+			// The stats don't count the actual bytes, but they are a synthetic value
+			// based on the number of tuples. In this test 21 tuples flow over the
+			// network.
+			require.Equal(t, int64(21*8), queryLevelStats.NetworkBytesSent)
 
-		require.Equal(t, tc.expectedMaxMemUsage, queryLevelStats.MaxMemUsage)
+			// Soft check that MaxMemUsage is set to a non-zero value. The actual
+			// value differs between test runs due to metamorphic randomization.
+			require.Greater(t, queryLevelStats.MaxMemUsage, int64(0))
 
-		require.Equal(t, int64(30), queryLevelStats.KVRowsRead)
-		// For tests, the bytes read is based on the number of rows read, rather
-		// than actual bytes read.
-		require.Equal(t, int64(30*8), queryLevelStats.KVBytesRead)
+			require.Equal(t, int64(1048576), queryLevelStats.MaxDiskUsage)
 
-		// For tests, network messages is a synthetic value based on the number of
-		// network tuples. In this test 21 tuples flow over the network.
-		require.Equal(t, int64(21/2), queryLevelStats.NetworkMessages)
+			require.Equal(t, int64(30), queryLevelStats.KVRowsRead)
+			// For tests, the bytes read is based on the number of rows read, rather
+			// than actual bytes read.
+			require.Equal(t, int64(30*8), queryLevelStats.KVBytesRead)
+
+			// For tests, network messages is a synthetic value based on the number of
+			// network tuples. In this test 21 tuples flow over the network.
+			require.Equal(t, int64(21/2), queryLevelStats.NetworkMessages)
+		})
 	}
 }
 
 func TestTraceAnalyzerProcessStats(t *testing.T) {
-	a := &execstats.TraceAnalyzer{FlowMetadata: &execstats.FlowMetadata{}}
+	const (
+		node1KVTime              = 1 * time.Second
+		node1ContentionTime      = 2 * time.Second
+		node2KVTime              = 3 * time.Second
+		node2ContentionTime      = 4 * time.Second
+		cumulativeKVTime         = node1KVTime + node2KVTime
+		cumulativeContentionTime = node1ContentionTime + node2ContentionTime
+	)
+	a := &execstats.TraceAnalyzer{FlowsMetadata: &execstats.FlowsMetadata{}}
+	n1 := base.SQLInstanceID(1)
+	n2 := base.SQLInstanceID(2)
 	a.AddComponentStats(
-		1, /* nodeID */
 		&execinfrapb.ComponentStats{
 			Component: execinfrapb.ProcessorComponentID(
+				n1,
 				execinfrapb.FlowID{UUID: uuid.MakeV4()},
 				1, /* processorID */
 			),
 			KV: execinfrapb.KVStats{
-				KVTime: optional.MakeTimeValue(3 * time.Second),
+				KVTime:         optional.MakeTimeValue(node1KVTime),
+				ContentionTime: optional.MakeTimeValue(node1ContentionTime),
 			},
 		},
 	)
 
 	a.AddComponentStats(
-		2, /* nodeID */
 		&execinfrapb.ComponentStats{
 			Component: execinfrapb.ProcessorComponentID(
+				n2,
 				execinfrapb.FlowID{UUID: uuid.MakeV4()},
 				2, /* processorID */
 			),
 			KV: execinfrapb.KVStats{
-				KVTime: optional.MakeTimeValue(5 * time.Second),
+				KVTime:         optional.MakeTimeValue(node2KVTime),
+				ContentionTime: optional.MakeTimeValue(node2ContentionTime),
 			},
 		},
 	)
 
-	expected := execstats.QueryLevelStats{KVTime: 8 * time.Second}
+	expected := execstats.QueryLevelStats{
+		KVTime:         cumulativeKVTime,
+		ContentionTime: cumulativeContentionTime,
+	}
 
 	assert.NoError(t, a.ProcessStats())
 	if got := a.GetQueryLevelStats(); !reflect.DeepEqual(got, expected) {
 		t.Errorf("ProcessStats() = %v, want %v", got, expected)
 	}
+}
+
+func TestQueryLevelStatsAccumulate(t *testing.T) {
+	a := execstats.QueryLevelStats{
+		NetworkBytesSent: 1,
+		MaxMemUsage:      2,
+		KVBytesRead:      3,
+		KVRowsRead:       4,
+		KVTime:           5 * time.Second,
+		NetworkMessages:  6,
+		ContentionTime:   7 * time.Second,
+		MaxDiskUsage:     8,
+	}
+	b := execstats.QueryLevelStats{
+		NetworkBytesSent: 8,
+		MaxMemUsage:      9,
+		KVBytesRead:      10,
+		KVRowsRead:       11,
+		KVTime:           12 * time.Second,
+		NetworkMessages:  13,
+		ContentionTime:   14 * time.Second,
+		MaxDiskUsage:     15,
+	}
+	expected := execstats.QueryLevelStats{
+		NetworkBytesSent: 9,
+		MaxMemUsage:      9,
+		KVBytesRead:      13,
+		KVRowsRead:       15,
+		KVTime:           17 * time.Second,
+		NetworkMessages:  19,
+		ContentionTime:   21 * time.Second,
+		MaxDiskUsage:     15,
+	}
+
+	aCopy := a
+	a.Accumulate(b)
+	require.Equal(t, expected, a)
+
+	reflectedAccumulatedStats := reflect.ValueOf(a)
+	reflectedOriginalStats := reflect.ValueOf(aCopy)
+	for i := 0; i < reflectedAccumulatedStats.NumField(); i++ {
+		require.NotEqual(
+			t,
+			reflectedAccumulatedStats.Field(i).Interface(),
+			reflectedOriginalStats.Field(i).Interface(),
+			"no struct field should be the same after accumulation in this test but %s was unchanged, did you forget to update Accumulate?",
+			reflectedAccumulatedStats.Type().Field(i).Name,
+		)
+	}
+}
+
+// TestGetQueryLevelStatsAccumulates does a sanity check that GetQueryLevelStats
+// accumulates the stats for all flows passed into it. It does so by creating
+// two FlowsMetadata objects and, thus, simulating a subquery and a main query.
+func TestGetQueryLevelStatsAccumulates(t *testing.T) {
+	const f1KVTime = 1 * time.Second
+	const f2KVTime = 3 * time.Second
+
+	// Artificially inject component stats directly into the FlowsMetadata (in
+	// the non-testing setting the stats come from the trace).
+	var f1, f2 execstats.FlowsMetadata
+	n1 := base.SQLInstanceID(1)
+	n2 := base.SQLInstanceID(2)
+	f1.AddComponentStats(
+		&execinfrapb.ComponentStats{
+			Component: execinfrapb.ProcessorComponentID(
+				n1,
+				execinfrapb.FlowID{UUID: uuid.MakeV4()},
+				1, /* processorID */
+			),
+			KV: execinfrapb.KVStats{
+				KVTime: optional.MakeTimeValue(f1KVTime),
+			},
+		},
+	)
+	f2.AddComponentStats(
+		&execinfrapb.ComponentStats{
+			Component: execinfrapb.ProcessorComponentID(
+				n2,
+				execinfrapb.FlowID{UUID: uuid.MakeV4()},
+				2, /* processorID */
+			),
+			KV: execinfrapb.KVStats{
+				KVTime: optional.MakeTimeValue(f2KVTime),
+			},
+		},
+	)
+
+	queryLevelStats, err := execstats.GetQueryLevelStats(
+		nil,   /* trace */
+		false, /* deterministicExplainAnalyze */
+		[]*execstats.FlowsMetadata{&f1, &f2},
+	)
+	require.NoError(t, err)
+	require.Equal(t, f1KVTime+f2KVTime, queryLevelStats.KVTime)
 }

@@ -152,7 +152,7 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 			// replicas to move according to them.
 			tc.ToggleReplicateQueues(false)
 			defer tc.ToggleReplicateQueues(true)
-			voters := desc.Replicas().Voters()
+			voters := desc.Replicas().VoterDescriptors()
 			if len(voters) == 1 && voters[0].NodeID == tc.Server(1).NodeID() {
 				return nil
 			}
@@ -270,10 +270,13 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 
 		s, repl := getFirstStoreReplica(t, tc.Server(1), tablePrefix)
 		s.SetReplicateQueueActive(false)
-		require.Len(t, repl.Desc().Replicas().All(), 1)
+		require.Len(t, repl.Desc().Replicas().Descriptors(), 1)
 		// We really need to make sure that the split queue has hit this range,
 		// otherwise we'll fail to backpressure.
-		go func() { _ = s.ForceSplitScanAndProcess() }()
+		_ = tc.Stopper().RunAsyncTask(ctx, "force-split", func(context.Context) {
+			_ = s.ForceSplitScanAndProcess()
+		})
+
 		waitForBlocked(repl.RangeID)
 
 		// Observe backpressure now that the range is just over the limit.
@@ -287,11 +290,11 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		ctxWithCancel, cancel := context.WithCancel(ctx)
 		defer cancel()
 		upsertErrCh := make(chan error)
-		go func() {
+		_ = tc.Stopper().RunAsyncTask(ctx, "upsert", func(ctx context.Context) {
 			_, err := c.ExecEx(ctxWithCancel, "UPSERT INTO foo VALUES ($1, $2)",
 				nil /* options */, rRand.Intn(numRows), randutil.RandBytes(rRand, rowSize))
 			upsertErrCh <- err
-		}()
+		})
 
 		select {
 		case <-time.After(10 * time.Millisecond):

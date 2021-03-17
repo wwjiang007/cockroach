@@ -15,7 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedidx"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -82,7 +81,7 @@ func newInvertedFilterer(
 		input:          input,
 		invertedColIdx: spec.InvertedColIdx,
 		invertedEval: batchedInvertedExprEvaluator{
-			exprs: []*invertedexpr.SpanExpressionProto{&spec.InvertedExpr},
+			exprs: []*inverted.SpanExpressionProto{&spec.InvertedExpr},
 		},
 	}
 
@@ -102,7 +101,7 @@ func newInvertedFilterer(
 		ifr, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ifr.input},
-			TrailingMetaCallback: func(ctx context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				ifr.close()
 				return nil
 			},
@@ -114,7 +113,7 @@ func newInvertedFilterer(
 	ctx := flowCtx.EvalCtx.Ctx()
 	// Initialize memory monitor and row container for input rows.
 	ifr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx.Cfg, "inverter-filterer-limited")
-	ifr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, "inverted-filterer-disk")
+	ifr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "inverted-filterer-disk")
 	ifr.rc = rowcontainer.NewDiskBackedNumberedRowContainer(
 		true, /* deDup */
 		rcColTypes,
@@ -124,7 +123,7 @@ func newInvertedFilterer(
 		ifr.diskMonitor,
 	)
 
-	if sp := tracing.SpanFromContext(flowCtx.EvalCtx.Ctx()); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
 		ifr.input = newInputStatCollector(ifr.input)
 		ifr.ExecStatsForTrace = ifr.execStatsForTrace
 	}
@@ -149,7 +148,10 @@ func newInvertedFilterer(
 	// de-duping. It will reduce the container memory/disk by 2x.
 
 	// Prepare inverted evaluator for later evaluation.
-	ifr.invertedEval.init()
+	_, err := ifr.invertedEval.init()
+	if err != nil {
+		return nil, err
+	}
 
 	return ifr, nil
 }
@@ -221,7 +223,31 @@ func (ifr *invertedFilterer) readInput() (invertedFiltererState, *execinfrapb.Pr
 		return ifrStateUnknown, ifr.DrainHelper()
 	}
 	// Add to the evaluator.
-	if _, err = ifr.invertedEval.prepareAddIndexRow(row[ifr.invertedColIdx].EncodedBytes()); err != nil {
+	//
+	// NB: Inverted columns are custom encoded in a manner that does not
+	// correspond to Datum encoding, and in the code here we only want the encoded
+	// bytes. We have two possibilities with what the provider of this row has
+	// done:
+	//  1. Not decoded the row: This is the len(enc) > 0 case.
+	//  2. Decoded the row, but special-cased the inverted column by stuffing the
+	//     encoded bytes into a "decoded" DBytes: This is the len(enc) == 0 case.
+	enc := row[ifr.invertedColIdx].EncodedBytes()
+	if len(enc) == 0 {
+		// If the input is from the vectorized engine, the encoded bytes may be
+		// empty (case 2 above). In this case, the Datum should contain the encoded
+		// key as a DBytes. The Datum should never be DNull since nulls aren't
+		// stored in inverted indexes.
+		if row[ifr.invertedColIdx].Datum == nil {
+			ifr.MoveToDraining(errors.New("no datum found"))
+			return ifrStateUnknown, ifr.DrainHelper()
+		}
+		if row[ifr.invertedColIdx].Datum.ResolvedType().Family() != types.BytesFamily {
+			ifr.MoveToDraining(errors.New("virtual inverted column should have type bytes"))
+			return ifrStateUnknown, ifr.DrainHelper()
+		}
+		enc = []byte(*row[ifr.invertedColIdx].Datum.(*tree.DBytes))
+	}
+	if _, err = ifr.invertedEval.prepareAddIndexRow(enc, nil /* encFull */); err != nil {
 		ifr.MoveToDraining(err)
 		return ifrStateUnknown, ifr.DrainHelper()
 	}
@@ -261,11 +287,10 @@ func (ifr *invertedFilterer) emitRow() (
 }
 
 // Start is part of the RowSource interface.
-func (ifr *invertedFilterer) Start(ctx context.Context) context.Context {
-	ifr.input.Start(ctx)
+func (ifr *invertedFilterer) Start(ctx context.Context) {
 	ctx = ifr.StartInternal(ctx, invertedFiltererProcName)
+	ifr.input.Start(ctx)
 	ifr.runningState = ifrReadingInput
-	return ctx
 }
 
 // ConsumerClosed is part of the RowSource interface.

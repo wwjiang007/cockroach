@@ -15,7 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -24,7 +24,7 @@ import (
 
 type commentOnColumnNode struct {
 	n         *tree.CommentOnColumn
-	tableDesc *tabledesc.Immutable
+	tableDesc catalog.TableDescriptor
 }
 
 // CommentOnColumn add comment on a column.
@@ -55,7 +55,7 @@ func (p *planner) CommentOnColumn(ctx context.Context, n *tree.CommentOnColumn) 
 }
 
 func (n *commentOnColumnNode) startExec(params runParams) error {
-	col, _, err := n.tableDesc.FindColumnByName(n.n.ColumnItem.ColumnName)
+	col, err := n.tableDesc.FindColumnWithName(n.n.ColumnItem.ColumnName)
 	if err != nil {
 		return err
 	}
@@ -68,8 +68,8 @@ func (n *commentOnColumnNode) startExec(params runParams) error {
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			"UPSERT INTO system.comments VALUES ($1, $2, $3, $4)",
 			keys.ColumnCommentType,
-			n.tableDesc.ID,
-			col.ID,
+			n.tableDesc.GetID(),
+			col.GetID(),
 			*n.n.Comment)
 		if err != nil {
 			return err
@@ -82,8 +82,8 @@ func (n *commentOnColumnNode) startExec(params runParams) error {
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=$3",
 			keys.ColumnCommentType,
-			n.tableDesc.ID,
-			col.ID)
+			n.tableDesc.GetID(),
+			col.GetID())
 		if err != nil {
 			return err
 		}
@@ -93,12 +93,16 @@ func (n *commentOnColumnNode) startExec(params runParams) error {
 	if n.n.Comment != nil {
 		comment = *n.n.Comment
 	}
+
+	tn, err := params.p.getQualifiedTableName(params.ctx, n.tableDesc)
+	if err != nil {
+		return err
+	}
+
 	return params.p.logEvent(params.ctx,
-		n.tableDesc.ID,
+		n.tableDesc.GetID(),
 		&eventpb.CommentOnColumn{
-			// TODO(knz): This table name is improperly qualified.
-			// See: https://github.com/cockroachdb/cockroach/issues/57740
-			TableName:   n.tableDesc.Name,
+			TableName:   tn.FQString(),
 			ColumnName:  string(n.n.ColumnItem.ColumnName),
 			Comment:     comment,
 			NullComment: n.n.Comment == nil,

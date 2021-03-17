@@ -10,7 +10,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv",
-        "//pkg/kv/kvserver/protectedts/ptpb",
+        "//pkg/kv/kvserver/protectedts/ptpb:ptpb_go_proto",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/util/hlc",
@@ -22,6 +22,7 @@ go_library(
 
 go_test(
     name = "protectedts_test",
+    size = "small",
     srcs = ["protectedts_test.go"],
     embed = [":protectedts"],
 )

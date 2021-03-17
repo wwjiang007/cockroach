@@ -11,14 +11,15 @@
 package sql
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -29,6 +30,7 @@ func (p *planner) addColumnImpl(
 	tn *tree.TableName,
 	desc *tabledesc.Mutable,
 	t *tree.AlterTableAddColumn,
+	sessionData *sessiondata.SessionData,
 ) error {
 	d := t.ColumnDef
 	version := params.ExecCfg().Settings.Version.ActiveVersionOrEmpty(params.ctx)
@@ -76,7 +78,7 @@ func (p *planner) addColumnImpl(
 	// its descriptor and this column descriptor.
 	if d.HasDefaultExpr() {
 		changedSeqDescs, err := maybeAddSequenceDependencies(
-			params.ctx, params.p, n.tableDesc, col, expr, nil,
+			params.ctx, params.ExecCfg().Settings, params.p, n.tableDesc, col, expr, nil,
 		)
 		if err != nil {
 			return err
@@ -102,29 +104,11 @@ func (p *planner) addColumnImpl(
 			return sqlerrors.NewNonNullViolationError(col.Name)
 		}
 	}
-	_, err = n.tableDesc.FindActiveColumnByName(string(d.Name))
-	if m := n.tableDesc.FindColumnMutationByName(d.Name); m != nil {
-		switch m.Direction {
-		case descpb.DescriptorMutation_ADD:
-			return pgerror.Newf(pgcode.DuplicateColumn,
-				"duplicate: column %q in the middle of being added, not yet public",
-				col.Name)
-		case descpb.DescriptorMutation_DROP:
-			return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-				"column %q being dropped, try again later", col.Name)
-		default:
-			if err != nil {
-				return errors.AssertionFailedf(
-					"mutation in state %s, direction %s, and no column descriptor",
-					errors.Safe(m.State), errors.Safe(m.Direction))
-			}
-		}
-	}
-	if err == nil {
-		if t.IfNotExists {
+	if isPublic, err := checkColumnDoesNotExist(n.tableDesc, d.Name); err != nil {
+		if isPublic && t.IfNotExists {
 			return nil
 		}
-		return sqlerrors.NewColumnAlreadyExistsError(string(d.Name), n.tableDesc.Name)
+		return err
 	}
 
 	n.tableDesc.AddColumnMutation(col, descpb.DescriptorMutation_ADD)
@@ -143,19 +127,45 @@ func (p *planner) addColumnImpl(
 	}
 
 	if d.IsComputed() {
-		if d.IsVirtual() {
-			return unimplemented.NewWithIssue(57608, "virtual computed columns")
-		}
 		computedColValidator := schemaexpr.MakeComputedColumnValidator(
 			params.ctx,
 			n.tableDesc,
 			&params.p.semaCtx,
 			tn,
 		)
-		if err := computedColValidator.Validate(d); err != nil {
+		serializedExpr, err := computedColValidator.Validate(d)
+		if err != nil {
 			return err
 		}
+		col.ComputeExpr = &serializedExpr
 	}
 
 	return nil
+}
+
+func checkColumnDoesNotExist(
+	tableDesc catalog.TableDescriptor, name tree.Name,
+) (isPublic bool, err error) {
+	col, _ := tableDesc.FindColumnWithName(name)
+	if col == nil {
+		return false, nil
+	}
+	if col.IsSystemColumn() {
+		return false, pgerror.Newf(pgcode.DuplicateColumn,
+			"column name %q conflicts with a system column name",
+			col.GetName())
+	}
+	if col.Public() {
+		return true, sqlerrors.NewColumnAlreadyExistsError(tree.ErrString(&name), tableDesc.GetName())
+	}
+	if col.Adding() {
+		return false, pgerror.Newf(pgcode.DuplicateColumn,
+			"duplicate: column %q in the middle of being added, not yet public",
+			col.GetName())
+	}
+	if col.Dropped() {
+		return false, pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"column %q being dropped, try again later", col.GetName())
+	}
+	return false, errors.AssertionFailedf("mutation in direction NONE")
 }

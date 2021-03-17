@@ -40,6 +40,7 @@ go_library(
 
 go_test(
     name = "kv_test",
+    size = "medium",
     srcs = [
         "client_test.go",
         "db_test.go",
@@ -54,7 +55,6 @@ go_test(
         "//pkg/base",
         "//pkg/config/zonepb",
         "//pkg/keys",
-        "//pkg/kv",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/roachpb",

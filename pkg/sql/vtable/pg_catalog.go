@@ -50,7 +50,7 @@ CREATE TABLE pg_catalog.pg_am (
 	amcostestimate OID,
 	amoptions OID,
 	amhandler OID,
-	amtype CHAR
+	amtype "char"
 )`
 
 // PGCatalogAttrDef describes the schema of the pg_catalog.pg_attrdef table.
@@ -79,12 +79,12 @@ CREATE TABLE pg_catalog.pg_attribute (
 	attcacheoff INT4,
 	atttypmod INT4,
 	attbyval BOOL,
-	attstorage CHAR,
-	attalign CHAR,
+	attstorage "char",
+	attalign "char",
 	attnotnull BOOL,
 	atthasdef BOOL,
-	attidentity CHAR, 
-	attgenerated CHAR,
+	attidentity "char", 
+	attgenerated "char",
 	attisdropped BOOL,
 	attislocal BOOL,
 	attinhcount INT4,
@@ -92,6 +92,7 @@ CREATE TABLE pg_catalog.pg_attribute (
 	attacl STRING[],
 	attoptions STRING[],
 	attfdwoptions STRING[],
+	atthasmissing BOOL,
   INDEX(attrelid)
 )`
 
@@ -103,8 +104,8 @@ CREATE TABLE pg_catalog.pg_cast (
 	castsource OID,
 	casttarget OID,
 	castfunc OID,
-	castcontext CHAR,
-	castmethod CHAR
+	castcontext "char",
+	castmethod "char"
 )`
 
 // PGCatalogAuthID describes the schema of the pg_catalog.pg_authid table.
@@ -166,9 +167,9 @@ CREATE TABLE pg_catalog.pg_class (
 	reltoastrelid OID,
 	relhasindex BOOL,
 	relisshared BOOL,
-	relpersistence CHAR,
+	relpersistence "char",
 	relistemp BOOL,
-	relkind CHAR,
+	relkind "char",
 	relnatts INT2,
 	relchecks INT2,
 	relhasoids BOOL,
@@ -179,6 +180,13 @@ CREATE TABLE pg_catalog.pg_class (
 	relfrozenxid INT,
 	relacl STRING[],
 	reloptions STRING[],
+	relforcerowsecurity BOOL,
+	relispartition BOOL,
+	relispopulated BOOL,
+	relreplident "char",
+	relrewrite OID,
+	relrowsecurity BOOL,
+	relpartbound STRING,
   INDEX (oid)
 )`
 
@@ -192,7 +200,10 @@ CREATE TABLE pg_catalog.pg_collation (
   collowner OID,
   collencoding INT4,
   collcollate STRING,
-  collctype STRING
+  collctype STRING,
+  collprovider "char",
+  collversion STRING,
+  collisdeterministic BOOL
 )`
 
 // PGCatalogConstraint describes the schema of the pg_catalog.pg_constraint
@@ -274,7 +285,7 @@ CREATE TABLE pg_catalog.pg_default_acl (
 	oid OID,
 	defaclrole OID,
 	defaclnamespace OID,
-	defaclobjtype CHAR,
+	defaclobjtype "char",
 	defaclacl STRING[]
 )`
 
@@ -288,7 +299,7 @@ CREATE TABLE pg_catalog.pg_depend (
   refclassid OID,
   refobjid OID,
   refobjsubid INT4,
-  deptype CHAR
+  deptype "char"
 )`
 
 // PGCatalogDescription describes the schema of the pg_catalog.pg_description
@@ -331,8 +342,9 @@ CREATE TABLE pg_catalog.pg_event_trigger (
 	evtevent NAME,
 	evtowner OID,
 	evtfoid OID,
-	evtenabled CHAR,
-	evttags TEXT[]
+	evtenabled "char",
+	evttags TEXT[],
+	oid OID
 )`
 
 // PGCatalogExtension describes the schema of the pg_catalog.pg_extension table.
@@ -410,7 +422,8 @@ CREATE TABLE pg_catalog.pg_index (
     indclass OIDVECTOR,
     indoption INT2VECTOR,
     indexprs STRING,
-    indpred STRING
+    indpred STRING,
+	indnkeyatts INT2
 )`
 
 // PGCatalogIndexes describes the schema of the pg_catalog.pg_indexes table.
@@ -578,8 +591,8 @@ CREATE TABLE pg_catalog.pg_proc (
 	proleakproof BOOL,
 	proisstrict BOOL,
 	proretset BOOL,
-	provolatile CHAR,
-	proparallel CHAR,
+	provolatile "char",
+	proparallel "char",
 	pronargs INT2,
 	pronargdefaults INT2,
 	prorettype OID,
@@ -592,7 +605,9 @@ CREATE TABLE pg_catalog.pg_proc (
 	prosrc STRING,
 	probin STRING,
 	proconfig STRING[],
-	proacl STRING[]
+	proacl STRING[],
+	prokind "char",
+	prosupport REGPROC
 )`
 
 // PGCatalogRange describes the schema of the pg_catalog.pg_range table.
@@ -702,7 +717,7 @@ CREATE TABLE pg_catalog.pg_shdepend (
   objsubid INT4,
 	refclassid OID,
 	refobjid OID,
-	deptype CHAR
+	deptype "char"
 )`
 
 // PGCatalogTables describes the schema of the pg_catalog.pg_tables table.
@@ -753,7 +768,8 @@ CREATE TABLE pg_catalog.pg_trigger (
 	tgargs BYTEA,
 	tgqual TEXT,
 	tgoldtable NAME,
-	tgnewtable NAME
+	tgnewtable NAME,
+	tgparentid OID
 )`
 
 // PGCatalogType describes the schema of the pg_catalog.pg_type table.
@@ -766,11 +782,11 @@ CREATE TABLE pg_catalog.pg_type (
 	typowner OID,
 	typlen INT2,
 	typbyval BOOL,
-	typtype CHAR,
-	typcategory CHAR,
+	typtype "char",
+	typcategory "char",
 	typispreferred BOOL,
 	typisdefined BOOL,
-	typdelim CHAR,
+	typdelim "char",
 	typrelid OID,
 	typelem OID,
 	typarray OID,
@@ -781,8 +797,8 @@ CREATE TABLE pg_catalog.pg_type (
 	typmodin REGPROC,
 	typmodout REGPROC,
 	typanalyze REGPROC,
-	typalign CHAR,
-	typstorage CHAR,
+	typalign "char",
+	typstorage "char",
 	typnotnull BOOL,
 	typbasetype OID,
 	typtypmod INT4,
@@ -843,7 +859,9 @@ CREATE TABLE pg_catalog.pg_stat_activity (
 	state TEXT,
 	backend_xid INTEGER,
 	backend_xmin INTEGER,
-	query TEXT
+	query TEXT,
+	backend_type STRING,
+	leader_pid INT4
 )`
 
 // PGCatalogSecurityLabel describes the schema of the pg_catalog.pg_seclabel
@@ -884,7 +902,7 @@ CREATE TABLE pg_catalog.pg_views (
 const PGCatalogAggregate = `
 CREATE TABLE pg_catalog.pg_aggregate (
 	aggfnoid REGPROC,
-	aggkind  CHAR,
+	aggkind  "char",
 	aggnumdirectargs INT2,
 	aggtransfn REGPROC,
 	aggfinalfn REGPROC,
@@ -902,5 +920,354 @@ CREATE TABLE pg_catalog.pg_aggregate (
 	aggmtranstype OID,
 	aggmtransspace INT4,
 	agginitval TEXT,
-	aggminitval TEXT
+	aggminitval TEXT,
+	aggfinalmodify "char",
+	aggmfinalmodify "char"
+)`
+
+// PgCatalogLargeobject is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogLargeobject = `
+CREATE TABLE pg_catalog.pg_largeobject (
+	data BYTES,
+	loid OID,
+	pageno INT4
+)`
+
+// PgCatalogConfig is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogConfig = `
+CREATE TABLE pg_catalog.pg_config (
+	name STRING,
+	setting STRING
+)`
+
+// PgCatalogAvailableExtensionVersions is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogAvailableExtensionVersions = `
+CREATE TABLE pg_catalog.pg_available_extension_versions (
+	trusted BOOL,
+	comment STRING,
+	relocatable BOOL,
+	requires NAME[],
+	schema NAME,
+	installed BOOL,
+	name NAME,
+	superuser BOOL,
+	version STRING
+)`
+
+// PgCatalogPublicationRel is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogPublicationRel = `
+CREATE TABLE pg_catalog.pg_publication_rel (
+	oid OID,
+	prpubid OID,
+	prrelid OID
+)`
+
+// PgCatalogOpfamily is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogOpfamily = `
+CREATE TABLE pg_catalog.pg_opfamily (
+	opfname NAME,
+	opfnamespace OID,
+	opfowner OID,
+	oid OID,
+	opfmethod OID
+)`
+
+// PgCatalogShmemAllocations is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogShmemAllocations = `
+CREATE TABLE pg_catalog.pg_shmem_allocations (
+	name STRING,
+	off INT,
+	size INT,
+	allocated_size INT
+)`
+
+// PgCatalogDbRoleSetting is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogDbRoleSetting = `
+CREATE TABLE pg_catalog.pg_db_role_setting (
+	setconfig STRING[],
+	setdatabase OID,
+	setrole OID
+)`
+
+// PgCatalogTimezoneNames is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogTimezoneNames = `
+CREATE TABLE pg_catalog.pg_timezone_names (
+	abbrev STRING,
+	is_dst BOOL,
+	name STRING,
+	utc_offset INTERVAL
+)`
+
+// PgCatalogPublicationTables is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogPublicationTables = `
+CREATE TABLE pg_catalog.pg_publication_tables (
+	pubname NAME,
+	schemaname NAME,
+	tablename NAME
+)`
+
+// PgCatalogUserMappings is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogUserMappings = `
+CREATE TABLE pg_catalog.pg_user_mappings (
+	srvname NAME,
+	umid OID,
+	umoptions STRING[],
+	umuser OID,
+	usename NAME,
+	srvid OID
+)`
+
+// PgCatalogTsTemplate is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogTsTemplate = `
+CREATE TABLE pg_catalog.pg_ts_template (
+	oid OID,
+	tmplinit REGPROC,
+	tmpllexize REGPROC,
+	tmplname NAME,
+	tmplnamespace OID
+)`
+
+// PgCatalogRules is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogRules = `
+CREATE TABLE pg_catalog.pg_rules (
+	definition STRING,
+	rulename NAME,
+	schemaname NAME,
+	tablename NAME
+)`
+
+// PgCatalogShadow is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogShadow = `
+CREATE TABLE pg_catalog.pg_shadow (
+	useconfig STRING[],
+	usecreatedb BOOL,
+	userepl BOOL,
+	usesuper BOOL,
+	usesysid OID,
+	valuntil TIMESTAMPTZ,
+	passwd STRING,
+	usename NAME,
+	usebypassrls BOOL
+)`
+
+// PgCatalogPublication is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogPublication = `
+CREATE TABLE pg_catalog.pg_publication (
+	pubupdate BOOL,
+	oid OID,
+	puballtables BOOL,
+	pubdelete BOOL,
+	pubinsert BOOL,
+	pubname NAME,
+	pubowner OID,
+	pubtruncate BOOL,
+	pubviaroot BOOL
+)`
+
+// PgCatalogGroup is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogGroup = `
+CREATE TABLE pg_catalog.pg_group (
+	grolist OID[],
+	groname NAME,
+	grosysid OID
+)`
+
+// PgCatalogCursors is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogCursors = `
+CREATE TABLE pg_catalog.pg_cursors (
+	is_scrollable BOOL,
+	name STRING,
+	statement STRING,
+	creation_time TIMESTAMPTZ,
+	is_binary BOOL,
+	is_holdable BOOL
+)`
+
+// PgCatalogTsParser is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogTsParser = `
+CREATE TABLE pg_catalog.pg_ts_parser (
+	prslextype REGPROC,
+	prsname NAME,
+	prsnamespace OID,
+	prsstart REGPROC,
+	prstoken REGPROC,
+	oid OID,
+	prsend REGPROC,
+	prsheadline REGPROC
+)`
+
+// PgCatalogSubscription is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogSubscription = `
+CREATE TABLE pg_catalog.pg_subscription (
+	subname NAME,
+	subpublications STRING[],
+	subslotname NAME,
+	subsynccommit STRING,
+	oid OID,
+	subconninfo STRING,
+	subdbid OID,
+	subenabled BOOL,
+	subowner OID
+)`
+
+// PgCatalogAmproc is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogAmproc = `
+CREATE TABLE pg_catalog.pg_amproc (
+	amproc REGPROC,
+	amprocfamily OID,
+	amproclefttype OID,
+	amprocnum INT2,
+	amprocrighttype OID,
+	oid OID
+)`
+
+// PgCatalogTsDict is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogTsDict = `
+CREATE TABLE pg_catalog.pg_ts_dict (
+	dictinitoption STRING,
+	dictname NAME,
+	dictnamespace OID,
+	dictowner OID,
+	dicttemplate OID,
+	oid OID
+)`
+
+// PgCatalogTimezoneAbbrevs is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogTimezoneAbbrevs = `
+CREATE TABLE pg_catalog.pg_timezone_abbrevs (
+	abbrev STRING,
+	is_dst BOOL,
+	utc_offset INTERVAL
+)`
+
+// PgCatalogTransform is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogTransform = `
+CREATE TABLE pg_catalog.pg_transform (
+	trffromsql REGPROC,
+	trflang OID,
+	trftosql REGPROC,
+	trftype OID,
+	oid OID
+)`
+
+// PgCatalogTsConfigMap is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogTsConfigMap = `
+CREATE TABLE pg_catalog.pg_ts_config_map (
+	mapcfg OID,
+	mapdict OID,
+	mapseqno INT4,
+	maptokentype INT4
+)`
+
+// PgCatalogFileSettings is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogFileSettings = `
+CREATE TABLE pg_catalog.pg_file_settings (
+	error STRING,
+	name STRING,
+	seqno INT4,
+	setting STRING,
+	sourcefile STRING,
+	sourceline INT4,
+	applied BOOL
+)`
+
+// PgCatalogPolicies is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogPolicies = `
+CREATE TABLE pg_catalog.pg_policies (
+	with_check STRING,
+	cmd STRING,
+	permissive STRING,
+	policyname NAME,
+	qual STRING,
+	roles NAME[],
+	schemaname NAME,
+	tablename NAME
+)`
+
+// PgCatalogTsConfig is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogTsConfig = `
+CREATE TABLE pg_catalog.pg_ts_config (
+	cfgname NAME,
+	cfgnamespace OID,
+	cfgowner OID,
+	cfgparser OID,
+	oid OID
+)`
+
+// PgCatalogHbaFileRules is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogHbaFileRules = `
+CREATE TABLE pg_catalog.pg_hba_file_rules (
+	address STRING,
+	database STRING[],
+	line_number INT4,
+	netmask STRING,
+	type STRING,
+	user_name STRING[],
+	auth_method STRING,
+	error STRING,
+	options STRING[]
+)`
+
+// PgCatalogStatisticExt is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogStatisticExt = `
+CREATE TABLE pg_catalog.pg_statistic_ext (
+	stxrelid OID,
+	stxstattarget INT4,
+	oid OID,
+	stxkeys INT2VECTOR,
+	stxkind "char"[],
+	stxname NAME,
+	stxnamespace OID,
+	stxowner OID
+)`
+
+// PgCatalogReplicationOrigin is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogReplicationOrigin = `
+CREATE TABLE pg_catalog.pg_replication_origin (
+	roident OID,
+	roname STRING
+)`
+
+// PgCatalogAmop is an empty table created by pg_catalog_test
+// and is currently unimplemented.
+const PgCatalogAmop = `
+CREATE TABLE pg_catalog.pg_amop (
+	amoplefttype OID,
+	amopmethod OID,
+	amopopr OID,
+	amoppurpose "char",
+	amoprighttype OID,
+	oid OID,
+	amopfamily OID,
+	amopsortfamily OID,
+	amopstrategy INT2
 )`

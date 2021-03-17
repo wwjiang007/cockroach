@@ -357,7 +357,7 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 					))
 				}
 				col := &scope.cols[colIdx]
-				if col.hidden {
+				if col.visibility != cat.Visible {
 					continue
 				}
 				col.name = colAlias[aliasIdx]
@@ -433,8 +433,10 @@ func (b *Builder) addTable(tab cat.Table, alias *tree.TableName) *opt.TableMeta 
 // columns", when performing mutation DML statements (INSERT, UPDATE, UPSERT,
 // DELETE).
 //
-// NOTE: Callers must take care that these mutation columns are never used in
-//       any other way, since they may not have been initialized yet by the
+// NOTE: Callers must take care that mutation columns (columns that are being
+//       added or dropped from the table) are only used when performing mutation
+//       DML statements (INSERT, UPDATE, UPSERT, DELETE). They cannot be used in
+//       any other way because they may not have been initialized yet by the
 //       backfiller!
 //
 // See Builder.buildStmt for a description of the remaining input and return
@@ -452,8 +454,13 @@ func (b *Builder) buildScan(
 	tab := tabMeta.Table
 	tabID := tabMeta.MetaID
 
-	if indexFlags != nil && indexFlags.IgnoreForeignKeys {
-		tabMeta.IgnoreForeignKeys = true
+	if indexFlags != nil {
+		if indexFlags.IgnoreForeignKeys {
+			tabMeta.IgnoreForeignKeys = true
+		}
+		if indexFlags.IgnoreUniqueWithoutIndexKeys {
+			tabMeta.IgnoreUniqueWithoutIndexKeys = true
+		}
 	}
 
 	outScope = inScope.push()
@@ -477,7 +484,7 @@ func (b *Builder) buildScan(
 			name:         name,
 			table:        tabMeta.Alias,
 			typ:          col.DatumType(),
-			hidden:       col.IsHidden() || kind != cat.Ordinary,
+			visibility:   col.Visibility(),
 			kind:         kind,
 			mutation:     kind == cat.WriteOnly || kind == cat.DeleteOnly,
 			tableOrdinal: ord,
@@ -536,8 +543,9 @@ func (b *Builder) buildScan(
 	outScope.expr = b.factory.ConstructScan(&private)
 
 	// Add the partial indexes after constructing the scan so we can use the
-	// logical properties of the scan to fully normalize the index
-	// predicates.
+	// logical properties of the scan to fully normalize the index predicates.
+	// We don't need to add deletable partial index predicates in the context of
+	// a scan.
 	b.addPartialIndexPredicatesForTable(tabMeta, outScope.expr)
 
 	if !virtualColIDs.Empty() {
@@ -672,7 +680,7 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 			tableScope.appendOrdinaryColumnsFromTable(tabMeta, &tabMeta.Alias)
 		}
 
-		if texpr := tableScope.resolveAndRequireType(expr, types.Any); texpr != nil {
+		if texpr := tableScope.resolveAndRequireType(expr, tabCol.DatumType()); texpr != nil {
 			colID := tabMeta.MetaID.ColumnID(i)
 			var scalar opt.ScalarExpr
 			b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
@@ -685,80 +693,6 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 				tabMeta.AddComputedCol(colID, scalar)
 			}
 		}
-	}
-}
-
-// addPartialIndexPredicatesForTable finds all partial indexes in the table and
-// adds their predicates to the table metadata (see
-// TableMeta.PartialIndexPredicates). The predicates are converted from strings
-// to ScalarExprs here.
-//
-// The predicates are used as "known truths" about table data. Any predicates
-// containing non-immutable operators are omitted.
-//
-// scan is an optional argument that is a Scan expression on the table. If scan
-// outputs all the ordinary columns in the table, we avoid constructing a new
-// scan. A scan and its logical properties are required in order to fully
-// normalize the partial index predicates.
-func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta, scan memo.RelExpr) {
-	tab := tabMeta.Table
-
-	// Find the first partial index.
-	numIndexes := tab.IndexCount()
-	indexOrd := 0
-	for ; indexOrd < numIndexes; indexOrd++ {
-		if _, ok := tab.Index(indexOrd).Predicate(); ok {
-			break
-		}
-	}
-
-	// Return early if there are no partial indexes. Only partial indexes have
-	// predicates.
-	if indexOrd == numIndexes {
-		return
-	}
-
-	// Construct a scan as the tableScope expr so that logical properties of the
-	// scan can be used to fully normalize the index predicate.
-	tableScope := b.allocScope()
-	tableScope.appendOrdinaryColumnsFromTable(tabMeta, &tabMeta.Alias)
-
-	// If the optional scan argument was provided and it outputs all of the
-	// ordinary table columns, we use it as tableScope.expr. Otherwise, we must
-	// construct a new scan. Attaching a scan to tableScope.expr is required to
-	// fully normalize the partial index predicates with logical properties of
-	// the scan.
-	if scan != nil && tableScope.colSet().SubsetOf(scan.Relational().OutputCols) {
-		tableScope.expr = scan
-	} else {
-		tableScope.expr = b.factory.ConstructScan(&memo.ScanPrivate{
-			Table: tabMeta.MetaID,
-			Cols:  tableScope.colSet(),
-		})
-	}
-
-	// Skip to the first partial index we found above.
-	for ; indexOrd < numIndexes; indexOrd++ {
-		index := tab.Index(indexOrd)
-		pred, ok := index.Predicate()
-
-		// If the index is not a partial index, do nothing.
-		if !ok {
-			continue
-		}
-
-		expr, err := parser.ParseExpr(pred)
-		if err != nil {
-			panic(err)
-		}
-
-		// Build the partial index predicate as a memo.FiltersExpr and add it
-		// to the table metadata.
-		predExpr, err := b.buildPartialIndexPredicate(tableScope, expr, "index predicate")
-		if err != nil {
-			panic(err)
-		}
-		tabMeta.AddPartialIndexPredicate(indexOrd, &predExpr)
 	}
 }
 

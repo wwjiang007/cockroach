@@ -227,7 +227,7 @@ func (node *ShowDatabaseIndexes) Format(ctx *FmtCtx) {
 	}
 }
 
-// ShowQueries represents a SHOW QUERIES statement.
+// ShowQueries represents a SHOW STATEMENTS statement.
 type ShowQueries struct {
 	All     bool
 	Cluster bool
@@ -240,9 +240,9 @@ func (node *ShowQueries) Format(ctx *FmtCtx) {
 		ctx.WriteString("ALL ")
 	}
 	if node.Cluster {
-		ctx.WriteString("CLUSTER QUERIES")
+		ctx.WriteString("CLUSTER STATEMENTS")
 	} else {
-		ctx.WriteString("LOCAL QUERIES")
+		ctx.WriteString("LOCAL STATEMENTS")
 	}
 }
 
@@ -308,6 +308,8 @@ const (
 	ShowRegionsFromDatabase
 	// ShowRegionsFromAllDatabases represents SHOW REGIONS FROM ALL DATABASES.
 	ShowRegionsFromAllDatabases
+	// ShowRegionsFromDefault represents SHOW REGIONS.
+	ShowRegionsFromDefault
 )
 
 // ShowRegions represents a SHOW REGIONS statement
@@ -318,18 +320,19 @@ type ShowRegions struct {
 
 // Format implements the NodeFormatter interface.
 func (node *ShowRegions) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW REGIONS ")
+	ctx.WriteString("SHOW REGIONS")
 	switch node.ShowRegionsFrom {
+	case ShowRegionsFromDefault:
 	case ShowRegionsFromAllDatabases:
-		ctx.WriteString("FROM ALL DATABASES")
+		ctx.WriteString(" FROM ALL DATABASES")
 	case ShowRegionsFromDatabase:
-		ctx.WriteString("FROM DATABASE")
+		ctx.WriteString(" FROM DATABASE")
 		if node.DatabaseName != "" {
 			ctx.WriteString(" ")
 			node.DatabaseName.Format(ctx)
 		}
 	case ShowRegionsFromCluster:
-		ctx.WriteString("FROM CLUSTER")
+		ctx.WriteString(" FROM CLUSTER")
 	default:
 		panic(fmt.Sprintf("unknown ShowRegionsFrom: %v", node.ShowRegionsFrom))
 	}
@@ -479,6 +482,14 @@ type ShowCreate struct {
 func (node *ShowCreate) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW CREATE ")
 	ctx.FormatNode(node.Name)
+}
+
+// ShowCreateAllTables represents a SHOW CREATE ALL TABLES statement.
+type ShowCreateAllTables struct{}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowCreateAllTables) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW CREATE ALL TABLES")
 }
 
 // ShowSyntax represents a SHOW SYNTAX statement.

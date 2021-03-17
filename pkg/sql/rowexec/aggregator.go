@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/stringarena"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -90,11 +89,11 @@ func (ag *aggregatorBase) init(
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
-	trailingMetaCallback func(context.Context) []execinfrapb.ProducerMetadata,
+	trailingMetaCallback func() []execinfrapb.ProducerMetadata,
 ) error {
 	ctx := flowCtx.EvalCtx.Ctx()
 	memMonitor := execinfra.NewMonitor(ctx, flowCtx.EvalCtx.Mon, "aggregator-mem")
-	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(ctx, flowCtx) {
 		input = newInputStatCollector(input)
 		ag.ExecStatsForTrace = ag.execStatsForTrace
 	}
@@ -279,7 +278,7 @@ func newAggregator(
 		input,
 		post,
 		output,
-		func(context.Context) []execinfrapb.ProducerMetadata {
+		func() []execinfrapb.ProducerMetadata {
 			ag.close()
 			return nil
 		},
@@ -312,7 +311,7 @@ func newOrderedAggregator(
 		input,
 		post,
 		output,
-		func(context.Context) []execinfrapb.ProducerMetadata {
+		func() []execinfrapb.ProducerMetadata {
 			ag.close()
 			return nil
 		},
@@ -328,21 +327,20 @@ func newOrderedAggregator(
 }
 
 // Start is part of the RowSource interface.
-func (ag *hashAggregator) Start(ctx context.Context) context.Context {
-	return ag.start(ctx, hashAggregatorProcName)
+func (ag *hashAggregator) Start(ctx context.Context) {
+	ag.start(ctx, hashAggregatorProcName)
 }
 
 // Start is part of the RowSource interface.
-func (ag *orderedAggregator) Start(ctx context.Context) context.Context {
-	return ag.start(ctx, orderedAggregatorProcName)
+func (ag *orderedAggregator) Start(ctx context.Context) {
+	ag.start(ctx, orderedAggregatorProcName)
 }
 
-func (ag *aggregatorBase) start(ctx context.Context, procName string) context.Context {
-	ag.input.Start(ctx)
+func (ag *aggregatorBase) start(ctx context.Context, procName string) {
 	ctx = ag.StartInternal(ctx, procName)
+	ag.input.Start(ctx)
 	ag.cancelChecker = cancelchecker.NewCancelChecker(ctx)
 	ag.runningState = aggAccumulating
-	return ctx
 }
 
 func (ag *hashAggregator) close() {

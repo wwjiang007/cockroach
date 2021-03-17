@@ -23,7 +23,20 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
-//go:generate go run -tags gen-batch gen_batch.go
+//go:generate go run -tags gen-batch gen/main.go
+
+// WriteTimestamp returns the timestamps at which this request is writing. For
+// non-transactional requests, this is the same as the read timestamp. For
+// transactional requests, the write timestamp can be higher until commit time.
+//
+// This should only be called after SetActiveTimestamp().
+func (h Header) WriteTimestamp() hlc.Timestamp {
+	ts := h.Timestamp
+	if h.Txn != nil {
+		ts.Forward(h.Txn.WriteTimestamp)
+	}
+	return ts
+}
 
 // SetActiveTimestamp sets the correct timestamp at which the request is to be
 // carried out. For transactional requests, ba.Timestamp must be zero initially
@@ -43,7 +56,7 @@ func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
 		// provisional commit timestamp evolves.
 		//
 		// Note that writes will be performed at the provisional commit timestamp,
-		// txn.Timestamp, regardless of the batch timestamp.
+		// txn.WriteTimestamp, regardless of the batch timestamp.
 		ba.Timestamp = txn.ReadTimestamp
 	} else {
 		// When not transactional, allow empty timestamp and use nowFn instead
@@ -68,7 +81,11 @@ func (ba BatchRequest) EarliestActiveTimestamp() hlc.Timestamp {
 				ts.Backward(t.StartTime)
 			}
 		case *RevertRangeRequest:
-			ts.Backward(t.TargetTime)
+			// This method is only used to check GC Threshold so Revert requests that
+			// opt-out of checking the target vs threshold should skip this.
+			if !t.IgnoreGcThreshold {
+				ts.Backward(t.TargetTime)
+			}
 		}
 	}
 	return ts
@@ -167,84 +184,73 @@ func (ba *BatchRequest) IsSingleSkipLeaseCheckRequest() bool {
 	return ba.IsSingleRequest() && ba.hasFlag(skipLeaseCheck)
 }
 
+func (ba *BatchRequest) isSingleRequestWithMethod(m Method) bool {
+	return ba.IsSingleRequest() && ba.Requests[0].GetInner().Method() == m
+}
+
+// IsSingleTransferLeaseRequest returns true iff the batch contains a single
+// request, and that request is a TransferLease.
+func (ba *BatchRequest) IsSingleTransferLeaseRequest() bool {
+	return ba.isSingleRequestWithMethod(TransferLease)
+}
+
 // IsSinglePushTxnRequest returns true iff the batch contains a single
-// request, and that request is for a PushTxn.
+// request, and that request is a PushTxn.
 func (ba *BatchRequest) IsSinglePushTxnRequest() bool {
-	if ba.IsSingleRequest() {
-		_, ok := ba.Requests[0].GetInner().(*PushTxnRequest)
-		return ok
-	}
-	return false
+	return ba.isSingleRequestWithMethod(PushTxn)
 }
 
 // IsSingleHeartbeatTxnRequest returns true iff the batch contains a single
 // request, and that request is a HeartbeatTxn.
 func (ba *BatchRequest) IsSingleHeartbeatTxnRequest() bool {
-	if ba.IsSingleRequest() {
-		_, ok := ba.Requests[0].GetInner().(*HeartbeatTxnRequest)
-		return ok
-	}
-	return false
+	return ba.isSingleRequestWithMethod(HeartbeatTxn)
 }
 
 // IsSingleEndTxnRequest returns true iff the batch contains a single request,
 // and that request is an EndTxnRequest.
 func (ba *BatchRequest) IsSingleEndTxnRequest() bool {
-	if ba.IsSingleRequest() {
-		_, ok := ba.Requests[0].GetInner().(*EndTxnRequest)
-		return ok
-	}
-	return false
+	return ba.isSingleRequestWithMethod(EndTxn)
 }
 
 // IsSingleAbortTxnRequest returns true iff the batch contains a single request,
 // and that request is an EndTxnRequest(commit=false).
 func (ba *BatchRequest) IsSingleAbortTxnRequest() bool {
-	if ba.IsSingleRequest() {
-		if et, ok := ba.Requests[0].GetInner().(*EndTxnRequest); ok {
-			return !et.Commit
-		}
+	if ba.isSingleRequestWithMethod(EndTxn) {
+		return !ba.Requests[0].GetInner().(*EndTxnRequest).Commit
 	}
 	return false
+}
+
+// IsSingleRefreshRequest returns true iff the batch contains a single request,
+// and that request is a RefreshRequest.
+func (ba *BatchRequest) IsSingleRefreshRequest() bool {
+	return ba.isSingleRequestWithMethod(Refresh)
 }
 
 // IsSingleSubsumeRequest returns true iff the batch contains a single request,
 // and that request is an SubsumeRequest.
 func (ba *BatchRequest) IsSingleSubsumeRequest() bool {
-	if ba.IsSingleRequest() {
-		_, ok := ba.Requests[0].GetInner().(*SubsumeRequest)
-		return ok
-	}
-	return false
+	return ba.isSingleRequestWithMethod(Subsume)
 }
 
 // IsSingleComputeChecksumRequest returns true iff the batch contains a single
 // request, and that request is a ComputeChecksumRequest.
 func (ba *BatchRequest) IsSingleComputeChecksumRequest() bool {
-	if ba.IsSingleRequest() {
-		_, ok := ba.Requests[0].GetInner().(*ComputeChecksumRequest)
-		return ok
-	}
-	return false
+	return ba.isSingleRequestWithMethod(ComputeChecksum)
 }
 
 // IsSingleCheckConsistencyRequest returns true iff the batch contains a single
 // request, and that request is a CheckConsistencyRequest.
 func (ba *BatchRequest) IsSingleCheckConsistencyRequest() bool {
-	if ba.IsSingleRequest() {
-		_, ok := ba.Requests[0].GetInner().(*CheckConsistencyRequest)
-		return ok
-	}
-	return false
+	return ba.isSingleRequestWithMethod(CheckConsistency)
 }
 
 // IsSingleAddSSTableRequest returns true iff the batch contains a single
 // request, and that request is an AddSSTableRequest that will ingest as an SST,
 // (i.e. does not have IngestAsWrites set)
 func (ba *BatchRequest) IsSingleAddSSTableRequest() bool {
-	if ba.IsSingleRequest() {
-		req, ok := ba.Requests[0].GetInner().(*AddSSTableRequest)
-		return ok && !req.IngestAsWrites
+	if ba.isSingleRequestWithMethod(AddSSTable) {
+		return !ba.Requests[0].GetInner().(*AddSSTableRequest).IngestAsWrites
 	}
 	return false
 }

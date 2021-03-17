@@ -357,16 +357,6 @@ func (b *Bytes) AppendVal(v []byte) {
 	b.offsets = append(b.offsets, int32(len(b.data)))
 }
 
-// SetLength sets the length of this Bytes. Note that it will panic if there is
-// not enough capacity.
-func (b *Bytes) SetLength(l int) {
-	if b.isWindow {
-		panic("SetLength is called on a window into Bytes")
-	}
-	// We need +1 for an extra offset at the end.
-	b.offsets = b.offsets[:l+1]
-}
-
 // Len returns how many []byte values the receiver contains.
 func (b *Bytes) Len() int {
 	return len(b.offsets) - 1
@@ -386,7 +376,12 @@ func (b *Bytes) Size() uintptr {
 // ProportionalSize returns the size of the receiver in bytes that is
 // attributed to only first n out of Len() elements.
 func (b *Bytes) ProportionalSize(n int64) uintptr {
-	return FlatBytesOverhead + uintptr(len(b.data[:b.offsets[n]])) + uintptr(n)*sizeOfInt32
+	if n == 0 {
+		return 0
+	}
+	// It is possible that we have a "window" into the vector that doesn't start
+	// from the offset of 0, so we have to look at the first actual offset.
+	return FlatBytesOverhead + uintptr(len(b.data[b.offsets[0]:b.offsets[n]])) + uintptr(n)*sizeOfInt32
 }
 
 var zeroInt32Slice = make([]int32, BytesInitialAllocationFactor*BatchSize())

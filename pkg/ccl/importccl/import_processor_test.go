@@ -116,8 +116,7 @@ func TestConverterFlushesBatches(t *testing.T) {
 				}
 
 				kvCh := make(chan row.KVBatch, batchSize)
-				conv, err := makeInputConverter(ctx, converterSpec, &evalCtx, kvCh,
-					nil /* seqChunkProvider */)
+				conv, err := makeInputConverter(ctx, converterSpec, &evalCtx, kvCh, nil /* seqChunkProvider */)
 				if err != nil {
 					t.Fatalf("makeInputConverter() error = %v", err)
 				}
@@ -543,18 +542,16 @@ var _ jobs.Resumer = &cancellableImportResumer{}
 
 type cancellableImportResumer struct {
 	ctx              context.Context
-	jobIDCh          chan int64
-	jobID            int64
+	jobIDCh          chan jobspb.JobID
+	jobID            jobspb.JobID
 	onSuccessBarrier syncBarrier
 	wrapped          *importResumer
 }
 
-func (r *cancellableImportResumer) Resume(
-	_ context.Context, execCtx interface{}, resultsCh chan<- tree.Datums,
-) error {
-	r.jobID = *r.wrapped.job.ID()
+func (r *cancellableImportResumer) Resume(ctx context.Context, execCtx interface{}) error {
+	r.jobID = r.wrapped.job.ID()
 	r.jobIDCh <- r.jobID
-	if err := r.wrapped.Resume(r.ctx, execCtx, resultsCh); err != nil {
+	if err := r.wrapped.Resume(r.ctx, execCtx); err != nil {
 		return err
 	}
 	if r.onSuccessBarrier != nil {
@@ -593,7 +590,7 @@ type jobState struct {
 	prog   jobspb.ImportProgress
 }
 
-func queryJob(db sqlutils.DBHandle, jobID int64) (js jobState) {
+func queryJob(db sqlutils.DBHandle, jobID jobspb.JobID) (js jobState) {
 	js = jobState{
 		err:    nil,
 		status: "",
@@ -626,7 +623,7 @@ func queryJob(db sqlutils.DBHandle, jobID int64) (js jobState) {
 
 // Repeatedly queries job status/progress until specified function returns true.
 func queryJobUntil(
-	t *testing.T, db sqlutils.DBHandle, jobID int64, isDone func(js jobState) bool,
+	t *testing.T, db sqlutils.DBHandle, jobID jobspb.JobID, isDone func(js jobState) bool,
 ) (js jobState) {
 	t.Helper()
 	for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
@@ -669,8 +666,8 @@ func TestCSVImportCanBeResumed(t *testing.T) {
 	defer sqlDB.Exec(t, `DROP TABLE t`)
 
 	jobCtx, cancelImport := context.WithCancel(ctx)
-	jobIDCh := make(chan int64)
-	var jobID int64 = -1
+	jobIDCh := make(chan jobspb.JobID)
+	var jobID jobspb.JobID = -1
 	var importSummary backupccl.RowCount
 
 	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
@@ -775,10 +772,10 @@ func TestCSVImportMarksFilesFullyProcessed(t *testing.T) {
 	sqlDB.Exec(t, "CREATE TABLE t (id INT, data STRING)")
 	defer sqlDB.Exec(t, `DROP TABLE t`)
 
-	jobIDCh := make(chan int64)
+	jobIDCh := make(chan jobspb.JobID)
 	controllerBarrier, importBarrier := newSyncBarrier()
 
-	var jobID int64 = -1
+	var jobID jobspb.JobID = -1
 	var importSummary backupccl.RowCount
 
 	registry.TestingResumerCreationKnobs = map[jobspb.Type]func(raw jobs.Resumer) jobs.Resumer{
@@ -917,7 +914,7 @@ func newTestSpec(
 	switch format.Format {
 	case roachpb.IOFileFormat_CSV:
 		descr = descForTable(ctx, t,
-			"CREATE TABLE simple (i INT PRIMARY KEY, s text )", 10, 20, NoFKs)
+			"CREATE TABLE simple (i INT PRIMARY KEY, s text )", 100, 200, NoFKs)
 	case
 		roachpb.IOFileFormat_Mysqldump,
 		roachpb.IOFileFormat_MysqlOutfile,
@@ -925,7 +922,7 @@ func newTestSpec(
 		roachpb.IOFileFormat_PgCopy,
 		roachpb.IOFileFormat_Avro:
 		descr = descForTable(ctx, t,
-			"CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea default null)", 10, 20, NoFKs)
+			"CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea default null)", 100, 200, NoFKs)
 	default:
 		t.Fatalf("Unsupported input format: %v", format)
 	}
@@ -940,8 +937,12 @@ func newTestSpec(
 	}
 	assert.True(t, numCols > 0)
 
+	fullTableName := "simple"
+	if format.Format == roachpb.IOFileFormat_PgDump {
+		fullTableName = "public.simple"
+	}
 	spec.tables = map[string]*execinfrapb.ReadImportDataSpec_ImportTable{
-		"simple": {Desc: descr.TableDesc(), TargetCols: targetCols[0:numCols]},
+		fullTableName: {Desc: descr.TableDesc(), TargetCols: targetCols[0:numCols]},
 	}
 
 	for id, path := range inputs {
@@ -955,7 +956,8 @@ func pgDumpFormat() roachpb.IOFileFormat {
 	return roachpb.IOFileFormat{
 		Format: roachpb.IOFileFormat_PgDump,
 		PgDump: roachpb.PgDumpOptions{
-			MaxRowSize: 64 * 1024,
+			MaxRowSize:        64 * 1024,
+			IgnoreUnsupported: true,
 		},
 	}
 }

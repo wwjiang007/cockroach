@@ -17,17 +17,17 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 )
@@ -43,11 +43,9 @@ type flowStreamClient interface {
 // be called with the necessary information to establish a connection to a
 // given remote endpoint.
 type Outbox struct {
-	colexec.OneInputNode
+	colexecop.OneInputNode
 
 	typs []*types.T
-	// batch is the last batch received from the input.
-	batch coldata.Batch
 
 	converter  *colserde.ArrowBatchConverter
 	serializer *colserde.RecordBatchSerializer
@@ -56,12 +54,19 @@ type Outbox struct {
 	draining        uint32
 	metadataSources []execinfrapb.MetadataSource
 	// closers is a slice of Closers that need to be Closed on termination.
-	closers colexecbase.Closers
+	closers colexecop.Closers
 
 	scratch struct {
 		buf *bytes.Buffer
 		msg *execinfrapb.ProducerMessage
 	}
+
+	span *tracing.Span
+	// getStats, when non-nil, returns all of the execution statistics of the
+	// operators that are in the same tree as this Outbox. The stats will be
+	// added into the span as Structured payload and returned to the gateway as
+	// execinfrapb.ProducerMetadata.
+	getStats func() []*execinfrapb.ComponentStats
 
 	// A copy of Run's caller ctx, with no StreamID tag.
 	// Used to pass a clean context to the input.Next.
@@ -69,12 +74,15 @@ type Outbox struct {
 }
 
 // NewOutbox creates a new Outbox.
+// - getStats, when non-nil, returns all of the execution statistics of the
+//   operators that are in the same tree as this Outbox.
 func NewOutbox(
 	allocator *colmem.Allocator,
-	input colexecbase.Operator,
+	input colexecop.Operator,
 	typs []*types.T,
 	metadataSources []execinfrapb.MetadataSource,
-	toClose []colexecbase.Closer,
+	toClose []colexecop.Closer,
+	getStats func() []*execinfrapb.ComponentStats,
 ) (*Outbox, error) {
 	c, err := colserde.NewArrowBatchConverter(typs)
 	if err != nil {
@@ -87,12 +95,13 @@ func NewOutbox(
 	o := &Outbox{
 		// Add a deselector as selection vectors are not serialized (nor should they
 		// be).
-		OneInputNode:    colexec.NewOneInputNode(colexec.NewDeselectorOp(allocator, input, typs)),
+		OneInputNode:    colexecop.NewOneInputNode(colexecutils.NewDeselectorOp(allocator, input, typs)),
 		typs:            typs,
 		converter:       c,
 		serializer:      s,
 		metadataSources: metadataSources,
 		closers:         toClose,
+		getStats:        getStats,
 	}
 	o.scratch.buf = &bytes.Buffer{}
 	o.scratch.msg = &execinfrapb.ProducerMessage{}
@@ -130,6 +139,11 @@ func (o *Outbox) Run(
 	cancelFn context.CancelFunc,
 	connectionTimeout time.Duration,
 ) {
+	ctx, o.span = execinfra.ProcessorSpan(ctx, "outbox")
+	if o.span != nil {
+		defer o.span.Finish()
+	}
+
 	o.runnerCtx = ctx
 	ctx = logtags.AddTag(ctx, "streamID", streamID)
 	log.VEventf(ctx, 2, "Outbox Dialing %s", nodeID)
@@ -227,28 +241,32 @@ func (o *Outbox) sendBatches(
 	ctx context.Context, stream flowStreamClient, cancelFn context.CancelFunc,
 ) (terminatedGracefully bool, errToSend error) {
 	if o.runnerCtx == nil {
+		// In the non-testing path, runnerCtx has been set in Run() method;
+		// however, the tests might use runWithStream() directly in which case
+		// runnerCtx will remain unset, so we have this check.
 		o.runnerCtx = ctx
 	}
 	errToSend = colexecerror.CatchVectorizedRuntimeError(func() {
-		o.Input().Init()
+		o.Input.Init()
 		for {
 			if atomic.LoadUint32(&o.draining) == 1 {
 				terminatedGracefully = true
 				return
 			}
 
-			o.batch = o.Input().Next(o.runnerCtx)
-			if o.batch.Length() == 0 {
+			batch := o.Input.Next(o.runnerCtx)
+			n := batch.Length()
+			if n == 0 {
 				terminatedGracefully = true
 				return
 			}
 
 			o.scratch.buf.Reset()
-			d, err := o.converter.BatchToArrow(o.batch)
+			d, err := o.converter.BatchToArrow(batch)
 			if err != nil {
 				colexecerror.InternalError(errors.Wrap(err, "Outbox BatchToArrow data serialization error"))
 			}
-			if _, _, err := o.serializer.Serialize(o.scratch.buf, d, o.batch.Length()); err != nil {
+			if _, _, err := o.serializer.Serialize(o.scratch.buf, d, n); err != nil {
 				colexecerror.InternalError(errors.Wrap(err, "Outbox Serialize data error"))
 			}
 			o.scratch.msg.Data.RawBytes = o.scratch.buf.Bytes()
@@ -274,6 +292,11 @@ func (o *Outbox) sendMetadata(ctx context.Context, stream flowStreamClient, errT
 		msg.Data.Metadata = append(
 			msg.Data.Metadata, execinfrapb.LocalMetaToRemoteProducerMeta(ctx, execinfrapb.ProducerMetadata{Err: errToSend}),
 		)
+	}
+	if o.span != nil && o.getStats != nil {
+		for _, s := range o.getStats() {
+			o.span.RecordStructured(s)
+		}
 	}
 	if trace := execinfra.GetTraceData(ctx); trace != nil {
 		msg.Data.Metadata = append(msg.Data.Metadata, execinfrapb.RemoteProducerMetadata{

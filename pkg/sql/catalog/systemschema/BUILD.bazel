@@ -9,6 +9,7 @@ go_library(
         "//pkg/keys",
         "//pkg/roachpb",
         "//pkg/security",
+        "//pkg/sql/catalog",
         "//pkg/sql/catalog/dbdesc",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/tabledesc",
@@ -20,6 +21,7 @@ go_library(
 
 go_test(
     name = "systemschema_test",
+    size = "small",
     srcs = ["system_test.go"],
     embed = [":systemschema"],
     deps = [

@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -183,14 +182,14 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 					tree.Name(tbDesc.GetName()),
 				)
 				var dependentDescQualifiedString string
-				if dbDesc.GetID() != dependentDesc.ParentID || tbDesc.GetParentSchemaID() != dependentDesc.GetParentSchemaID() {
+				if dbDesc.GetID() != dependentDesc.GetParentID() || tbDesc.GetParentSchemaID() != dependentDesc.GetParentSchemaID() {
 					descFQName, err := p.getQualifiedTableName(ctx, dependentDesc)
 					if err != nil {
 						log.Warningf(
 							ctx,
 							"unable to retrieve fully-qualified name of %s (id: %d): %v",
 							tbTableName.String(),
-							dependentDesc.ID,
+							dependentDesc.GetID(),
 							err,
 						)
 						return sqlerrors.NewDependentObjectErrorf(
@@ -202,7 +201,7 @@ func (n *renameDatabaseNode) startExec(params runParams) error {
 					dependentDescTableName := tree.MakeTableNameWithSchema(
 						tree.Name(dbDesc.GetName()),
 						tree.Name(schema),
-						tree.Name(dependentDesc.Name),
+						tree.Name(dependentDesc.GetName()),
 					)
 					dependentDescQualifiedString = dependentDescTableName.String()
 				}
@@ -261,7 +260,7 @@ func isAllowedDependentDescInRenameDatabase(
 	ctx context.Context,
 	dependedOn *descpb.TableDescriptor_Reference,
 	tbDesc catalog.TableDescriptor,
-	dependentDesc *tabledesc.Immutable,
+	dependentDesc catalog.TableDescriptor,
 	dbName string,
 ) (bool, string, error) {
 	// If it is a sequence, and it does not contain the database name, then we have
@@ -275,34 +274,37 @@ func isAllowedDependentDescInRenameDatabase(
 		colIDs.Add(int(colID))
 	}
 
-	for _, column := range dependentDesc.Columns {
-		if !colIDs.Contains(int(column.ID)) {
+	for _, column := range dependentDesc.PublicColumns() {
+		if !colIDs.Contains(int(column.GetID())) {
 			continue
 		}
-		colIDs.Remove(int(column.ID))
+		colIDs.Remove(int(column.GetID()))
 
-		if column.DefaultExpr == nil {
+		if !column.HasDefault() {
 			return false, "", errors.AssertionFailedf(
 				"rename_database: expected column id %d in table id %d to have a default expr",
 				dependedOn.ID,
-				dependentDesc.ID,
+				dependentDesc.GetID(),
 			)
 		}
 		// Try parse the default expression and find the table name direct reference.
-		parsedExpr, err := parser.ParseExpr(*column.DefaultExpr)
+		parsedExpr, err := parser.ParseExpr(column.GetDefaultExpr())
 		if err != nil {
 			return false, "", err
 		}
-		typedExpr, err := tree.TypeCheck(ctx, parsedExpr, nil, column.Type)
+		typedExpr, err := tree.TypeCheck(ctx, parsedExpr, nil, column.GetType())
 		if err != nil {
 			return false, "", err
 		}
-		seqNames, err := sequence.GetUsedSequenceNames(typedExpr)
+		seqIdentifiers, err := sequence.GetUsedSequences(typedExpr)
 		if err != nil {
 			return false, "", err
 		}
-		for _, seqName := range seqNames {
-			parsedSeqName, err := parser.ParseTableName(seqName)
+		for _, seqIdentifier := range seqIdentifiers {
+			if seqIdentifier.IsByID() {
+				continue
+			}
+			parsedSeqName, err := parser.ParseTableName(seqIdentifier.SeqName)
 			if err != nil {
 				return false, "", err
 			}
@@ -311,7 +313,7 @@ func isAllowedDependentDescInRenameDatabase(
 				// We only don't allow this if the database name is in there.
 				// This is always the last argument.
 				if tree.Name(parsedSeqName.Parts[parsedSeqName.NumParts-1]).Normalize() == tree.Name(dbName).Normalize() {
-					return false, column.Name, nil
+					return false, column.GetName(), nil
 				}
 			}
 		}
@@ -320,7 +322,7 @@ func isAllowedDependentDescInRenameDatabase(
 		return false, "", errors.AssertionFailedf(
 			"expected to find column ids %s in table id %d",
 			colIDs.String(),
-			dependentDesc.ID,
+			dependentDesc.GetID(),
 		)
 	}
 	return true, "", nil

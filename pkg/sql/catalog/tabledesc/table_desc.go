@@ -12,21 +12,33 @@
 package tabledesc
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
 
-var _ catalog.TableDescriptor = (*Immutable)(nil)
+var _ catalog.TableDescriptor = (*immutable)(nil)
 var _ catalog.TableDescriptor = (*Mutable)(nil)
 var _ catalog.MutableDescriptor = (*Mutable)(nil)
 var _ catalog.TableDescriptor = (*wrapper)(nil)
 
 // wrapper is the base implementation of the catalog.Descriptor
-// interface, which is overloaded by Immutable and Mutable.
+// interface, which is overloaded by immutable and Mutable.
 type wrapper struct {
 	descpb.TableDescriptor
+
+	// mutationCache, indexCache and columnCache, when not nil, respectively point
+	// to a struct containing precomputed catalog.Mutation, catalog.Index or
+	// catalog.Column slices.
+	// Those can therefore only be set when creating an immutable.
+	mutationCache *mutationCache
+	indexCache    *indexCache
+	columnCache   *columnCache
+
 	postDeserializationChanges PostDeserializationTableDescriptorChanges
 }
 
@@ -44,126 +56,6 @@ func (desc *wrapper) GetPostDeserializationChanges() PostDeserializationTableDes
 	return desc.postDeserializationChanges
 }
 
-// PartialIndexOrds returns a set containing the ordinal of each partial index
-// defined on the table.
-func (desc *wrapper) PartialIndexOrds() util.FastIntSet {
-	var partialIndexOrds util.FastIntSet
-	for i, idx := range desc.DeletableIndexes() {
-		if idx.IsPartial() {
-			partialIndexOrds.Add(i)
-		}
-	}
-	return partialIndexOrds
-}
-
-// mutationIndexes returns all non-public indexes in the specified state.
-func (desc *wrapper) mutationIndexes(
-	mutationState descpb.DescriptorMutation_State,
-) []descpb.IndexDescriptor {
-	if len(desc.Mutations) == 0 {
-		return nil
-	}
-	indexes := make([]descpb.IndexDescriptor, 0, len(desc.Mutations))
-	for _, m := range desc.Mutations {
-		if m.State != mutationState {
-			continue
-		}
-		if idx := m.GetIndex(); idx != nil {
-			indexes = append(indexes, *idx)
-		}
-	}
-	return indexes
-}
-
-// DeleteOnlyIndexes returns a list of delete-only mutation indexes.
-func (desc *wrapper) DeleteOnlyIndexes() []descpb.IndexDescriptor {
-	return desc.mutationIndexes(descpb.DescriptorMutation_DELETE_ONLY)
-}
-
-// WritableIndexes returns a list of public and write-only mutation indexes.
-func (desc *wrapper) WritableIndexes() []descpb.IndexDescriptor {
-	if len(desc.Mutations) == 0 {
-		return desc.Indexes
-	}
-	indexes := make([]descpb.IndexDescriptor, 0, len(desc.Indexes)+len(desc.Mutations))
-	// Add all public indexes.
-	indexes = append(indexes, desc.Indexes...)
-	// Add all non-public writable indexes.
-	indexes = append(indexes, desc.mutationIndexes(descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY)...)
-	return indexes
-}
-
-// DeletableIndexes implements the catalog.Descriptor interface.
-func (desc *wrapper) DeletableIndexes() []descpb.IndexDescriptor {
-	if len(desc.Mutations) == 0 {
-		return desc.Indexes
-	}
-	indexes := make([]descpb.IndexDescriptor, 0, len(desc.Indexes)+len(desc.Mutations))
-	// Add all writable indexes.
-	indexes = append(indexes, desc.WritableIndexes()...)
-	// Add all delete-only indexes.
-	indexes = append(indexes, desc.DeleteOnlyIndexes()...)
-	return indexes
-}
-
-// mutationColumns returns all non-public writable columns in the specified state.
-func (desc *wrapper) mutationColumns(
-	mutationState descpb.DescriptorMutation_State,
-) []descpb.ColumnDescriptor {
-	if len(desc.Mutations) == 0 {
-		return nil
-	}
-	columns := make([]descpb.ColumnDescriptor, 0, len(desc.Mutations))
-	for _, m := range desc.Mutations {
-		if m.State != mutationState {
-			continue
-		}
-		if col := m.GetColumn(); col != nil {
-			columns = append(columns, *col)
-		}
-	}
-	return columns
-}
-
-// DeletableColumns returns a list of public and non-public columns.
-func (desc *wrapper) DeletableColumns() []descpb.ColumnDescriptor {
-	if len(desc.Mutations) == 0 {
-		return desc.Columns
-	}
-	columns := make([]descpb.ColumnDescriptor, 0, len(desc.Columns)+len(desc.Mutations))
-	// Add writable columns.
-	columns = append(columns, desc.WritableColumns()...)
-	// Add delete-only columns.
-	columns = append(columns, desc.mutationColumns(descpb.DescriptorMutation_DELETE_ONLY)...)
-	return columns
-}
-
-// WritableColumns returns a list of public and write-only mutation columns.
-func (desc *wrapper) WritableColumns() []descpb.ColumnDescriptor {
-	if len(desc.Mutations) == 0 {
-		return desc.Columns
-	}
-	columns := make([]descpb.ColumnDescriptor, 0, len(desc.Columns)+len(desc.Mutations))
-	// Add public columns.
-	columns = append(columns, desc.Columns...)
-	// Add writable non-public columns.
-	columns = append(columns, desc.mutationColumns(descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY)...)
-	return columns
-}
-
-// MutationColumns returns a list of mutation columns.
-func (desc *wrapper) MutationColumns() []descpb.ColumnDescriptor {
-	if len(desc.Mutations) == 0 {
-		return nil
-	}
-	columns := make([]descpb.ColumnDescriptor, 0, len(desc.Mutations))
-	// Add all writable non-public columns.
-	columns = append(columns, desc.mutationColumns(descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY)...)
-	// Add all delete-only non-public columns.
-	columns = append(columns, desc.mutationColumns(descpb.DescriptorMutation_DELETE_ONLY)...)
-	return columns
-}
-
 // ActiveChecks returns a list of all check constraints that should be enforced
 // on writes (including constraints being added/validated). The columns
 // referenced by the returned checks are writable, but not necessarily public.
@@ -175,49 +67,13 @@ func (desc *wrapper) ActiveChecks() []descpb.TableDescriptor_CheckConstraint {
 	return checks
 }
 
-// GetColumnOrdinalsWithUserDefinedTypes returns a slice of column ordinals
-// of columns that contain user defined types.
-func (desc *wrapper) GetColumnOrdinalsWithUserDefinedTypes() []int {
-	var ords []int
-	for ord, col := range desc.DeletableColumns() {
-		if col.Type != nil && col.Type.UserDefined() {
-			ords = append(ords, ord)
-		}
-	}
-	return ords
-}
-
-// Immutable is a custom type for TableDescriptors
+// immutable is a custom type for TableDescriptors
 // It holds precomputed values and the underlying TableDescriptor
 // should be const.
-type Immutable struct {
+type immutable struct {
 	wrapper
 
-	// publicAndNonPublicCols is a list of public and non-public columns.
-	// It is partitioned by the state of the column: public, write-only, delete-only
-	publicAndNonPublicCols []descpb.ColumnDescriptor
-
-	// publicAndNonPublicCols is a list of public and non-public indexes.
-	// It is partitioned by the state of the index: public, write-only, delete-only
-	publicAndNonPublicIndexes []descpb.IndexDescriptor
-
-	writeOnlyColCount   int
-	writeOnlyIndexCount int
-
 	allChecks []descpb.TableDescriptor_CheckConstraint
-
-	// partialIndexOrds contains the ordinal of each partial index.
-	partialIndexOrds util.FastIntSet
-
-	// readableColumns is a list of columns (including those undergoing a schema change)
-	// which can be scanned. Columns in the process of a schema change
-	// are all set to nullable while column backfilling is still in
-	// progress, as mutation columns may have NULL values.
-	readableColumns []descpb.ColumnDescriptor
-
-	// columnsWithUDTs is a set of indexes into publicAndNonPublicCols containing
-	// indexes of columns that contain user defined types.
-	columnsWithUDTs []int
 
 	// isUncommittedVersion is set to true if this descriptor was created from
 	// a copy of a Mutable with an uncommitted version.
@@ -229,7 +85,7 @@ type Immutable struct {
 }
 
 // IsUncommittedVersion implements the Descriptor interface.
-func (desc *Immutable) IsUncommittedVersion() bool {
+func (desc *immutable) IsUncommittedVersion() bool {
 	return desc.isUncommittedVersion
 }
 
@@ -245,38 +101,17 @@ func (desc *wrapper) GetPrimaryIndexID() descpb.IndexID {
 	return desc.PrimaryIndex.ID
 }
 
-// GetPublicNonPrimaryIndexes returns the public non-primary indexes of the descriptor.
-func (desc *wrapper) GetPublicNonPrimaryIndexes() []descpb.IndexDescriptor {
-	return desc.Indexes
-}
-
 // IsTemporary returns true if this is a temporary table.
 func (desc *wrapper) IsTemporary() bool {
 	return desc.GetTemporary()
 }
 
-// GetPublicColumns return the public columns in the descriptor.
-func (desc *wrapper) GetPublicColumns() []descpb.ColumnDescriptor {
-	return desc.Columns
-}
-
-// GetColumnAtIdx returns the column at the specified index.
-func (desc *wrapper) GetColumnAtIdx(idx int) *descpb.ColumnDescriptor {
-	return &desc.Columns[idx]
-}
-
-// ReadableColumns implements the catalog.TableDescriptor interface
-func (desc *Immutable) ReadableColumns() []descpb.ColumnDescriptor {
-	return desc.readableColumns
-}
-
 // ImmutableCopy implements the MutableDescriptor interface.
 func (desc *Mutable) ImmutableCopy() catalog.Descriptor {
-	// TODO (lucy): Should the immutable descriptor constructors always make a
-	// copy, so we don't have to do it here?
-	imm := NewImmutable(*protoutil.Clone(desc.TableDesc()).(*descpb.TableDescriptor))
-	imm.isUncommittedVersion = desc.IsUncommittedVersion()
-	return imm
+	if desc.IsUncommittedVersion() {
+		return NewBuilderForUncommittedVersion(desc.TableDesc()).BuildImmutable()
+	}
+	return NewBuilder(desc.TableDesc()).BuildImmutable()
 }
 
 // IsUncommittedVersion implements the Descriptor interface.
@@ -317,4 +152,241 @@ func (desc *Mutable) SetPrimaryIndex(index descpb.IndexDescriptor) {
 // index.
 func (desc *Mutable) SetPublicNonPrimaryIndex(indexOrdinal int, index descpb.IndexDescriptor) {
 	desc.Indexes[indexOrdinal-1] = index
+}
+
+// GetPrimaryIndex returns the primary index in the form of a catalog.Index
+// interface.
+func (desc *wrapper) GetPrimaryIndex() catalog.Index {
+	return desc.getExistingOrNewIndexCache().primary
+}
+
+// getExistingOrNewIndexCache should be the only place where the indexCache
+// field in wrapper is ever read.
+func (desc *wrapper) getExistingOrNewIndexCache() *indexCache {
+	if desc.indexCache != nil {
+		return desc.indexCache
+	}
+	return newIndexCache(desc.TableDesc(), desc.getExistingOrNewMutationCache())
+}
+
+// AllIndexes returns a slice with all indexes, public and non-public,
+// in the underlying proto, in their canonical order:
+// - the primary index,
+// - the public non-primary indexes in the Indexes array, in order,
+// - the non-public indexes present in the Mutations array, in order.
+//
+// See also catalog.Index.Ordinal().
+func (desc *wrapper) AllIndexes() []catalog.Index {
+	return desc.getExistingOrNewIndexCache().all
+}
+
+// ActiveIndexes returns a slice with all public indexes in the underlying
+// proto, in their canonical order:
+// - the primary index,
+// - the public non-primary indexes in the Indexes array, in order.
+//
+// See also catalog.Index.Ordinal().
+func (desc *wrapper) ActiveIndexes() []catalog.Index {
+	return desc.getExistingOrNewIndexCache().active
+}
+
+// NonDropIndexes returns a slice of all non-drop indexes in the underlying
+// proto, in their canonical order. This means:
+// - the primary index, if the table is a physical table,
+// - the public non-primary indexes in the Indexes array, in order,
+// - the non-public indexes present in the Mutations array, in order,
+//   if the mutation is not a drop.
+//
+// See also catalog.Index.Ordinal().
+func (desc *wrapper) NonDropIndexes() []catalog.Index {
+	return desc.getExistingOrNewIndexCache().nonDrop
+}
+
+// NonDropIndexes returns a slice of all partial indexes in the underlying
+// proto, in their canonical order. This is equivalent to taking the slice
+// produced by AllIndexes and filtering indexes with non-empty expressions.
+func (desc *wrapper) PartialIndexes() []catalog.Index {
+	return desc.getExistingOrNewIndexCache().partial
+}
+
+// PublicNonPrimaryIndexes returns a slice of all active secondary indexes,
+// in their canonical order. This is equivalent to the Indexes array in the
+// proto.
+func (desc *wrapper) PublicNonPrimaryIndexes() []catalog.Index {
+	return desc.getExistingOrNewIndexCache().publicNonPrimary
+}
+
+// WritableNonPrimaryIndexes returns a slice of all non-primary indexes which
+// allow being written to: public + delete-and-write-only, in their canonical
+// order. This is equivalent to taking the slice produced by
+// DeletableNonPrimaryIndexes and removing the indexes which are in mutations
+// in the delete-only state.
+func (desc *wrapper) WritableNonPrimaryIndexes() []catalog.Index {
+	return desc.getExistingOrNewIndexCache().writableNonPrimary
+}
+
+// DeletableNonPrimaryIndexes returns a slice of all non-primary indexes
+// which allow being deleted from: public + delete-and-write-only +
+// delete-only, in  their canonical order. This is equivalent to taking
+// the slice produced by AllIndexes and removing the primary index.
+func (desc *wrapper) DeletableNonPrimaryIndexes() []catalog.Index {
+	return desc.getExistingOrNewIndexCache().deletableNonPrimary
+}
+
+// DeleteOnlyNonPrimaryIndexes returns a slice of all non-primary indexes
+// which allow only being deleted from, in their canonical order. This is
+// equivalent to taking the slice produced by DeletableNonPrimaryIndexes and
+// removing the indexes which are not in mutations or not in the delete-only
+// state.
+func (desc *wrapper) DeleteOnlyNonPrimaryIndexes() []catalog.Index {
+	return desc.getExistingOrNewIndexCache().deleteOnlyNonPrimary
+}
+
+// FindIndexWithID returns the first catalog.Index that matches the id
+// in the set of all indexes, or an error if none was found. The order of
+// traversal is the canonical order, see catalog.Index.Ordinal().
+func (desc *wrapper) FindIndexWithID(id descpb.IndexID) (catalog.Index, error) {
+	if idx := catalog.FindIndex(desc, catalog.IndexOpts{
+		NonPhysicalPrimaryIndex: true,
+		DropMutations:           true,
+		AddMutations:            true,
+	}, func(idx catalog.Index) bool {
+		return idx.GetID() == id
+	}); idx != nil {
+		return idx, nil
+	}
+	for _, m := range desc.GCMutations {
+		if m.IndexID == id {
+			return nil, ErrIndexGCMutationsList
+		}
+	}
+	return nil, errors.Errorf("index-id \"%d\" does not exist", id)
+}
+
+// FindIndexWithName returns the first catalog.Index that matches the name in
+// the set of all indexes, excluding the primary index of non-physical
+// tables, or an error if none was found. The order of traversal is the
+// canonical order, see catalog.Index.Ordinal().
+func (desc *wrapper) FindIndexWithName(name string) (catalog.Index, error) {
+	if idx := catalog.FindIndex(desc, catalog.IndexOpts{
+		NonPhysicalPrimaryIndex: false,
+		DropMutations:           true,
+		AddMutations:            true,
+	}, func(idx catalog.Index) bool {
+		return idx.GetName() == name
+	}); idx != nil {
+		return idx, nil
+	}
+	return nil, errors.Errorf("index %q does not exist", name)
+}
+
+// getExistingOrNewColumnCache should be the only place where the columnCache
+// field in wrapper is ever read.
+func (desc *wrapper) getExistingOrNewColumnCache() *columnCache {
+	if desc.columnCache != nil {
+		return desc.columnCache
+	}
+	return newColumnCache(desc.TableDesc(), desc.getExistingOrNewMutationCache())
+}
+
+// AllColumns returns a slice of Column interfaces containing the
+// table's public columns and column mutations, in the canonical order:
+// - all public columns in the same order as in the underlying
+//   desc.TableDesc().Columns slice;
+// - all column mutations in the same order as in the underlying
+//   desc.TableDesc().Mutations slice.
+// - all system columns defined in colinfo.AllSystemColumnDescs.
+func (desc *wrapper) AllColumns() []catalog.Column {
+	return desc.getExistingOrNewColumnCache().all
+}
+
+// PublicColumns returns a slice of Column interfaces containing the
+// table's public columns, in the canonical order.
+func (desc *wrapper) PublicColumns() []catalog.Column {
+	return desc.getExistingOrNewColumnCache().public
+}
+
+// WritableColumns returns a slice of Column interfaces containing the
+// table's public columns and DELETE_AND_WRITE_ONLY mutations, in the canonical
+// order.
+func (desc *wrapper) WritableColumns() []catalog.Column {
+	return desc.getExistingOrNewColumnCache().writable
+}
+
+// DeletableColumns returns a slice of Column interfaces containing the
+// table's public columns and mutations, in the canonical order.
+func (desc *wrapper) DeletableColumns() []catalog.Column {
+	return desc.getExistingOrNewColumnCache().deletable
+}
+
+// NonDropColumns returns a slice of Column interfaces containing the
+// table's public columns and ADD mutations, in the canonical order.
+func (desc *wrapper) NonDropColumns() []catalog.Column {
+	return desc.getExistingOrNewColumnCache().nonDrop
+}
+
+// VisibleColumns returns a slice of Column interfaces containing the
+// table's visible columns , in the canonical order.
+func (desc *wrapper) VisibleColumns() []catalog.Column {
+	return desc.getExistingOrNewColumnCache().visible
+}
+
+// UserDefinedTypeColumns returns a slice of Column interfaces
+// containing the table's columns with user defined types, in the
+// canonical order.
+func (desc *wrapper) UserDefinedTypeColumns() []catalog.Column {
+	return desc.getExistingOrNewColumnCache().withUDTs
+}
+
+// ReadableColumns is a list of columns (including those undergoing a schema
+// change) which can be scanned. Columns in the process of a schema change
+// are all set to nullable while column backfilling is still in
+// progress, as mutation columns may have NULL values.
+func (desc *wrapper) ReadableColumns() []catalog.Column {
+	return desc.getExistingOrNewColumnCache().readable
+}
+
+// SystemColumns returns a slice of Column interfaces
+// containing the table's system columns, as defined in
+// colinfo.AllSystemColumnDescs.
+func (desc *wrapper) SystemColumns() []catalog.Column {
+	return desc.getExistingOrNewColumnCache().system
+}
+
+// FindColumnWithID returns the first column found whose ID matches the
+// provided target ID, in the canonical order.
+// If no column is found then an error is also returned.
+func (desc *wrapper) FindColumnWithID(id descpb.ColumnID) (catalog.Column, error) {
+	for _, col := range desc.AllColumns() {
+		if col.GetID() == id {
+			return col, nil
+		}
+	}
+	return nil, fmt.Errorf("column-id \"%d\" does not exist", id)
+}
+
+// FindColumnWithName returns the first column found whose name matches the
+// provided target ID, in the canonical order.
+// If no column is found then an error is also returned.
+func (desc *wrapper) FindColumnWithName(name tree.Name) (catalog.Column, error) {
+	for _, col := range desc.AllColumns() {
+		if col.ColName() == name {
+			return col, nil
+		}
+	}
+	return nil, colinfo.NewUndefinedColumnError(string(name))
+}
+
+// getExistingOrNewMutationCache should be the only place where the
+// mutationCache field in wrapper is ever read.
+func (desc *wrapper) getExistingOrNewMutationCache() *mutationCache {
+	if desc.mutationCache != nil {
+		return desc.mutationCache
+	}
+	return newMutationCache(desc.TableDesc())
+}
+
+// AllMutations returns all of the table descriptor's mutations.
+func (desc *wrapper) AllMutations() []catalog.Mutation {
+	return desc.getExistingOrNewMutationCache().all
 }

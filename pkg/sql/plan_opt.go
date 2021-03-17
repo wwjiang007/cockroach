@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -60,7 +61,7 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 		*tree.CreateSequence,
 		*tree.CreateStats,
 		*tree.Deallocate, *tree.Discard, *tree.DropDatabase, *tree.DropIndex,
-		*tree.DropTable, *tree.DropView, *tree.DropSequence,
+		*tree.DropTable, *tree.DropView, *tree.DropSequence, *tree.DropType,
 		*tree.Execute,
 		*tree.Grant, *tree.GrantRole,
 		*tree.Prepare,
@@ -142,12 +143,12 @@ func (p *planner) prepareUsingOptimizer(ctx context.Context) (planFlags, error) 
 			// Convert the metadata opt.ColumnID to its ordinal position in the table.
 			colOrdinal := colMeta.Table.ColumnOrdinal(col.ID)
 			// Use that ordinal position to retrieve the column's stable ID.
-			var desc *descpb.ColumnDescriptor
+			var column catalog.Column
 			if catTable, ok := tab.(optCatalogTableInterface); ok {
-				desc = catTable.getColDesc(colOrdinal)
+				column = catTable.getCol(colOrdinal)
 			}
-			if desc != nil {
-				resultCols[i].PGAttributeNum = desc.GetPGAttributeNum()
+			if column != nil {
+				resultCols[i].PGAttributeNum = column.GetPGAttributeNum()
 			} else {
 				resultCols[i].PGAttributeNum = uint32(tab.Column(colOrdinal).ColID())
 			}
@@ -583,8 +584,6 @@ func (opc *optPlanningCtx) runExecBuilder(
 	}
 
 	planTop.planComponents = *result
-	planTop.mem = mem
-	planTop.catalog = &opc.catalog
 	planTop.stmt = stmt
 	planTop.flags = opc.flags
 	if isDDL {
@@ -595,6 +594,10 @@ func (opc *optPlanningCtx) runExecBuilder(
 	}
 	if containsFullIndexScan {
 		planTop.flags.Set(planFlagContainsFullIndexScan)
+	}
+	if planTop.instrumentation.ShouldSaveMemo() {
+		planTop.mem = mem
+		planTop.catalog = &opc.catalog
 	}
 	return nil
 }

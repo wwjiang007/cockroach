@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -146,10 +147,10 @@ func (tr *TableReaderSpec) summary() (string, []string) {
 	details := []string{indexDetail(&tr.Table, tr.IndexIdx)}
 
 	if len(tr.Spans) > 0 {
-		tbl := tabledesc.NewImmutable(tr.Table)
+		tbl := tabledesc.NewBuilder(&tr.Table).BuildImmutableTable()
 		// only show the first span
-		idx, _, _ := tbl.FindIndexByIndexIdx(int(tr.IndexIdx))
-		valDirs := catalogkeys.IndexKeyValDirs(idx)
+		idx := tbl.ActiveIndexes()[int(tr.IndexIdx)]
+		valDirs := catalogkeys.IndexKeyValDirs(idx.IndexDesc())
 
 		var spanStr strings.Builder
 		spanStr.WriteString("Spans: ")
@@ -176,8 +177,11 @@ func (jr *JoinReaderSpec) summary() (string, []string) {
 		details = append(details, joinTypeDetail(jr.Type))
 	}
 	details = append(details, indexDetail(&jr.Table, jr.IndexIdx))
-	if jr.LookupColumns != nil {
+	if len(jr.LookupColumns) > 0 {
 		details = append(details, fmt.Sprintf("Lookup join on: %s", colListStr(jr.LookupColumns)))
+	}
+	if !jr.LookupExpr.Empty() {
+		details = append(details, fmt.Sprintf("Lookup join on: %s", jr.LookupExpr))
 	}
 	if !jr.OnExpr.Empty() {
 		details = append(details, fmt.Sprintf("ON %s", jr.OnExpr))
@@ -575,8 +579,9 @@ type diagramData struct {
 	Processors []diagramProcessor `json:"processors"`
 	Edges      []diagramEdge      `json:"edges"`
 
-	flags  DiagramFlags
-	flowID FlowID
+	flags   DiagramFlags
+	flowID  FlowID
+	nodeIDs []roachpb.NodeID
 }
 
 var _ FlowDiagram = &diagramData{}
@@ -595,27 +600,36 @@ func (d *diagramData) AddSpans(spans []tracingpb.RecordedSpan) {
 	statsMap := ExtractStatsFromSpans(spans, d.flags.MakeDeterministic)
 	for i := range d.Processors {
 		p := &d.Processors[i]
-		component := ProcessorComponentID(d.flowID, p.processorID)
+		nodeID := d.nodeIDs[p.NodeIdx]
+		component := ProcessorComponentID(base.SQLInstanceID(nodeID), d.flowID, p.processorID)
 		if compStats := statsMap[component]; compStats != nil {
 			p.Core.Details = append(p.Core.Details, compStats.StatsForQueryPlan()...)
 		}
 	}
 	for i := range d.Edges {
-		component := StreamComponentID(d.flowID, d.Edges[i].streamID)
+		originNodeID := d.nodeIDs[d.Processors[d.Edges[i].SourceProc].NodeIdx]
+		component := StreamComponentID(base.SQLInstanceID(originNodeID), d.flowID, d.Edges[i].streamID)
 		if compStats := statsMap[component]; compStats != nil {
 			d.Edges[i].Stats = compStats.StatsForQueryPlan()
 		}
 	}
 }
 
+// generateDiagramData generates the diagram data, given a list of flows (one
+// per node). The nodeIDs list corresponds 1-1 to the flows list.
 func generateDiagramData(
-	sql string, flows []FlowSpec, nodeNames []string, flags DiagramFlags,
+	sql string, flows []FlowSpec, nodeIDs []roachpb.NodeID, flags DiagramFlags,
 ) (FlowDiagram, error) {
 	d := &diagramData{
-		SQL:       sql,
-		NodeNames: nodeNames,
-		flags:     flags,
+		SQL:     sql,
+		nodeIDs: nodeIDs,
+		flags:   flags,
 	}
+	d.NodeNames = make([]string, len(nodeIDs))
+	for i := range d.NodeNames {
+		d.NodeNames[i] = nodeIDs[i].String()
+	}
+
 	if len(flows) > 0 {
 		d.flowID = flows[0].FlowID
 		for i := 1; i < len(flows); i++ {
@@ -746,21 +760,20 @@ func GeneratePlanDiagram(
 ) (FlowDiagram, error) {
 	// We sort the flows by node because we want the diagram data to be
 	// deterministic.
-	nodeIDs := make([]int, 0, len(flows))
+	nodeIDs := make([]roachpb.NodeID, 0, len(flows))
 	for n := range flows {
-		nodeIDs = append(nodeIDs, int(n))
+		nodeIDs = append(nodeIDs, n)
 	}
-	sort.Ints(nodeIDs)
+	sort.Slice(nodeIDs, func(i, j int) bool {
+		return nodeIDs[i] < nodeIDs[j]
+	})
 
 	flowSlice := make([]FlowSpec, len(nodeIDs))
-	nodeNames := make([]string, len(nodeIDs))
-	for i, nVal := range nodeIDs {
-		n := roachpb.NodeID(nVal)
+	for i, n := range nodeIDs {
 		flowSlice[i] = *flows[n]
-		nodeNames[i] = n.String()
 	}
 
-	return generateDiagramData(sql, flowSlice, nodeNames, flags)
+	return generateDiagramData(sql, flowSlice, nodeIDs, flags)
 }
 
 // GeneratePlanDiagramURL generates the json data for a flow diagram and a

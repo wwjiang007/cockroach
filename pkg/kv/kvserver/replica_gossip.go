@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -29,6 +30,10 @@ const configGossipTTL = 0 // does not expire
 func (r *Replica) gossipFirstRange(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.gossipFirstRangeLocked(ctx)
+}
+
+func (r *Replica) gossipFirstRangeLocked(ctx context.Context) {
 	// Gossip is not provided for the bootstrap store and for some tests.
 	if r.store.Gossip() == nil {
 		return
@@ -56,7 +61,7 @@ func (r *Replica) gossipFirstRange(ctx context.Context) {
 // inherently inconsistent and asynchronous, we're using the lease as a way to
 // ensure that only one node gossips at a time.
 func (r *Replica) shouldGossip(ctx context.Context) bool {
-	return r.OwnsValidLease(ctx, r.store.Clock().Now())
+	return r.OwnsValidLease(ctx, r.store.Clock().NowAsClockTimestamp())
 }
 
 // MaybeGossipSystemConfig scans the entire SystemConfig span and gossips it.
@@ -156,7 +161,7 @@ func (r *Replica) MaybeGossipNodeLiveness(ctx context.Context, span roachpb.Span
 	defer rw.Close()
 
 	br, result, pErr :=
-		evaluateBatch(ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, &ba, true /* readOnly */)
+		evaluateBatch(ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, &ba, hlc.Timestamp{} /* lul */, true /* readOnly */)
 	if pErr != nil {
 		return errors.Wrapf(pErr.GoError(), "couldn't scan node liveness records in span %s", span)
 	}
@@ -208,7 +213,7 @@ func (r *Replica) loadSystemConfig(ctx context.Context) (*config.SystemConfigEnt
 	defer rw.Close()
 
 	br, result, pErr := evaluateBatch(
-		ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, &ba, true, /* readOnly */
+		ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, &ba, hlc.Timestamp{} /* lul */, true, /* readOnly */
 	)
 	if pErr != nil {
 		return nil, pErr.GoError()
@@ -292,10 +297,6 @@ func (r *Replica) maybeGossipFirstRange(ctx context.Context) *roachpb.Error {
 	}
 	if err := r.store.Gossip().AddClusterID(r.store.ClusterID()); err != nil {
 		log.Errorf(ctx, "failed to gossip cluster ID: %+v", err)
-	}
-
-	if r.store.cfg.TestingKnobs.DisablePeriodicGossips {
-		return nil
 	}
 
 	hasLease, pErr := r.getLeaseForGossip(ctx)

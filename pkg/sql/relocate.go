@@ -17,9 +17,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -30,7 +30,7 @@ type relocateNode struct {
 	optColumnsSlot
 
 	relocateLease bool
-	tableDesc     *tabledesc.Immutable
+	tableDesc     catalog.TableDescriptor
 	index         *descpb.IndexDescriptor
 	rows          planNode
 
@@ -51,6 +51,9 @@ func (n *relocateNode) startExec(runParams) error {
 	n.run.storeMap = make(map[roachpb.StoreID]roachpb.NodeID)
 	return nil
 }
+
+// TODO(aayush): Extend EXPERIMENTAL_RELOCATE syntax to support relocating
+// non-voting replicas.
 
 func (n *relocateNode) Next(params runParams) (bool, error) {
 	// Each Next call relocates one range (corresponding to one row from n.rows).
@@ -131,7 +134,9 @@ func (n *relocateNode) Next(params runParams) (bool, error) {
 			return false, err
 		}
 	} else {
-		if err := params.p.ExecCfg().DB.AdminRelocateRange(params.ctx, rowKey, relocationTargets); err != nil {
+		if err := params.p.ExecCfg().DB.AdminRelocateRange(
+			params.ctx, rowKey, relocationTargets, nil, /* nonVoterTargets */
+		); err != nil {
 			return false, err
 		}
 	}

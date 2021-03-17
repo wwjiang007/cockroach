@@ -11,11 +11,14 @@
 package xform
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/idxconstraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/partialidx"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
 
 // CustomFuncs contains all the custom match and replace functions used by the
@@ -30,8 +33,12 @@ type CustomFuncs struct {
 
 // Init initializes a new CustomFuncs with the given explorer.
 func (c *CustomFuncs) Init(e *explorer) {
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*c = CustomFuncs{
+		e: e,
+	}
 	c.CustomFuncs.Init(e.f)
-	c.e = e
 	c.im.Init(e.f, e.mem.Metadata(), e.evalCtx)
 }
 
@@ -54,6 +61,44 @@ func (c *CustomFuncs) HasInvertedIndexes(scanPrivate *memo.ScanPrivate) bool {
 		}
 	}
 	return false
+}
+
+// MapFilterCols returns a new FiltersExpr with all the src column IDs in
+// the input expression replaced with column IDs in dst.
+//
+// NOTE: Every ColumnID in src must map to the a ColumnID in dst with the same
+// relative position in the ColSets. For example, if src and dst are (1, 5, 6)
+// and (7, 12, 15), then the following mapping would be applied:
+//
+//   1 => 7
+//   5 => 12
+//   6 => 15
+func (c *CustomFuncs) MapFilterCols(
+	filters memo.FiltersExpr, src, dst opt.ColSet,
+) memo.FiltersExpr {
+	newFilters := c.mapScalarExprCols(&filters, src, dst).(*memo.FiltersExpr)
+	return *newFilters
+}
+
+func (c *CustomFuncs) mapScalarExprCols(scalar opt.ScalarExpr, src, dst opt.ColSet) opt.ScalarExpr {
+	if src.Len() != dst.Len() {
+		panic(errors.AssertionFailedf(
+			"src and dst must have the same number of columns, src: %v, dst: %v",
+			src,
+			dst,
+		))
+	}
+
+	// Map each column in src to a column in dst based on the relative position
+	// of both the src and dst ColumnIDs in the ColSet.
+	var colMap opt.ColMap
+	dstCol, _ := dst.Next(0)
+	for srcCol, ok := src.Next(0); ok; srcCol, ok = src.Next(srcCol + 1) {
+		colMap.Set(int(srcCol), int(dstCol))
+		dstCol, _ = dst.Next(dstCol + 1)
+	}
+
+	return c.RemapCols(scalar, colMap)
 }
 
 // checkConstraintFilters generates all filters that we can derive from the
@@ -110,10 +155,7 @@ func (c *CustomFuncs) checkConstraintFilters(tabID opt.TableID) memo.FiltersExpr
 }
 
 func (c *CustomFuncs) initIdxConstraintForIndex(
-	requiredFilters, optionalFilters memo.FiltersExpr,
-	tabID opt.TableID,
-	indexOrd int,
-	isInverted bool,
+	requiredFilters, optionalFilters memo.FiltersExpr, tabID opt.TableID, indexOrd int,
 ) (ic *idxconstraint.Instance) {
 	ic = &idxconstraint.Instance{}
 
@@ -131,14 +173,6 @@ func (c *CustomFuncs) initIdxConstraintForIndex(
 		col := index.Column(i)
 		ordinal := col.Ordinal()
 		nullable := col.IsNullable()
-		if isInverted && col == index.VirtualInvertedColumn() {
-			// We pass the real column to the index constraint generator (instead of
-			// the virtual column).
-			// TODO(radu): improve the inverted index constraint generator to handle
-			// this internally.
-			ordinal = col.InvertedSourceColumnOrdinal()
-			nullable = col.IsNullable()
-		}
 		colID := tabID.ColumnID(ordinal)
 		columns[i] = opt.MakeOrderingColumn(colID, col.Descending)
 		if !nullable {
@@ -150,7 +184,7 @@ func (c *CustomFuncs) initIdxConstraintForIndex(
 	ic.Init(
 		requiredFilters, optionalFilters,
 		columns, notNullCols, tabMeta.ComputedCols,
-		isInverted, true /* consolidate */, c.e.evalCtx, c.e.f,
+		true /* consolidate */, c.e.evalCtx, c.e.f,
 	)
 	return ic
 }
@@ -197,9 +231,9 @@ func (c *CustomFuncs) initIdxConstraintForIndex(
 // The values of both columns in that index are known, enabling a single value
 // constraint to be generated.
 func (c *CustomFuncs) computedColFilters(
-	tabID opt.TableID, requiredFilters, optionalFilters memo.FiltersExpr,
+	scanPrivate *memo.ScanPrivate, requiredFilters, optionalFilters memo.FiltersExpr,
 ) memo.FiltersExpr {
-	tabMeta := c.e.mem.Metadata().TableMeta(tabID)
+	tabMeta := c.e.mem.Metadata().TableMeta(scanPrivate.Table)
 	if len(tabMeta.ComputedCols) == 0 {
 		return nil
 	}
@@ -207,8 +241,8 @@ func (c *CustomFuncs) computedColFilters(
 	// Start with set of constant columns, as derived from the list of filter
 	// conditions.
 	constCols := make(map[opt.ColumnID]opt.ScalarExpr)
-	c.findConstantFilterCols(constCols, tabID, requiredFilters)
-	c.findConstantFilterCols(constCols, tabID, optionalFilters)
+	c.findConstantFilterCols(constCols, scanPrivate, requiredFilters)
+	c.findConstantFilterCols(constCols, scanPrivate, optionalFilters)
 	if len(constCols) == 0 {
 		// No constant values could be derived from filters, so assume that there
 		// are also no constant computed columns.
@@ -227,4 +261,65 @@ func (c *CustomFuncs) computedColFilters(
 		}
 	}
 	return computedColFilters
+}
+
+// findConstantFilterCols adds to constFilterCols mappings from table column ID
+// to the constant value of that column. It does this by iterating over the
+// given lists of filters and finding expressions that constrain columns to a
+// single constant value. For example:
+//
+//   x = 5 AND y = 'foo'
+//
+// This would add a mapping from x => 5 and y => 'foo', which constants can
+// then be used to prove that dependent computed columns are also constant.
+func (c *CustomFuncs) findConstantFilterCols(
+	constFilterCols map[opt.ColumnID]opt.ScalarExpr,
+	scanPrivate *memo.ScanPrivate,
+	filters memo.FiltersExpr,
+) {
+	tab := c.e.mem.Metadata().Table(scanPrivate.Table)
+	for i := range filters {
+		// If filter constraints are not tight, then no way to derive constant
+		// values.
+		props := filters[i].ScalarProps()
+		if !props.TightConstraints {
+			continue
+		}
+
+		// Iterate over constraint conjuncts with a single column and single
+		// span having a single key.
+		for i, n := 0, props.Constraints.Length(); i < n; i++ {
+			cons := props.Constraints.Constraint(i)
+			if cons.Columns.Count() != 1 || cons.Spans.Count() != 1 {
+				continue
+			}
+
+			// Skip columns that aren't in the scanned table.
+			colID := cons.Columns.Get(0).ID()
+			if !scanPrivate.Cols.Contains(colID) {
+				continue
+			}
+
+			// Skip columns with a data type that uses a composite key encoding.
+			// Each of these data types can have multiple distinct values that
+			// compare equal. For example, 0 == -0 for the FLOAT data type. It's
+			// not safe to treat these as constant inputs to computed columns,
+			// since the computed expression may differentiate between the
+			// different forms of the same value.
+			colTyp := tab.Column(scanPrivate.Table.ColumnOrdinal(colID)).DatumType()
+			if colinfo.HasCompositeKeyEncoding(colTyp) {
+				continue
+			}
+
+			span := cons.Spans.Get(0)
+			if !span.HasSingleKey(c.e.evalCtx) {
+				continue
+			}
+
+			datum := span.StartKey().Value(0)
+			if datum != tree.DNull {
+				constFilterCols[colID] = c.e.f.ConstructConstVal(datum, colTyp)
+			}
+		}
+	}
 }

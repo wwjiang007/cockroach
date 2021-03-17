@@ -132,9 +132,9 @@ type mutationBuilder struct {
 	// an insert; otherwise it's an update.
 	canaryColID opt.ColumnID
 
-	// arbiters stores the ordinals of indexes that are used to detect conflicts
-	// for UPSERT and INSERT ON CONFLICT statements.
-	arbiters cat.IndexOrdinals
+	// arbiters is the set of indexes and unique constraints that are used to
+	// detect conflicts for UPSERT and INSERT ON CONFLICT statements.
+	arbiters arbiterSet
 
 	// roundedDecimalCols is the set of columns that have already been rounded.
 	// Keeping this set avoids rounding the same column multiple times.
@@ -154,6 +154,11 @@ type mutationBuilder struct {
 	// reuse.
 	parsedIndexExprs []tree.Expr
 
+	// parsedUniqueConstraintExprs is a cached set of parsed partial unique
+	// constraint predicate expressions from the table schema. These are parsed
+	// once and cached for reuse.
+	parsedUniqueConstraintExprs []tree.Expr
+
 	// uniqueChecks contains unique check queries; see buildUnique* methods.
 	uniqueChecks memo.UniqueChecksExpr
 
@@ -163,7 +168,8 @@ type mutationBuilder struct {
 	// cascades contains foreign key check cascades; see buildFK* methods.
 	cascades memo.FKCascades
 
-	// withID is nonzero if we need to buffer the input for FK checks.
+	// withID is nonzero if we need to buffer the input for FK or uniqueness
+	// checks.
 	withID opt.WithID
 
 	// extraAccessibleCols stores all the columns that are available to the
@@ -177,14 +183,22 @@ type mutationBuilder struct {
 
 	// uniqueCheckHelper is used to prevent allocating the helper separately.
 	uniqueCheckHelper uniqueCheckHelper
+
+	// arbiterPredicateHelper is used to prevent allocating the helper
+	// separately.
+	arbiterPredicateHelper arbiterPredicateHelper
 }
 
 func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias tree.TableName) {
-	mb.b = b
-	mb.md = b.factory.Metadata()
-	mb.opName = opName
-	mb.tab = tab
-	mb.alias = alias
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*mb = mutationBuilder{
+		b:      b,
+		md:     b.factory.Metadata(),
+		opName: opName,
+		tab:    tab,
+		alias:  alias,
+	}
 
 	n := tab.ColumnCount()
 	mb.targetColList = make(opt.ColList, 0, n)
@@ -267,16 +281,15 @@ func (mb *mutationBuilder) buildInputForUpdate(
 			includeMutations:       true,
 			includeSystem:          true,
 			includeVirtualInverted: false,
-			includeVirtualComputed: false,
+			includeVirtualComputed: true,
 		}),
 		indexFlags,
 		noRowLocking,
 		inScope,
 	)
-	mb.outScope = mb.fetchScope
 
 	// Set list of columns that will be fetched by the input expression.
-	mb.setFetchColIDs(mb.outScope.cols)
+	mb.setFetchColIDs(mb.fetchScope.cols)
 
 	// If there is a FROM clause present, we must join all the tables
 	// together with the table being updated.
@@ -285,18 +298,25 @@ func (mb *mutationBuilder) buildInputForUpdate(
 		fromScope := mb.b.buildFromTables(from, noRowLocking, inScope)
 
 		// Check that the same table name is not used multiple times.
-		mb.b.validateJoinTableNames(mb.outScope, fromScope)
+		mb.b.validateJoinTableNames(mb.fetchScope, fromScope)
 
 		// The FROM table columns can be accessed by the RETURNING clause of the
 		// query and so we have to make them accessible.
 		mb.extraAccessibleCols = fromScope.cols
 
 		// Add the columns in the FROM scope.
+		// We create a new scope so that fetchScope is not modified. It will be
+		// used later to build partial index predicate expressions, and we do
+		// not want ambiguities with column names in the FROM clause.
+		mb.outScope = mb.fetchScope.replace()
+		mb.outScope.appendColumnsFromScope(mb.fetchScope)
 		mb.outScope.appendColumnsFromScope(fromScope)
 
-		left := mb.outScope.expr.(memo.RelExpr)
+		left := mb.fetchScope.expr.(memo.RelExpr)
 		right := fromScope.expr.(memo.RelExpr)
 		mb.outScope.expr = mb.b.factory.ConstructInnerJoin(left, right, memo.TrueFilter, memo.EmptyJoinPrivate)
+	} else {
+		mb.outScope = mb.fetchScope
 	}
 
 	// WHERE
@@ -328,7 +348,9 @@ func (mb *mutationBuilder) buildInputForUpdate(
 		for i := 0; i < primaryIndex.KeyColumnCount(); i++ {
 			// If the primary key column is hidden, then we don't need to use it
 			// for the distinct on.
-			if col := primaryIndex.Column(i); !col.IsHidden() {
+			// TODO(radu): this logic seems fragile, is it assuming that only an
+			// implicit `rowid` column can be a hidden PK column?
+			if col := primaryIndex.Column(i); col.Visibility() != cat.Hidden {
 				pkCols.Add(mb.fetchColIDs[col.Ordinal()])
 			}
 		}
@@ -759,6 +781,20 @@ func (mb *mutationBuilder) roundDecimalValues(colIDs opt.OptionalColList, roundC
 		// Overwrite the input column ID with the new synthesized column ID.
 		colIDs[i] = scopeCol.id
 		mb.roundedDecimalCols.Add(scopeCol.id)
+
+		// When building an UPDATE..FROM expression the projectionScope may have
+		// two columns with different names but the same ID. As a result, the
+		// scope column with the correct name (the name of the target column)
+		// may not be returned from projectionScope.getColumn. We set the name
+		// of the new scope column to the target column name to ensure it is
+		// in-scope when building CHECK constraint and partial index PUT
+		// expressions. See #61520.
+		// TODO(mgartner): Find a less brittle way to manage the scopes of
+		// mutations so that this isn't necessary. Ideally the scope produced by
+		// addUpdateColumns would not include columns in the FROM clause. Those
+		// columns are only in-scope in the RETURNING clause via
+		// mb.extraAccessibleCols.
+		scopeCol.name = mb.tab.Column(i).ColName()
 	}
 
 	if projectionsScope != nil {
@@ -990,7 +1026,8 @@ func (mb *mutationBuilder) makeMutationPrivate(needResults bool) *memo.MutationP
 		FetchCols:           checkEmptyList(mb.fetchColIDs),
 		UpdateCols:          checkEmptyList(mb.updateColIDs),
 		CanaryCol:           mb.canaryColID,
-		Arbiters:            mb.arbiters,
+		ArbiterIndexes:      mb.arbiters.IndexOrdinals(),
+		ArbiterConstraints:  mb.arbiters.UniqueConstraintOrdinals(),
 		CheckCols:           checkEmptyList(mb.checkColIDs),
 		PartialIndexPutCols: checkEmptyList(mb.partialIndexPutColIDs),
 		PartialIndexDelCols: checkEmptyList(mb.partialIndexDelColIDs),
@@ -1181,12 +1218,64 @@ func (mb *mutationBuilder) parsePartialIndexPredicateExpr(idx cat.IndexOrdinal) 
 	return expr
 }
 
+// parseUniqueConstraintPredicateExpr parses the predicate of the given partial
+// unique constraint and caches it for reuse. This function panics if the unique
+// constraint at the given ordinal is not partial.
+func (mb *mutationBuilder) parseUniqueConstraintPredicateExpr(uniq cat.UniqueOrdinal) tree.Expr {
+	uniqueConstraint := mb.tab.Unique(uniq)
+
+	predStr, isPartial := uniqueConstraint.Predicate()
+	if !isPartial {
+		panic(errors.AssertionFailedf("unique constraint at ordinal %d is not a partial unique constraint", uniq))
+	}
+
+	if mb.parsedUniqueConstraintExprs == nil {
+		mb.parsedUniqueConstraintExprs = make([]tree.Expr, mb.tab.UniqueCount())
+	}
+
+	// Return expression from the cache, if it was already parsed previously.
+	if mb.parsedUniqueConstraintExprs[uniq] != nil {
+		return mb.parsedUniqueConstraintExprs[uniq]
+	}
+
+	expr, err := parser.ParseExpr(predStr)
+	if err != nil {
+		panic(err)
+	}
+
+	mb.parsedUniqueConstraintExprs[uniq] = expr
+	return expr
+}
+
 // getIndexLaxKeyOrdinals returns the ordinals of all lax key columns in the
 // given index. A column's ordinal is the ordered position of that column in the
 // owning table.
 func getIndexLaxKeyOrdinals(index cat.Index) util.FastIntSet {
 	var keyOrds util.FastIntSet
 	for i, n := 0, index.LaxKeyColumnCount(); i < n; i++ {
+		keyOrds.Add(index.Column(i).Ordinal())
+	}
+	return keyOrds
+}
+
+// getUniqueConstraintOrdinals returns the ordinals of all columns in the given
+// unique constraint. A column's ordinal is the ordered position of that column
+// in the owning table.
+func getUniqueConstraintOrdinals(tab cat.Table, uc cat.UniqueConstraint) util.FastIntSet {
+	var ucOrds util.FastIntSet
+	for i, n := 0, uc.ColumnCount(); i < n; i++ {
+		ucOrds.Add(uc.ColumnOrdinal(tab, i))
+	}
+	return ucOrds
+}
+
+// getExplicitPrimaryKeyOrdinals returns the ordinals of the primary key
+// columns, excluding any implicit partitioning columns in the primary index.
+func getExplicitPrimaryKeyOrdinals(tab cat.Table) util.FastIntSet {
+	index := tab.Index(cat.PrimaryIndex)
+	skipCols := index.ImplicitPartitioningColumnCount()
+	var keyOrds util.FastIntSet
+	for i, n := skipCols, index.LaxKeyColumnCount(); i < n; i++ {
 		keyOrds.Add(index.Column(i).Ordinal())
 	}
 	return keyOrds
@@ -1257,25 +1346,28 @@ const (
 	checkInputScanFetchedVals
 )
 
-// makeCheckInputScan constructs a WithScan that iterates over the input to the
+// buildCheckInputScan constructs a WithScan that iterates over the input to the
 // mutation operator. Used in expressions that generate rows for checking for FK
 // and uniqueness violations.
 //
 // The WithScan expression will scan either the new values or the fetched values
 // for the given table ordinals (which correspond to FK or unique columns).
 //
-// Returns the output columns from the WithScan, which map 1-to-1 to
-// tabOrdinals. Also returns the subset of these columns that can be assumed
-// to be not null (either because they are not null in the mutation input or
-// because they are non-nullable table columns).
+// Returns a scope containing the WithScan expression and the output columns
+// from the WithScan. The output columns map 1-to-1 to tabOrdinals. Also returns
+// the subset of these columns that can be assumed to be not null (either
+// because they are not null in the mutation input or because they are
+// non-nullable table columns).
 //
-func (mb *mutationBuilder) makeCheckInputScan(
+func (mb *mutationBuilder) buildCheckInputScan(
 	typ checkInputScanType, tabOrdinals []int,
-) (scan memo.RelExpr, outCols opt.ColList, notNullOutCols opt.ColSet) {
+) (withScanScope *scope, notNullOutCols opt.ColSet) {
 	// inputCols are the column IDs from the mutation input that we are scanning.
 	inputCols := make(opt.ColList, len(tabOrdinals))
-	// outCols will store the newly synthesized output columns for WithScan.
-	outCols = make(opt.ColList, len(inputCols))
+
+	withScanScope = mb.b.allocScope()
+	withScanScope.cols = make([]scopeColumn, len(inputCols))
+
 	for i, tabOrd := range tabOrdinals {
 		if typ == checkInputScanNewVals {
 			inputCols[i] = mb.mapToReturnColID(tabOrd)
@@ -1283,27 +1375,36 @@ func (mb *mutationBuilder) makeCheckInputScan(
 			inputCols[i] = mb.fetchColIDs[tabOrd]
 		}
 		if inputCols[i] == 0 {
-			panic(errors.AssertionFailedf("no value for FK column (tabOrd=%d)", tabOrd))
+			panic(errors.AssertionFailedf("no value for check input column (tabOrd=%d)", tabOrd))
 		}
 
-		// Synthesize new column.
-		c := mb.b.factory.Metadata().ColumnMeta(inputCols[i])
-		outCols[i] = mb.md.AddColumn(c.Alias, c.Type)
+		// Synthesize a new output column for the input column, using the name
+		// of the column in the underlying table. The table's column names are
+		// used because partial unique constraint checks must filter the
+		// WithScan rows with a predicate expression that references the table's
+		// columns.
+		tableCol := mb.b.factory.Metadata().Table(mb.tabID).Column(tabOrd)
+		outCol := mb.md.AddColumn(string(tableCol.ColName()), tableCol.DatumType())
+		withScanScope.cols[i] = scopeColumn{
+			id:   outCol,
+			name: tableCol.ColName(),
+			typ:  tableCol.DatumType(),
+		}
 
 		// If a table column is not nullable, NULLs cannot be inserted (the
 		// mutation will fail). So for the purposes of checks, we can treat
 		// these columns as not null.
 		if mb.outScope.expr.Relational().NotNullCols.Contains(inputCols[i]) ||
 			!mb.tab.Column(tabOrd).IsNullable() {
-			notNullOutCols.Add(outCols[i])
+			notNullOutCols.Add(outCol)
 		}
 	}
 
-	scan = mb.b.factory.ConstructWithScan(&memo.WithScanPrivate{
+	withScanScope.expr = mb.b.factory.ConstructWithScan(&memo.WithScanPrivate{
 		With:    mb.withID,
 		InCols:  inputCols,
-		OutCols: outCols,
+		OutCols: withScanScope.colList(),
 		ID:      mb.b.factory.Metadata().NextUniqueID(),
 	})
-	return scan, outCols, notNullOutCols
+	return withScanScope, notNullOutCols
 }

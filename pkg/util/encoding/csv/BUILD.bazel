@@ -13,6 +13,7 @@ go_library(
 
 go_test(
     name = "csv_test",
+    size = "small",
     srcs = [
         "example_test.go",
         "reader_test.go",
@@ -20,7 +21,6 @@ go_test(
     ],
     embed = [":csv"],
     deps = [
-        "//pkg/util/encoding/csv",
         "//pkg/util/log",
         "@com_github_cockroachdb_errors//:errors",
     ],

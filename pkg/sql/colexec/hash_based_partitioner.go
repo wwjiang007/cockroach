@@ -16,8 +16,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexechash"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -111,17 +114,17 @@ const (
 // "fallback" disk-backed strategy (when the recursive repartitioning doesn't
 // seem to make progress in reducing the size of the partitions).
 type hashBasedPartitioner struct {
-	NonExplainable
-	closerHelper
+	colexecop.NonExplainable
+	colexecop.CloserHelper
 
 	unlimitedAllocator                 *colmem.Allocator
 	name                               string
 	state                              hashBasedPartitionerState
-	inputs                             []colexecbase.Operator
+	inputs                             []colexecop.Operator
 	inputTypes                         [][]*types.T
 	hashCols                           [][]uint32
-	inMemMainOp                        ResettableOperator
-	diskBackedFallbackOp               ResettableOperator
+	inMemMainOp                        colexecop.ResettableOperator
+	diskBackedFallbackOp               colexecop.ResettableOperator
 	maxPartitionSizeToProcessUsingMain int64
 	// fdState is used to acquire file descriptors up front.
 	fdState struct {
@@ -131,7 +134,7 @@ type hashBasedPartitioner struct {
 
 	partitioners      []*colcontainer.PartitionedDiskQueue
 	partitionedInputs []*partitionerToOperator
-	tupleDistributor  *tupleHashDistributor
+	tupleDistributor  *colexechash.TupleHashDistributor
 	// maxNumberActivePartitions determines the maximum number of active
 	// partitions that the operator is allowed to have. This number is computed
 	// semi-dynamically and will influence the choice of numBuckets value.
@@ -179,7 +182,7 @@ type hashBasedPartitioner struct {
 	}
 }
 
-var _ closableOperator = &hashBasedPartitioner{}
+var _ colexecop.ClosableOperator = &hashBasedPartitioner{}
 
 // hbpPartitionInfo is a helper struct that tracks the memory usage of a
 // partition. Note that if the hash-based partitioner has two inputs, we take
@@ -192,7 +195,7 @@ type hbpPartitionInfo struct {
 
 // DiskBackedSorterConstructor is used by the external operators to instantiate
 // a disk-backed sorter used in the fallback strategies.
-type DiskBackedSorterConstructor func(input colexecbase.Operator, inputTypes []*types.T, orderingCols []execinfrapb.Ordering_Column, maxNumberPartitions int) colexecbase.Operator
+type DiskBackedSorterConstructor func(input colexecop.Operator, inputTypes []*types.T, orderingCols []execinfrapb.Ordering_Column, maxNumberPartitions int) colexecop.Operator
 
 // newHashBasedPartitioner returns a disk-backed operator that utilizes
 // partitioning by hash approach to divide up the input set into separate
@@ -203,17 +206,17 @@ type DiskBackedSorterConstructor func(input colexecbase.Operator, inputTypes []*
 func newHashBasedPartitioner(
 	unlimitedAllocator *colmem.Allocator,
 	flowCtx *execinfra.FlowCtx,
-	args *NewColOperatorArgs,
+	args *colexecargs.NewColOperatorArgs,
 	name string,
-	inputs []colexecbase.Operator,
+	inputs []colexecop.Operator,
 	inputTypes [][]*types.T,
 	hashCols [][]uint32,
-	inMemMainOpConstructor func([]*partitionerToOperator) ResettableOperator,
+	inMemMainOpConstructor func([]*partitionerToOperator) colexecop.ResettableOperator,
 	diskBackedFallbackOpConstructor func(
 		partitionedInputs []*partitionerToOperator,
 		maxNumberActivePartitions int,
 		fdSemaphore semaphore.Semaphore,
-	) ResettableOperator,
+	) colexecop.ResettableOperator,
 	diskAcc *mon.BoundAccount,
 	numRequiredActivePartitions int,
 ) *hashBasedPartitioner {
@@ -239,12 +242,19 @@ func newHashBasedPartitioner(
 			inputTypes[i], diskQueueCfg, partitionedDiskQueueSemaphore, colcontainer.PartitionerStrategyDefault, diskAcc,
 		)
 		partitionedInputs[i] = newPartitionerToOperator(
-			unlimitedAllocator, inputTypes[i], partitioners[i], 0, /* partitionIdx */
+			unlimitedAllocator, inputTypes[i], partitioners[i],
 		)
 	}
 	maxNumberActivePartitions := calculateMaxNumberActivePartitions(flowCtx, args, numRequiredActivePartitions)
 	diskQueuesMemUsed := maxNumberActivePartitions * diskQueueCfg.BufferSizeBytes
-	maxPartitionSizeToProcessUsingMain := execinfra.GetWorkMemLimit(flowCtx.Cfg) - int64(diskQueuesMemUsed)
+	memoryLimit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
+	if memoryLimit == 1 {
+		// If memory limit is 1, we're likely in a "force disk spill"
+		// scenario, but we don't want to artificially limit batches when we
+		// have already spilled, so we'll use a larger limit.
+		memoryLimit = colexecop.DefaultMemoryLimit
+	}
+	maxPartitionSizeToProcessUsingMain := memoryLimit - int64(diskQueuesMemUsed)
 	if maxPartitionSizeToProcessUsingMain < hbpMinimalMaxPartitionSizeForMain {
 		maxPartitionSizeToProcessUsingMain = hbpMinimalMaxPartitionSizeForMain
 	}
@@ -276,7 +286,7 @@ func newHashBasedPartitioner(
 }
 
 func calculateMaxNumberActivePartitions(
-	flowCtx *execinfra.FlowCtx, args *NewColOperatorArgs, numRequiredActivePartitions int,
+	flowCtx *execinfra.FlowCtx, args *colexecargs.NewColOperatorArgs, numRequiredActivePartitions int,
 ) int {
 	// With the default limit of 256 file descriptors, this results in 16
 	// partitions. This is a hard maximum of partitions that will be used by the
@@ -329,8 +339,8 @@ func (op *hashBasedPartitioner) Init() {
 	// In the processing phase, the in-memory operator will use the default init
 	// hash value, so in order to use a "different" hash function in the
 	// partitioning phase we use a different init hash value.
-	op.tupleDistributor = newTupleHashDistributor(
-		defaultInitHashValue+1, op.numBuckets,
+	op.tupleDistributor = colexechash.NewTupleHashDistributor(
+		colexechash.DefaultInitHashValue+1, op.numBuckets,
 	)
 	op.state = hbpInitialPartitioning
 }
@@ -343,7 +353,7 @@ func (op *hashBasedPartitioner) partitionBatch(
 		return
 	}
 	scratchBatch := op.scratch.batches[inputIdx]
-	selections := op.tupleDistributor.distribute(ctx, batch, op.hashCols[inputIdx])
+	selections := op.tupleDistributor.Distribute(ctx, batch, op.hashCols[inputIdx])
 	for idx, sel := range selections {
 		partitionIdx := op.partitionIdxOffset + idx
 		if len(sel) > 0 {
@@ -365,7 +375,7 @@ func (op *hashBasedPartitioner) partitionBatch(
 				scratchBatch.SetLength(len(sel))
 			})
 			if err := op.partitioners[inputIdx].Enqueue(ctx, partitionIdx, scratchBatch); err != nil {
-				colexecerror.InternalError(err)
+				colexecutils.HandleErrorFromDiskQueue(err)
 			}
 			partitionInfo, ok := op.partitionsToProcessUsingMain[partitionIdx]
 			if !ok {
@@ -440,7 +450,7 @@ StateChanged:
 			}
 			// In order to use a different hash function when repartitioning, we
 			// need to increase the seed value of the tuple distributor.
-			op.tupleDistributor.initHashValue++
+			op.tupleDistributor.InitHashValue++
 			// We're actively will be using op.numBuckets + 1 partitions
 			// (because we're repartitioning one side at a time), so we can set
 			// op.numBuckets higher than in the initial partitioning step.
@@ -448,15 +458,17 @@ StateChanged:
 			// op.numBuckets being a power of two (finalizeHash step is faster
 			// if so).
 			op.numBuckets = op.maxNumberActivePartitions - 1
-			op.tupleDistributor.resetNumOutputs(op.numBuckets)
+			op.tupleDistributor.ResetNumOutputs(op.numBuckets)
 			for parentPartitionIdx, parentPartitionInfo := range op.partitionsToProcessUsingMain {
 				for i := range op.inputs {
 					batch := op.recursiveScratch.batches[i]
 					partitioner := op.partitioners[i]
 					for {
-						if err := partitioner.Dequeue(ctx, parentPartitionIdx, batch); err != nil {
-							colexecerror.InternalError(err)
-						}
+						op.unlimitedAllocator.PerformOperation(batch.ColVecs(), func() {
+							if err := partitioner.Dequeue(ctx, parentPartitionIdx, batch); err != nil {
+								colexecerror.InternalError(err)
+							}
+						})
 						if batch.Length() == 0 {
 							break
 						}
@@ -520,7 +532,7 @@ StateChanged:
 					for i := range op.partitionedInputs {
 						op.partitionedInputs[i].partitionIdx = partitionIdx
 					}
-					op.inMemMainOp.reset(ctx)
+					op.inMemMainOp.Reset(ctx)
 					delete(op.partitionsToProcessUsingMain, partitionIdx)
 					op.state = hbpProcessingUsingMain
 					continue StateChanged
@@ -579,7 +591,7 @@ StateChanged:
 			for i := range op.partitionedInputs {
 				op.partitionedInputs[i].partitionIdx = partitionIdx
 			}
-			op.diskBackedFallbackOp.reset(ctx)
+			op.diskBackedFallbackOp.Reset(ctx)
 			op.state = hbpProcessingUsingFallback
 			continue
 
@@ -611,7 +623,7 @@ StateChanged:
 }
 
 func (op *hashBasedPartitioner) Close(ctx context.Context) error {
-	if !op.close() {
+	if !op.CloserHelper.Close() {
 		return nil
 	}
 	var retErr error
@@ -620,10 +632,17 @@ func (op *hashBasedPartitioner) Close(ctx context.Context) error {
 			retErr = err
 		}
 	}
+	// The in-memory main operator might be a Closer (e.g. the in-memory hash
+	// aggregator), and we need to close it if so.
+	if c, ok := op.inMemMainOp.(colexecop.Closer); ok {
+		if err := c.Close(ctx); err != nil {
+			retErr = err
+		}
+	}
 	// Note that it is ok if the disk-backed fallback operator is not a Closer -
 	// it will still be closed appropriately because we accumulate all closers
 	// in NewColOperatorResult.
-	if c, ok := op.diskBackedFallbackOp.(colexecbase.Closer); ok {
+	if c, ok := op.diskBackedFallbackOp.(colexecop.Closer); ok {
 		if err := c.Close(ctx); err != nil {
 			retErr = err
 		}

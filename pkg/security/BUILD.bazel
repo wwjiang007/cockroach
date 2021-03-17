@@ -4,6 +4,7 @@ go_library(
     name = "security",
     srcs = [
         "auth.go",
+        "auto_tls_init.go",
         "certificate_loader.go",
         "certificate_manager.go",
         "certs.go",
@@ -26,6 +27,7 @@ go_library(
         "//pkg/util/contextutil",
         "//pkg/util/envutil",
         "//pkg/util/log",
+        "//pkg/util/log/eventpb",
         "//pkg/util/metric",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
@@ -36,15 +38,17 @@ go_library(
         "@com_github_cockroachdb_redact//:redact",
         "@org_golang_x_crypto//bcrypt",
         "@org_golang_x_crypto//ocsp",
-        "@org_golang_x_crypto//ssh/terminal",
         "@org_golang_x_sync//errgroup",
+        "@org_golang_x_term//:term",
     ],
 )
 
 go_test(
     name = "security_test",
+    size = "medium",
     srcs = [
         "auth_test.go",
+        "auto_tls_init_test.go",
         "certificate_loader_test.go",
         "certificate_manager_test.go",
         "certs_rotation_test.go",
@@ -56,10 +60,10 @@ go_test(
         "x509_test.go",
     ],
     deps = [
+        ":security",
         "//pkg/base",
         "//pkg/roachpb",
         "//pkg/rpc",
-        "//pkg/security",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/testutils",
@@ -73,45 +77,59 @@ go_test(
         "@org_golang_x_exp//rand",
     ] + select({
         "@io_bazel_rules_go//go/platform:aix": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:android": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:darwin": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:dragonfly": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:freebsd": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:illumos": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:ios": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:js": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:linux": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:nacl": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:netbsd": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:openbsd": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:plan9": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "@io_bazel_rules_go//go/platform:solaris": [
+            "//pkg/util/log/eventpb",
             "@org_golang_x_sys//unix",
         ],
         "//conditions:default": [],

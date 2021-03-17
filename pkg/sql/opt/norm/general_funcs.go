@@ -33,8 +33,12 @@ type CustomFuncs struct {
 
 // Init initializes a new CustomFuncs with the given factory.
 func (c *CustomFuncs) Init(f *Factory) {
-	c.f = f
-	c.mem = f.Memo()
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*c = CustomFuncs{
+		f:   f,
+		mem: f.Memo(),
+	}
 }
 
 // Succeeded returns true if a result expression is not nil.
@@ -284,6 +288,26 @@ func (c *CustomFuncs) RedundantCols(input memo.RelExpr, cols opt.ColSet) opt.Col
 		return opt.ColSet{}
 	}
 	return cols.Difference(reducedCols)
+}
+
+// DuplicateColumnIDs duplicates a table and set of columns IDs in the metadata.
+// It returns the new table's ID and the new set of columns IDs.
+func (c *CustomFuncs) DuplicateColumnIDs(
+	table opt.TableID, cols opt.ColSet,
+) (opt.TableID, opt.ColSet) {
+	md := c.mem.Metadata()
+	tabMeta := md.TableMeta(table)
+	newTableID := md.DuplicateTable(table, c.RemapCols)
+
+	// Build a new set of column IDs from the new TableMeta.
+	var newColIDs opt.ColSet
+	for col, ok := cols.Next(0); ok; col, ok = cols.Next(col + 1) {
+		ord := tabMeta.MetaID.ColumnOrdinal(col)
+		newColID := newTableID.ColumnID(ord)
+		newColIDs.Add(newColID)
+	}
+
+	return newTableID, newColIDs
 }
 
 // RemapCols remaps columns IDs in the input ScalarExpr by replacing occurrences
@@ -651,6 +675,11 @@ func (c *CustomFuncs) IsFilterFalse(filters memo.FiltersExpr) bool {
 	return filters.IsFalse()
 }
 
+// IsFilterEmpty returns true if filters is empty.
+func (c *CustomFuncs) IsFilterEmpty(filters memo.FiltersExpr) bool {
+	return len(filters) == 0
+}
+
 // IsContradiction returns true if the given filter item contains a
 // contradiction constraint.
 func (c *CustomFuncs) IsContradiction(item *memo.FiltersItem) bool {
@@ -666,6 +695,13 @@ func (c *CustomFuncs) ConcatFilters(left, right memo.FiltersExpr) memo.FiltersEx
 	copy(newFilters, left)
 	copy(newFilters[len(left):], right)
 	return newFilters
+}
+
+// DiffFilters creates new Filters that contains all conditions in left that do
+// not exist in right. If right is empty, the original left filters are
+// returned.
+func (c *CustomFuncs) DiffFilters(left, right memo.FiltersExpr) memo.FiltersExpr {
+	return left.Difference(right)
 }
 
 // RemoveFiltersItem returns a new list that is a copy of the given list, except
@@ -1050,23 +1086,11 @@ func (c *CustomFuncs) DatumsEqual(first, second tree.Datum) bool {
 // ScanPrivate, so the new ScanPrivate will not have constraints even if the old
 // one did.
 func (c *CustomFuncs) DuplicateScanPrivate(sp *memo.ScanPrivate) *memo.ScanPrivate {
-	md := c.mem.Metadata()
-	tabMeta := md.TableMeta(sp.Table)
-	newTableID := md.DuplicateTable(sp.Table, c.RemapCols)
-
-	// Build a new set of column IDs from the new TableMeta.
-	var newColIDs opt.ColSet
-	cols := sp.Cols
-	for col, ok := cols.Next(0); ok; col, ok = cols.Next(col + 1) {
-		ord := tabMeta.MetaID.ColumnOrdinal(col)
-		newColID := newTableID.ColumnID(ord)
-		newColIDs.Add(newColID)
-	}
-
+	table, cols := c.DuplicateColumnIDs(sp.Table, sp.Cols)
 	return &memo.ScanPrivate{
-		Table:   newTableID,
+		Table:   table,
 		Index:   sp.Index,
-		Cols:    newColIDs,
+		Cols:    cols,
 		Flags:   sp.Flags,
 		Locking: sp.Locking,
 	}

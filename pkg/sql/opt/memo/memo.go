@@ -135,6 +135,7 @@ type Memo struct {
 	zigzagJoinEnabled       bool
 	useHistograms           bool
 	useMultiColStats        bool
+	localityOptimizedSearch bool
 	safeUpdates             bool
 	preferLookupJoinsForFKs bool
 	saveTablesPrefix        string
@@ -147,7 +148,15 @@ type Memo struct {
 
 	newGroupFn func(opt.Expr)
 
-	// WARNING: if you add more members, add initialization code in Init.
+	// disableCheckExpr disables expression validation performed by CheckExpr,
+	// if the crdb_test build tag is set. If the crdb_test build tag is not set,
+	// CheckExpr is always a no-op, so disableCheckExpr has no effect. This is
+	// set to true for the optsteps test command to prevent CheckExpr from
+	// erring with partially normalized expressions.
+	disableCheckExpr bool
+
+	// WARNING: if you add more members, add initialization code in Init (if
+	// reusing allocated data structures is desired).
 }
 
 // Init initializes a new empty memo instance, or resets existing state so it
@@ -156,24 +165,23 @@ type Memo struct {
 // argument. If any of that changes, then the memo must be invalidated (see the
 // IsStale method for more details).
 func (m *Memo) Init(evalCtx *tree.EvalContext) {
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*m = Memo{
+		metadata:                m.metadata,
+		interner:                m.interner,
+		reorderJoinsLimit:       evalCtx.SessionData.ReorderJoinsLimit,
+		zigzagJoinEnabled:       evalCtx.SessionData.ZigzagJoinEnabled,
+		useHistograms:           evalCtx.SessionData.OptimizerUseHistograms,
+		useMultiColStats:        evalCtx.SessionData.OptimizerUseMultiColStats,
+		localityOptimizedSearch: evalCtx.SessionData.LocalityOptimizedSearch,
+		safeUpdates:             evalCtx.SessionData.SafeUpdates,
+		preferLookupJoinsForFKs: evalCtx.SessionData.PreferLookupJoinsForFKs,
+		saveTablesPrefix:        evalCtx.SessionData.SaveTablesPrefix,
+	}
 	m.metadata.Init()
 	m.interner.Clear()
 	m.logPropsBuilder.init(evalCtx, m)
-
-	m.rootExpr = nil
-	m.rootProps = nil
-	m.memEstimate = 0
-
-	m.reorderJoinsLimit = evalCtx.SessionData.ReorderJoinsLimit
-	m.zigzagJoinEnabled = evalCtx.SessionData.ZigzagJoinEnabled
-	m.useHistograms = evalCtx.SessionData.OptimizerUseHistograms
-	m.useMultiColStats = evalCtx.SessionData.OptimizerUseMultiColStats
-	m.safeUpdates = evalCtx.SessionData.SafeUpdates
-	m.preferLookupJoinsForFKs = evalCtx.SessionData.PreferLookupJoinsForFKs
-	m.saveTablesPrefix = evalCtx.SessionData.SaveTablesPrefix
-
-	m.curID = 0
-	m.curWithID = 0
 }
 
 // NotifyOnNewGroup sets a callback function which is invoked each time we
@@ -275,6 +283,7 @@ func (m *Memo) IsStale(
 		m.zigzagJoinEnabled != evalCtx.SessionData.ZigzagJoinEnabled ||
 		m.useHistograms != evalCtx.SessionData.OptimizerUseHistograms ||
 		m.useMultiColStats != evalCtx.SessionData.OptimizerUseMultiColStats ||
+		m.localityOptimizedSearch != evalCtx.SessionData.LocalityOptimizedSearch ||
 		m.safeUpdates != evalCtx.SessionData.SafeUpdates ||
 		m.preferLookupJoinsForFKs != evalCtx.SessionData.PreferLookupJoinsForFKs ||
 		m.saveTablesPrefix != evalCtx.SessionData.SaveTablesPrefix {
@@ -408,4 +417,11 @@ func (m *Memo) Detach() {
 		}
 	}
 	clearColStats(m.RootExpr())
+}
+
+// DisableCheckExpr disables expression validation performed by CheckExpr,
+// if the crdb_test build tag is set. If the crdb_test build tag is not set,
+// CheckExpr is always a no-op, so DisableCheckExpr has no effect.
+func (m *Memo) DisableCheckExpr() {
+	m.disableCheckExpr = true
 }

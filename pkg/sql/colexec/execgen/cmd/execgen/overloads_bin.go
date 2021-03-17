@@ -19,7 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
@@ -714,7 +714,7 @@ func (c intervalDecimalCustomizer) getBinOpAssignFunc() assignFunc {
 			return fmt.Sprintf(`
 		  f, err := %[3]s.Float64()
 		  if err != nil {
-		    colexecerror.InternalError(err)
+		    colexecerror.ExpectedError(err)
 		  }
 		  %[1]s = %[2]s.MulFloat(f)`,
 				targetElem, leftElem, rightElem)
@@ -732,7 +732,7 @@ func (c decimalIntervalCustomizer) getBinOpAssignFunc() assignFunc {
 			return fmt.Sprintf(`
 		  f, err := %[2]s.Float64()
 		  if err != nil {
-		    colexecerror.InternalError(err)
+		    colexecerror.ExpectedError(err)
 		  }
 		  %[1]s = %[3]s.MulFloat(f)`,
 				targetElem, leftElem, rightElem)

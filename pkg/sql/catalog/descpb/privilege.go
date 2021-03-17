@@ -218,7 +218,11 @@ func (p *PrivilegeDescriptor) Revoke(
 // perhaps it was intended only for the 2.0 release but then somehow we got
 // bad descriptors with bad initial permissions into later versions or we didn't
 // properly bake this migration in.
-func MaybeFixPrivileges(id ID, p *PrivilegeDescriptor) bool {
+func MaybeFixPrivileges(id ID, ptr **PrivilegeDescriptor) bool {
+	if *ptr == nil {
+		*ptr = &PrivilegeDescriptor{}
+	}
+	p := *ptr
 	allowedPrivilegesBits := privilege.ALL.Mask()
 	if IsReservedID(id) {
 		// System databases and tables have custom maximum allowed privileges.
@@ -262,36 +266,40 @@ func MaybeFixPrivileges(id ID, p *PrivilegeDescriptor) bool {
 	return modified
 }
 
-// Validate is called when writing a database, table or type descriptor.
-// It takes the descriptor ID which is used to determine if
-// it belongs to a system descriptor, in which case the maximum
-// set of allowed privileges is looked up and applied.
+// Validate returns an error if the privilege descriptor is invalid.
+// It requires the ID of the descriptor it is applied on to determine whether
+// it is is a system descriptor, because superusers do not always have full
+// privileges for those.
+// It requires the objectType to determine the superset of privileges allowed
+// for regular users.
 func (p PrivilegeDescriptor) Validate(id ID, objectType privilege.ObjectType) error {
-	allowedPrivileges := DefaultSuperuserPrivileges
+	allowedSuperuserPrivileges := DefaultSuperuserPrivileges
+	maybeSystem := ""
 
 	if IsReservedID(id) {
 		var ok bool
-		allowedPrivileges, ok = SystemAllowedPrivileges[id]
+		maybeSystem = "system "
+		allowedSuperuserPrivileges, ok = SystemAllowedPrivileges[id]
 		if !ok {
-			return fmt.Errorf("no allowed privileges found for system %s with ID=%d",
-				objectType, id)
+			return fmt.Errorf("no allowed privileges defined for %s%s with ID=%d",
+				maybeSystem, objectType, id)
 		}
 	}
 
 	// Check "root" user.
-	if err := p.validateRequiredSuperuser(id, allowedPrivileges, security.RootUserName(), objectType); err != nil {
+	if err := p.validateRequiredSuperuser(id, allowedSuperuserPrivileges, security.RootUserName(), objectType); err != nil {
 		return err
 	}
 
 	// We expect an "admin" role. Check that it has desired superuser permissions.
-	if err := p.validateRequiredSuperuser(id, allowedPrivileges, security.AdminRoleName(), objectType); err != nil {
+	if err := p.validateRequiredSuperuser(id, allowedSuperuserPrivileges, security.AdminRoleName(), objectType); err != nil {
 		return err
 	}
 
 	if p.Version >= OwnerVersion {
 		if p.Owner().Undefined() {
-			return errors.AssertionFailedf("found no owner for system %s with ID=%d",
-				objectType, id)
+			return errors.AssertionFailedf("found no owner for %s%s with ID=%d",
+				maybeSystem, objectType, id)
 		}
 	}
 
@@ -306,8 +314,8 @@ func (p PrivilegeDescriptor) Validate(id ID, objectType privilege.ObjectType) er
 		}
 
 		if remaining := u.Privileges &^ allowedPrivilegesBits; remaining != 0 {
-			return fmt.Errorf("user %s must not have %s privileges on system %s with ID=%d",
-				u.User(), privilege.ListFromBitField(remaining, privilege.Any), objectType, id)
+			return fmt.Errorf("user %s must not have %s privileges on %s%s with ID=%d",
+				u.User(), privilege.ListFromBitField(remaining, privilege.Any), maybeSystem, objectType, id)
 		}
 		// Get all the privilege bits set on the descriptor even if they're not valid.
 		privs := privilege.ListFromBitField(u.Privileges, privilege.Any)
@@ -327,16 +335,20 @@ func (p PrivilegeDescriptor) validateRequiredSuperuser(
 	user security.SQLUsername,
 	objectType privilege.ObjectType,
 ) error {
+	maybeSystem := ""
+	if IsReservedID(id) {
+		maybeSystem = "system "
+	}
 	superPriv, ok := p.findUser(user)
 	if !ok {
-		return fmt.Errorf("user %s does not have privileges over system %s with ID=%d",
-			user, objectType, id)
+		return fmt.Errorf("user %s does not have privileges over %s%s with ID=%d",
+			user, maybeSystem, objectType, id)
 	}
 
 	// The super users must match the allowed privilege set exactly.
 	if superPriv.Privileges != allowedPrivileges.ToBitField() {
-		return fmt.Errorf("user %s must have exactly %s privileges on system %s with ID=%d",
-			user, allowedPrivileges, objectType, id)
+		return fmt.Errorf("user %s must have exactly %s privileges on %s%s with ID=%d",
+			user, allowedPrivileges, maybeSystem, objectType, id)
 	}
 
 	return nil
@@ -435,6 +447,7 @@ var SystemAllowedPrivileges = map[ID]privilege.List{
 	keys.StatementDiagnosticsTableID:          privilege.ReadWriteData,
 	keys.ScheduledJobsTableID:                 privilege.ReadWriteData,
 	keys.SqllivenessID:                        privilege.ReadWriteData,
+	keys.MigrationsID:                         privilege.ReadWriteData,
 }
 
 // SetOwner sets the owner of the privilege descriptor to the provided string.

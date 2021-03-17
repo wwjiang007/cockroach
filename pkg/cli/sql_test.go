@@ -25,8 +25,8 @@ import (
 
 // Example_sql_lex tests the usage of the lexer in the sql subcommand.
 func Example_sql_lex() {
-	c := newCLITest(cliTestParams{insecure: true})
-	defer c.cleanup()
+	c := NewCLITest(TestCLIParams{Insecure: true})
+	defer c.Cleanup()
 
 	conn := makeSQLConn(fmt.Sprintf("postgres://%s@%s/?sslmode=disable",
 		security.RootUser, c.ServingSQLAddr()))
@@ -232,6 +232,18 @@ func TestHandleCliCmdSlashDInvalidSyntax(t *testing.T) {
 		assert.Equal(t, cliStateEnum(0), gotState)
 		assert.Equal(t, errInvalidSyntax, c.exitErr)
 	}
+}
+
+func TestHandleDemoNodeCommandsInvalidNodeName(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	initCLIDefaults()
+
+	demoNodeCommandTests := []string{"shutdown", "*"}
+
+	c := setupTestCliState()
+	c.handleDemoNodeCommands(demoNodeCommandTests, cliStateEnum(0), cliStateEnum(1))
+	assert.Equal(t, errInvalidSyntax, c.exitErr)
 }
 
 func setupTestCliState() cliState {

@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -768,7 +769,7 @@ func (r *Replica) applySnapshot(
 		if err == nil {
 			desc, err := r.GetReplicaDescriptor()
 			if err != nil {
-				log.Fatalf(ctx, "could not fetch replica descriptor for range after applying snapshot")
+				log.Fatalf(ctx, "could not fetch replica descriptor for range after applying snapshot: %v", err)
 			}
 			if isInitialSnap {
 				r.store.metrics.RangeSnapshotsAppliedForInitialUpreplication.Inc(1)
@@ -777,9 +778,10 @@ func (r *Replica) applySnapshot(
 				// NB: A replica of type LEARNER can receive a non-initial snapshot (via
 				// the snapshot queue) if we end up truncating the raft log before it
 				// gets promoted to a voter. We count such snapshot applications as
-				// "applied by voters" here.
-				case roachpb.VOTER_FULL, roachpb.VOTER_INCOMING, roachpb.VOTER_DEMOTING,
-					roachpb.VOTER_OUTGOING, roachpb.LEARNER:
+				// "applied by voters" here, since the LEARNER will soon be promoted to
+				// a voting replica.
+				case roachpb.VOTER_FULL, roachpb.VOTER_INCOMING, roachpb.VOTER_DEMOTING_LEARNER,
+					roachpb.VOTER_OUTGOING, roachpb.LEARNER, roachpb.VOTER_DEMOTING_NON_VOTER:
 					r.store.metrics.RangeSnapshotsAppliedByVoters.Inc(1)
 				case roachpb.NON_VOTER:
 					r.store.metrics.RangeSnapshotsAppliedByNonVoters.Inc(1)
@@ -963,28 +965,34 @@ func (r *Replica) applySnapshot(
 		log.Fatalf(ctx, "failed to clear in-memory data of subsumed replicas while applying snapshot: %+v", err)
 	}
 
+	// Read the prior read summary for this range, which was included in the
+	// snapshot. We may need to use it to bump our timestamp cache if we
+	// discover that we are the leaseholder as of the snapshot's log index.
+	prioReadSum, err := readsummary.Load(ctx, r.store.engine, r.RangeID)
+	if err != nil {
+		log.Fatalf(ctx, "failed to read prior read summary after applying snapshot: %+v", err)
+	}
+
 	// Atomically swap the placeholder, if any, for the replica, and update the
-	// replica's descriptor.
+	// replica's state. Note that this is intentionally in one critical section.
+	// to avoid exposing an inconsistent in-memory state. We did however already
+	// consume the SSTs above, meaning that at this point the in-memory state lags
+	// the on-disk state.
+
 	r.store.mu.Lock()
+	r.mu.Lock()
 	if r.store.removePlaceholderLocked(ctx, r.RangeID) {
 		atomic.AddInt32(&r.store.counts.filledPlaceholders, 1)
 	}
-	r.setDescRaftMuLocked(ctx, s.Desc)
-	if err := r.store.maybeMarkReplicaInitializedLocked(ctx, r); err != nil {
+	r.setDescLockedRaftMuLocked(ctx, s.Desc)
+	if err := r.store.maybeMarkReplicaInitializedLockedReplLocked(ctx, r); err != nil {
 		log.Fatalf(ctx, "unable to mark replica initialized while applying snapshot: %+v", err)
 	}
+	// NOTE: even though we acquired the store mutex first (according to the
+	// lock ordering rules described on Store.mu), it is safe to drop it first
+	// without risking a lock-ordering deadlock.
 	r.store.mu.Unlock()
 
-	// Invoke the leasePostApply method to ensure we properly initialize the
-	// replica according to whether it holds the lease. We allow jumps in the
-	// lease sequence because there may be multiple lease changes accounted for
-	// in the snapshot.
-	r.leasePostApply(ctx, *s.Lease, true /* permitJump */)
-
-	// Inform the concurrency manager that this replica just applied a snapshot.
-	r.concMgr.OnReplicaSnapshotApplied()
-
-	r.mu.Lock()
 	// We set the persisted last index to the last applied index. This is
 	// not a correctness issue, but means that we may have just transferred
 	// some entries we're about to re-request from the leader and overwrite.
@@ -998,6 +1006,7 @@ func (r *Replica) applySnapshot(
 	// Update the store stats for the data in the snapshot.
 	r.store.metrics.subtractMVCCStats(ctx, r.mu.tenantID, *r.mu.state.Stats)
 	r.store.metrics.addMVCCStats(ctx, r.mu.tenantID, *s.Stats)
+	lastKnownLease := r.mu.state.Lease
 	// Update the rest of the Raft state. Changes to r.mu.state.Desc must be
 	// managed by r.setDescRaftMuLocked and changes to r.mu.state.Lease must be handled
 	// by r.leasePostApply, but we called those above, so now it's safe to
@@ -1006,8 +1015,33 @@ func (r *Replica) applySnapshot(
 	// Snapshots typically have fewer log entries than the leaseholder. The next
 	// time we hold the lease, recompute the log size before making decisions.
 	r.mu.raftLogSizeTrusted = false
-	r.assertStateLocked(ctx, r.store.Engine())
+
+	// Invoke the leasePostApply method to ensure we properly initialize the
+	// replica according to whether it holds the lease. We allow jumps in the
+	// lease sequence because there may be multiple lease changes accounted for
+	// in the snapshot.
+	r.leasePostApplyLocked(ctx, lastKnownLease, s.Lease /* newLease */, prioReadSum, allowLeaseJump)
+
+	// Similarly, if we subsumed any replicas through the snapshot (meaning that
+	// we missed the application of a merge) and we are the new leaseholder, we
+	// make sure to update the timestamp cache using the prior read summary to
+	// account for any reads that were served on the right-hand side range(s).
+	if len(subsumedRepls) > 0 && s.Lease.Replica.ReplicaID == r.mu.replicaID && prioReadSum != nil {
+		applyReadSummaryToTimestampCache(r.store.tsCache, r.descRLocked(), *prioReadSum)
+	}
+
+	// Inform the concurrency manager that this replica just applied a snapshot.
+	r.concMgr.OnReplicaSnapshotApplied()
+
 	r.mu.Unlock()
+
+	// Assert that the in-memory and on-disk states of the Replica are congruent
+	// after the application of the snapshot. Do so under a read lock, as this
+	// operation can be expensive. This is safe, as we hold the Replica.raftMu
+	// across both Replica.mu critical sections.
+	r.mu.RLock()
+	r.assertStateRaftMuLockedReplicaMuRLocked(ctx, r.store.Engine())
+	r.mu.RUnlock()
 
 	// The rangefeed processor is listening for the logical ops attached to
 	// each raft command. These will be lost during a snapshot, so disconnect

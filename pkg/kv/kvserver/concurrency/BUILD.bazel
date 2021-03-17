@@ -31,6 +31,7 @@ go_library(
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
+        "//pkg/util/tracing",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
     ],
@@ -38,6 +39,7 @@ go_library(
 
 go_test(
     name = "concurrency_test",
+    size = "large",
     srcs = [
         "concurrency_manager_test.go",
         "datadriven_util_test.go",
@@ -50,7 +52,6 @@ go_test(
     deps = [
         "//pkg/keys",
         "//pkg/kv/kvserver/batcheval",
-        "//pkg/kv/kvserver/concurrency",
         "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/kv/kvserver/intentresolver",
         "//pkg/kv/kvserver/spanlatch",

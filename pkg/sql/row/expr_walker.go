@@ -19,9 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
@@ -45,46 +45,91 @@ const chunkSizeIncrementRate = 10
 const initialChunkSize = 10
 const maxChunkSize = 100000
 
-type importRand struct {
-	*rand.Rand
-	pos int64
-}
+// importRandPosition uniquely identifies an instance to a call to a random
+// function during an import.
+type importRandPosition int64
 
-func newImportRand(pos int64) *importRand {
-	adjPos := (pos / reseedRandEveryN) * reseedRandEveryN
-	rnd := rand.New(rand.NewSource(adjPos))
-	for i := int(pos % reseedRandEveryN); i > 0; i-- {
-		_ = rnd.Float64()
+func (pos importRandPosition) distance(o importRandPosition) int64 {
+	diff := int64(pos) - int64(o)
+	if diff < 0 {
+		return -diff
 	}
-	return &importRand{rnd, pos}
+	return diff
 }
 
-func (r *importRand) advancePos() {
-	r.pos++
-	if r.pos%reseedRandEveryN == 0 {
-		// Time to reseed.
-		r.Rand = rand.New(rand.NewSource(r.pos))
-	}
-}
-
-func (r *importRand) Float64() float64 {
-	randNum := r.Rand.Float64()
-	r.advancePos()
-	return randNum
-}
-
-func (r *importRand) Int63() int64 {
-	randNum := r.Rand.Int63()
-	r.advancePos()
-	return randNum
-}
-
-func getSeedForImportRand(rowID int64, sourceID int32, numInstances int) int64 {
+// getPosForRandImport gives the importRandPosition for the first instance of a
+// call to a random function when generating a given row from a given source.
+// numInstances refers to the number of random function invocations per row.
+func getPosForRandImport(rowID int64, sourceID int32, numInstances int) importRandPosition {
 	// We expect r.pos to increment by numInstances for each row.
 	// Therefore, assuming that rowID increments by 1 for every row,
 	// we will initialize the position as rowID * numInstances + sourceID << rowIDBits.
 	rowIDWithMultiplier := int64(numInstances) * rowID
-	return (int64(sourceID) << rowIDBits) ^ rowIDWithMultiplier
+	pos := (int64(sourceID) << rowIDBits) ^ rowIDWithMultiplier
+	return importRandPosition(pos)
+}
+
+// randomSource is only exposed through an interface to ensure that caller's
+// don't access underlying field.
+type randomSource interface {
+	// Float64 returns, as a float64, a pseudo-random number in [0.0,1.0).
+	Float64(c *CellInfoAnnotation) float64
+	// Int63 returns a non-negative pseudo-random 63-bit integer as an int64.
+	Int63(c *CellInfoAnnotation) int64
+}
+
+var _ randomSource = (*importRand)(nil)
+
+type importRand struct {
+	*rand.Rand
+	pos importRandPosition
+}
+
+func (r *importRand) reseed(pos importRandPosition) {
+	adjPos := (pos / reseedRandEveryN) * reseedRandEveryN
+	rnd := rand.New(rand.NewSource(int64(adjPos)))
+	for i := int(pos % reseedRandEveryN); i > 0; i-- {
+		_ = rnd.Float64()
+	}
+
+	r.Rand = rnd
+	r.pos = pos
+}
+
+func (r *importRand) maybeReseed(c *CellInfoAnnotation) {
+	// newRowPos is the position of the first random function invocation of the
+	// row we're currently processing. If this is more than c.randInstancePerRow
+	// away, that means that we've skipped a batch of rows. importRand assumes
+	// that it operates on a contiguous set of rows when it increments its
+	// position, so if we skip some rows we need to reseed.
+	// We may skip rows because a single row converter may be responsible for
+	// converting several non-contiguous batches of KVs.
+	newRowPos := getPosForRandImport(c.rowID, c.sourceID, c.randInstancePerRow)
+	rowsSkipped := newRowPos.distance(r.pos) > int64(c.randInstancePerRow)
+	if rowsSkipped {
+		// Reseed at the new position, since our internally tracked r.pos is now out
+		// of sync.
+		r.reseed(newRowPos)
+	}
+	if r.pos%reseedRandEveryN == 0 {
+		r.reseed(r.pos)
+	}
+}
+
+// Float64 implements the randomSource interface.
+func (r *importRand) Float64(c *CellInfoAnnotation) float64 {
+	r.maybeReseed(c)
+	randNum := r.Rand.Float64()
+	r.pos++
+	return randNum
+}
+
+// Int63 implements the randomSource interface.
+func (r *importRand) Int63(c *CellInfoAnnotation) int64 {
+	r.maybeReseed(c)
+	randNum := r.Rand.Int63()
+	r.pos++
+	return randNum
 }
 
 // For some functions (specifically the volatile ones), we do
@@ -102,7 +147,7 @@ func makeBuiltinOverride(
 // default expressions which use sequences.
 type SequenceMetadata struct {
 	id              descpb.ID
-	seqDesc         *tabledesc.Immutable
+	seqDesc         catalog.TableDescriptor
 	instancesPerRow int64
 	curChunk        *jobspb.SequenceValChunk
 	curVal          int64
@@ -135,11 +180,13 @@ type CellInfoAnnotation struct {
 	uniqueRowIDTotal    int
 
 	// Annotations for rand() and gen_random_uuid().
-	randSource         *importRand
+	// randSource should not be used directly, but through getImportRand() instead.
+	randSource         randomSource
 	randInstancePerRow int
 
 	// Annotations for next_val().
 	seqNameToMetadata map[string]*SequenceMetadata
+	seqIDToMetadata   map[descpb.ID]*SequenceMetadata
 	seqChunkProvider  *SeqChunkProvider
 }
 
@@ -151,6 +198,13 @@ func (c *CellInfoAnnotation) reset(sourceID int32, rowID int64) {
 	c.sourceID = sourceID
 	c.rowID = rowID
 	c.uniqueRowIDInstance = 0
+}
+
+func makeImportRand(c *CellInfoAnnotation) randomSource {
+	pos := getPosForRandImport(c.rowID, c.sourceID, c.randInstancePerRow)
+	randSource := &importRand{}
+	randSource.reseed(pos)
+	return randSource
 }
 
 // We don't want to call unique_rowid() for columns with such default expressions
@@ -201,19 +255,17 @@ func importUniqueRowID(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum,
 func importRandom(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	if c.randSource == nil {
-		c.randSource = newImportRand(getSeedForImportRand(
-			c.rowID, c.sourceID, c.randInstancePerRow))
+		c.randSource = makeImportRand(c)
 	}
-	return tree.NewDFloat(tree.DFloat(c.randSource.Float64())), nil
+	return tree.NewDFloat(tree.DFloat(c.randSource.Float64(c))), nil
 }
 
 func importGenUUID(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
 	c := getCellInfoAnnotation(evalCtx.Annotations)
 	if c.randSource == nil {
-		c.randSource = newImportRand(getSeedForImportRand(
-			c.rowID, c.sourceID, c.randInstancePerRow))
+		c.randSource = makeImportRand(c)
 	}
-	gen := c.randSource.Int63()
+	gen := c.randSource.Int63(c)
 	id := uuid.MakeV4()
 	id.DeterministicV4(uint64(gen), uint64(1<<63))
 	return tree.NewDUuid(tree.DUuid{UUID: id}), nil
@@ -222,7 +274,7 @@ func importGenUUID(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, err
 // SeqChunkProvider uses the import job progress to read and write its sequence
 // value chunks.
 type SeqChunkProvider struct {
-	JobID    int64
+	JobID    jobspb.JobID
 	Registry *jobs.Registry
 }
 
@@ -307,19 +359,19 @@ func (j *SeqChunkProvider) RequestChunk(
 
 func incrementSequenceByVal(
 	ctx context.Context,
-	descriptor *tabledesc.Immutable,
+	descriptor catalog.TableDescriptor,
 	db *kv.DB,
 	codec keys.SQLCodec,
 	incrementBy int64,
 ) (int64, error) {
-	seqOpts := descriptor.SequenceOpts
+	seqOpts := descriptor.GetSequenceOpts()
 	var val int64
 	var err error
 	// TODO(adityamaru): Think about virtual sequences.
 	if seqOpts.Virtual {
 		return 0, errors.New("virtual sequences are not supported by IMPORT INTO")
 	}
-	seqValueKey := codec.SequenceKey(uint32(descriptor.ID))
+	seqValueKey := codec.SequenceKey(uint32(descriptor.GetID()))
 	val, err = kv.IncrementValRetryable(ctx, db, seqValueKey, incrementBy)
 	if err != nil {
 		if errors.HasType(err, (*roachpb.IntegerOverflowError)(nil)) {
@@ -334,8 +386,8 @@ func incrementSequenceByVal(
 	return val, nil
 }
 
-func boundsExceededError(descriptor *tabledesc.Immutable) error {
-	seqOpts := descriptor.SequenceOpts
+func boundsExceededError(descriptor catalog.TableDescriptor) error {
+	seqOpts := descriptor.GetSequenceOpts()
 	isAscending := seqOpts.Increment > 0
 
 	var word string
@@ -347,10 +399,11 @@ func boundsExceededError(descriptor *tabledesc.Immutable) error {
 		word = "minimum"
 		value = seqOpts.MinValue
 	}
+	name := descriptor.GetName()
 	return pgerror.Newf(
 		pgcode.SequenceGeneratorLimitExceeded,
 		`reached %s value of sequence %q (%d)`, word,
-		tree.ErrString((*tree.Name)(&descriptor.Name)), value)
+		tree.ErrString((*tree.Name)(&name)), value)
 }
 
 // checkForPreviouslyAllocatedChunks checks if a sequence value has already been
@@ -378,7 +431,7 @@ func (j *SeqChunkProvider) checkForPreviouslyAllocatedChunks(
 		if chunk.ChunkStartRow <= c.rowID && chunk.NextChunkStartRow > c.rowID {
 			relativeRowIndex := c.rowID - chunk.ChunkStartRow
 			seqMetadata.curVal = chunk.ChunkStartVal +
-				seqMetadata.seqDesc.SequenceOpts.Increment*(seqMetadata.instancesPerRow*relativeRowIndex)
+				seqMetadata.seqDesc.GetSequenceOpts().Increment*(seqMetadata.instancesPerRow*relativeRowIndex)
 			found = true
 			return found, nil
 		}
@@ -409,7 +462,7 @@ func reserveChunkOfSeqVals(
 		newChunkSize = seqMetadata.instancesPerRow
 	}
 
-	incrementValBy := newChunkSize * seqMetadata.seqDesc.SequenceOpts.Increment
+	incrementValBy := newChunkSize * seqMetadata.seqDesc.GetSequenceOpts().Increment
 	// incrementSequenceByVal keeps retrying until it is able to find a slot
 	// of incrementValBy.
 	seqVal, err := incrementSequenceByVal(evalCtx.Context, seqMetadata.seqDesc, evalCtx.DB,
@@ -420,7 +473,7 @@ func reserveChunkOfSeqVals(
 
 	// Update the sequence metadata to reflect the newly reserved chunk.
 	seqMetadata.curChunk = &jobspb.SequenceValChunk{
-		ChunkStartVal:     seqVal - incrementValBy + seqMetadata.seqDesc.SequenceOpts.Increment,
+		ChunkStartVal:     seqVal - incrementValBy + seqMetadata.seqDesc.GetSequenceOpts().Increment,
 		ChunkSize:         newChunkSize,
 		ChunkStartRow:     c.rowID,
 		NextChunkStartRow: c.rowID + (newChunkSize / seqMetadata.instancesPerRow),
@@ -435,6 +488,22 @@ func importNextVal(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, err
 	if !ok {
 		return nil, errors.Newf("sequence %s not found in annotation", seqName)
 	}
+	return importNextValHelper(evalCtx, c, seqMetadata)
+}
+
+func importNextValByID(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+	c := getCellInfoAnnotation(evalCtx.Annotations)
+	oid := tree.MustBeDOid(args[0])
+	seqMetadata, ok := c.seqIDToMetadata[descpb.ID(oid.DInt)]
+	if !ok {
+		return nil, errors.Newf("sequence with ID %v not found in annotation", oid)
+	}
+	return importNextValHelper(evalCtx, c, seqMetadata)
+}
+
+func importNextValHelper(
+	evalCtx *tree.EvalContext, c *CellInfoAnnotation, seqMetadata *SequenceMetadata,
+) (tree.Datum, error) {
 	if c.seqChunkProvider == nil {
 		return nil, errors.New("no sequence chunk provider configured for the import job")
 	}
@@ -449,7 +518,7 @@ func importNextVal(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, err
 	} else {
 		// The current chunk of sequence values can be used for the row being
 		// processed.
-		seqMetadata.curVal += seqMetadata.seqDesc.SequenceOpts.Increment
+		seqMetadata.curVal += seqMetadata.seqDesc.GetSequenceOpts().Increment
 	}
 	return tree.NewDInt(tree.DInt(seqMetadata.curVal)), nil
 }
@@ -537,14 +606,21 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 		visitorSideEffect: func(annot *tree.Annotations, fn *tree.FuncExpr) error {
 			// Get sequence name so that we can update the annotation with the number
 			// of nextval calls to this sequence in a row.
-			seqName, err := sequence.GetSequenceFromFunc(fn)
+			seqIdentifier, err := sequence.GetSequenceFromFunc(fn)
 			if err != nil {
 				return err
 			}
+
 			var sequenceMetadata *SequenceMetadata
 			var ok bool
-			if sequenceMetadata, ok = getCellInfoAnnotation(annot).seqNameToMetadata[*seqName]; !ok {
-				return errors.Newf("sequence %s not found in annotation", *seqName)
+			if seqIdentifier.IsByID() {
+				if sequenceMetadata, ok = getCellInfoAnnotation(annot).seqIDToMetadata[descpb.ID(seqIdentifier.SeqID)]; !ok {
+					return errors.Newf("sequence with ID %s not found in annotation", seqIdentifier.SeqID)
+				}
+			} else {
+				if sequenceMetadata, ok = getCellInfoAnnotation(annot).seqNameToMetadata[seqIdentifier.SeqName]; !ok {
+					return errors.Newf("sequence %s not found in annotation", seqIdentifier.SeqName)
+				}
 			}
 			sequenceMetadata.instancesPerRow++
 			return nil
@@ -556,6 +632,12 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 				ReturnType: tree.FixedReturnType(types.Int),
 				Info:       "Advances the value of the sequence and returns the final value.",
 				Fn:         importNextVal,
+			},
+			tree.Overload{
+				Types:      tree.ArgTypes{{builtins.SequenceNameArg, types.RegClass}},
+				ReturnType: tree.FixedReturnType(types.Int),
+				Info:       "Advances the value of the sequence and returns the final value.",
+				Fn:         importNextValByID,
 			},
 		),
 	},

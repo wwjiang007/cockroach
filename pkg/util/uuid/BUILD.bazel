@@ -21,6 +21,7 @@ go_library(
 
 go_test(
     name = "uuid_test",
+    size = "small",
     srcs = [
         "benchmark_fast_test.go",
         "codec_test.go",
@@ -33,7 +34,6 @@ go_test(
     deps = [
         "//pkg/testutils/skip",
         "//pkg/util/timeutil",
-        "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )

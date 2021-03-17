@@ -13,16 +13,17 @@ package colexec
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"testing"
-	"unsafe"
 
 	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecjoin"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -56,13 +57,13 @@ func getHJTestCases() []*joinTestCase {
 			leftTypes:   []*types.T{types.Int},
 			rightTypes:  []*types.T{types.Int},
 
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 				{1},
 				{2},
 				{3},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{-1},
 				{1},
 				{3},
@@ -78,7 +79,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{nil, -1},
 				{1, 1},
 				{3, 3},
@@ -93,8 +94,8 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int},
 
 			// Test an empty build table.
-			leftTuples: tuples{},
-			rightTuples: tuples{
+			leftTuples: colexectestutils.Tuples{},
+			rightTuples: colexectestutils.Tuples{
 				{-1},
 				{1},
 				{3},
@@ -108,7 +109,7 @@ func getHJTestCases() []*joinTestCase {
 			joinType:         descpb.FullOuterJoin,
 			leftEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{nil, -1},
 				{nil, 1},
 				{nil, 3},
@@ -119,14 +120,14 @@ func getHJTestCases() []*joinTestCase {
 			leftTypes:   []*types.T{types.Int},
 			rightTypes:  []*types.T{types.Int},
 
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 				{1},
 				{2},
 				{3},
 				{4},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1},
 				{3},
 				{5},
@@ -141,7 +142,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1, 1},
 				{3, 3},
 				{0, nil},
@@ -155,11 +156,11 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int},
 
 			// Test right outer join.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 				{1},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1},
 				{2},
 			},
@@ -173,7 +174,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1, 1},
 				{nil, 2},
 			},
@@ -187,12 +188,12 @@ func getHJTestCases() []*joinTestCase {
 			// unmatched row from the right followed by a matched one. This is a
 			// regression test for #39303 in order to check that probeRowUnmatched
 			// is updated correctly in case of non-distinct build table.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 				{0},
 				{2},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1},
 				{2},
 			},
@@ -205,7 +206,7 @@ func getHJTestCases() []*joinTestCase {
 			joinType:          descpb.RightOuterJoin,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{nil, 1},
 				{2, 2},
 			},
@@ -216,10 +217,10 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int},
 
 			// Test null handling only on probe column.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{nil},
 				{0},
 			},
@@ -232,7 +233,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: false,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{0},
 			},
 		},
@@ -242,13 +243,13 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int},
 
 			// Test null handling only on build column.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{nil},
 				{nil},
 				{1},
 				{0},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1},
 				{0},
 			},
@@ -262,7 +263,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1},
 				{0},
 			},
@@ -273,13 +274,13 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int, types.Int},
 
 			// Test null handling in output columns.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{1, nil},
 				{2, nil},
 				{3, 1},
 				{4, 2},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1, 2},
 				{2, nil},
 				{3, nil},
@@ -294,7 +295,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{nil, 2},
 				{nil, nil},
 				{1, nil},
@@ -307,13 +308,13 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int},
 
 			// Test null handling in hash join key column.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{1},
 				{3},
 				{nil},
 				{2},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{2},
 				{nil},
 				{3},
@@ -329,7 +330,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{2},
 				{3},
 				{1},
@@ -341,7 +342,7 @@ func getHJTestCases() []*joinTestCase {
 			leftTypes:   []*types.T{types.Int, types.Int, types.Int},
 			rightTypes:  []*types.T{types.Int, types.Int, types.Int},
 
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0, 0, 1},
 				{0, 0, 2},
 				{1, 0, 3},
@@ -349,7 +350,7 @@ func getHJTestCases() []*joinTestCase {
 				{1, 1, 5},
 				{0, 0, 6},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1, 0, 7},
 				{0, 0, 8},
 				{0, 0, 9},
@@ -364,7 +365,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{3, 7},
 				{6, 8},
 				{1, 8},
@@ -380,7 +381,7 @@ func getHJTestCases() []*joinTestCase {
 			leftTypes:   []*types.T{types.Int},
 			rightTypes:  []*types.T{types.Int},
 
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 				{coldata.BatchSize()},
 				{coldata.BatchSize()},
@@ -391,7 +392,7 @@ func getHJTestCases() []*joinTestCase {
 				{1},
 				{coldata.BatchSize() + 1},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{coldata.BatchSize()},
 				{coldata.BatchSize() * 2},
 				{coldata.BatchSize() * 3},
@@ -409,7 +410,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{coldata.BatchSize(), coldata.BatchSize()},
 				{coldata.BatchSize(), coldata.BatchSize()},
 				{coldata.BatchSize(), coldata.BatchSize()},
@@ -427,7 +428,7 @@ func getHJTestCases() []*joinTestCase {
 			leftTypes:   []*types.T{types.Int},
 			rightTypes:  []*types.T{types.Int},
 
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 				{0},
 				{1},
@@ -435,7 +436,7 @@ func getHJTestCases() []*joinTestCase {
 				{1},
 				{2},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1},
 				{0},
 				{2},
@@ -450,7 +451,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1},
 				{1},
 				{1},
@@ -466,13 +467,13 @@ func getHJTestCases() []*joinTestCase {
 			leftTypes:   []*types.T{types.Bool, types.Int, types.Bytes, types.Int},
 			rightTypes:  []*types.T{types.Int, types.Float, types.Int4},
 
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{false, 5, "a", 10},
 				{true, 3, "b", 30},
 				{false, 2, "foo", 20},
 				{false, 6, "bar", 50},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1, 1.1, int32(1)},
 				{2, 2.2, int32(2)},
 				{3, 3.3, int32(4)},
@@ -488,7 +489,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{2, "foo", 2, int32(2)},
 				{3, "b", 3, int32(4)},
 				{5, "a", 5, int32(16)},
@@ -501,13 +502,13 @@ func getHJTestCases() []*joinTestCase {
 
 			// Reverse engineering hash table hash heuristic to find key values that
 			// hash to the same bucket.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 				{coldata.BatchSize()},
 				{coldata.BatchSize() * 2},
 				{coldata.BatchSize() * 3},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{0},
 				{coldata.BatchSize()},
 				{coldata.BatchSize() * 3},
@@ -521,7 +522,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{0},
 				{coldata.BatchSize()},
 				{coldata.BatchSize() * 3},
@@ -533,14 +534,14 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int},
 
 			// Test a N:1 inner join where the right side key has duplicate values.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 				{1},
 				{2},
 				{3},
 				{4},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1},
 				{1},
 				{1},
@@ -556,7 +557,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: false,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1, 1},
 				{1, 1},
 				{1, 1},
@@ -570,7 +571,7 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int, types.Int, types.Int},
 
 			// Test inner join on multiple equality columns.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0, 0, 10},
 				{0, 1, 20},
 				{0, 2, 30},
@@ -579,7 +580,7 @@ func getHJTestCases() []*joinTestCase {
 				{2, 0, 60},
 				{2, 1, 70},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{0, 100, 2},
 				{1, 200, 1},
 				{2, 300, 0},
@@ -594,7 +595,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{0, 2, 30, 100},
 				{1, 1, 40, 200},
 				{2, 0, 60, 300},
@@ -607,7 +608,7 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int, types.Int},
 
 			// Test multiple column with values that hash to the same bucket.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{10, 0, 0},
 				{20, 0, coldata.BatchSize()},
 				{40, coldata.BatchSize(), 0},
@@ -615,7 +616,7 @@ func getHJTestCases() []*joinTestCase {
 				{60, coldata.BatchSize() * 2, 0},
 				{70, coldata.BatchSize() * 2, coldata.BatchSize()},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{0, coldata.BatchSize()},
 				{coldata.BatchSize() * 2, coldata.BatchSize()},
 				{0, 0},
@@ -630,7 +631,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{20, 0, coldata.BatchSize()},
 				{70, coldata.BatchSize() * 2, coldata.BatchSize()},
 				{10, 0, 0},
@@ -642,7 +643,7 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int, types.Int4, types.Int2, types.Bool, types.Bytes},
 
 			// Test multiple equality columns of different types.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{"foo", false, int16(100), int32(1000), int64(10000), "aaa"},
 				{"foo", true, 100, 1000, 10000, "bbb"},
 				{"foo1", false, 100, 1000, 10000, "ccc"},
@@ -650,7 +651,7 @@ func getHJTestCases() []*joinTestCase {
 				{"foo", false, 100, 2000, 10000, "eee"},
 				{"bar", true, 300, 3000, 30000, "fff"},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{int64(10000), int32(1000), int16(100), false, "foo1"},
 				{10000, 1000, 100, false, "foo"},
 				{30000, 3000, 300, true, "bar"},
@@ -667,7 +668,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{"ccc"},
 				{"aaa"},
 				{"fff"},
@@ -680,13 +681,13 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Float},
 
 			// Test equality columns of type float.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{33.333},
 				{44.4444},
 				{55.55555},
 				{44.4444},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{44.4444},
 				{55.55555},
 				{33.333},
@@ -700,7 +701,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{55.55555},
 				{44.4444},
 				{44.4444},
@@ -713,13 +714,13 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int, types.Int, types.Int, types.Int},
 
 			// Test use right side as build table.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{2, 4, 8, 16},
 				{3, 3, 2, 2},
 				{3, 7, 2, 1},
 				{5, 4, 3, 2},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1, 3, 5, 7},
 				{1, 1, 1, 1},
 				{1, 2, 3, 4},
@@ -733,7 +734,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{3, 3, 2, 2, 1, 2, 3, 4},
 				{3, 7, 2, 1, 1, 2, 3, 4},
 				{5, 4, 3, 2, 1, 3, 5, 7},
@@ -745,12 +746,12 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Decimal},
 
 			// Test types.Decimal type as equality column.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{decs[0]},
 				{decs[1]},
 				{decs[2]},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{decs[2]},
 				{decs[3]},
 				{decs[0]},
@@ -764,7 +765,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{decs[2]},
 				{decs[0]},
 			},
@@ -776,13 +777,13 @@ func getHJTestCases() []*joinTestCase {
 
 			joinType: descpb.LeftSemiJoin,
 
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 				{0},
 				{1},
 				{2},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{0},
 				{0},
 				{1},
@@ -796,7 +797,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{0},
 				{0},
 				{1},
@@ -809,13 +810,13 @@ func getHJTestCases() []*joinTestCase {
 
 			joinType: descpb.LeftAntiJoin,
 
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{0},
 				{0},
 				{1},
 				{2},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{0},
 				{0},
 				{1},
@@ -829,7 +830,7 @@ func getHJTestCases() []*joinTestCase {
 			leftEqColsAreKey:  false,
 			rightEqColsAreKey: false,
 
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{2},
 			},
 		},
@@ -839,13 +840,13 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int, types.Int},
 
 			// Test ON expression.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{1, nil},
 				{2, nil},
 				{3, 1},
 				{4, 2},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1, 2},
 				{2, nil},
 				{3, nil},
@@ -861,7 +862,7 @@ func getHJTestCases() []*joinTestCase {
 			rightEqColsAreKey: true,
 
 			onExpr: execinfrapb.Expression{Expr: "@1 + @3 > 2 AND @1 + @3 < 8"},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{nil, nil},
 				{1, nil},
 			},
@@ -872,13 +873,13 @@ func getHJTestCases() []*joinTestCase {
 			rightTypes:  []*types.T{types.Int, types.Int},
 
 			// Test ON expression.
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{1, nil},
 				{2, nil},
 				{3, 1},
 				{4, 2},
 			},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{1, 2},
 				{2, nil},
 				{3, nil},
@@ -894,7 +895,7 @@ func getHJTestCases() []*joinTestCase {
 			rightEqColsAreKey: true,
 
 			onExpr: execinfrapb.Expression{Expr: "@1 + @3 + @4 < 100"},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{nil, 2},
 				{2, 4},
 			},
@@ -904,24 +905,24 @@ func getHJTestCases() []*joinTestCase {
 			joinType:    descpb.IntersectAllJoin,
 			leftTypes:   []*types.T{types.Int},
 			rightTypes:  []*types.T{types.Int},
-			leftTuples:  tuples{{1}, {1}, {2}, {2}, {2}, {3}, {3}},
-			rightTuples: tuples{{1}, {2}, {3}, {3}, {3}},
+			leftTuples:  colexectestutils.Tuples{{1}, {1}, {2}, {2}, {2}, {3}, {3}},
+			rightTuples: colexectestutils.Tuples{{1}, {2}, {3}, {3}, {3}},
 			leftEqCols:  []uint32{0},
 			rightEqCols: []uint32{0},
 			leftOutCols: []uint32{0},
-			expected:    tuples{{1}, {2}, {3}, {3}},
+			expected:    colexectestutils.Tuples{{1}, {2}, {3}, {3}},
 		},
 		{
 			description: "26",
 			joinType:    descpb.ExceptAllJoin,
 			leftTypes:   []*types.T{types.Int},
 			rightTypes:  []*types.T{types.Int},
-			leftTuples:  tuples{{1}, {1}, {2}, {2}, {2}, {3}, {3}},
-			rightTuples: tuples{{1}, {2}, {3}, {3}, {3}},
+			leftTuples:  colexectestutils.Tuples{{1}, {1}, {2}, {2}, {2}, {3}, {3}},
+			rightTuples: colexectestutils.Tuples{{1}, {2}, {3}, {3}, {3}},
 			leftEqCols:  []uint32{0},
 			rightEqCols: []uint32{0},
 			leftOutCols: []uint32{0},
-			expected:    tuples{{1}, {2}, {2}},
+			expected:    colexectestutils.Tuples{{1}, {2}, {2}},
 		},
 	}
 	return withMirrors(hjTestCases)
@@ -977,21 +978,21 @@ func createSpecForHashJoiner(tc *joinTestCase) *execinfrapb.ProcessorSpec {
 func runHashJoinTestCase(
 	t *testing.T,
 	tc *joinTestCase,
-	hjOpConstructor func(sources []colexecbase.Operator) (colexecbase.Operator, error),
+	hjOpConstructor func(sources []colexecop.Operator) (colexecop.Operator, error),
 ) {
 	tc.init()
-	inputs := []tuples{tc.leftTuples, tc.rightTuples}
+	inputs := []colexectestutils.Tuples{tc.leftTuples, tc.rightTuples}
 	typs := [][]*types.T{tc.leftTypes, tc.rightTypes}
-	var runner testRunner
+	var runner colexectestutils.TestRunner
 	if tc.skipAllNullsInjection {
 		// We're omitting all nulls injection test. See comments for each such
 		// test case.
-		runner = runTestsWithoutAllNullsInjection
+		runner = colexectestutils.RunTestsWithoutAllNullsInjection
 	} else {
-		runner = runTestsWithTyps
+		runner = colexectestutils.RunTestsWithTyps
 	}
 	log.Infof(context.Background(), "%s", tc.description)
-	runner(t, inputs, typs, tc.expected, unorderedVerifier, hjOpConstructor)
+	runner(t, testAllocator, inputs, typs, tc.expected, colexectestutils.UnorderedVerifier, hjOpConstructor)
 }
 
 func TestHashJoiner(t *testing.T) {
@@ -1010,16 +1011,16 @@ func TestHashJoiner(t *testing.T) {
 	for _, tcs := range [][]*joinTestCase{getHJTestCases(), getMJTestCases()} {
 		for _, tc := range tcs {
 			for _, tc := range tc.mutateTypes() {
-				runHashJoinTestCase(t, tc, func(sources []colexecbase.Operator) (colexecbase.Operator, error) {
+				runHashJoinTestCase(t, tc, func(sources []colexecop.Operator) (colexecop.Operator, error) {
 					spec := createSpecForHashJoiner(tc)
-					args := &NewColOperatorArgs{
+					args := &colexecargs.NewColOperatorArgs{
 						Spec:                spec,
 						Inputs:              sources,
 						StreamingMemAccount: testMemAcc,
 					}
 					args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 					args.TestingKnobs.DiskSpillingDisabled = true
-					result, err := TestNewColOperator(ctx, flowCtx, args)
+					result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
 					if err != nil {
 						return nil, err
 					}
@@ -1076,21 +1077,22 @@ func BenchmarkHashJoiner(b *testing.B) {
 									b.SetBytes(int64(8 * nBatches * coldata.BatchSize() * nCols * 2))
 									b.ResetTimer()
 									for i := 0; i < b.N; i++ {
-										leftSource := colexecbase.NewRepeatableBatchSource(testAllocator, batch, sourceTypes)
-										rightSource := newFiniteBatchSource(batch, sourceTypes, nBatches)
+										leftSource := colexecop.NewRepeatableBatchSource(testAllocator, batch, sourceTypes)
+										rightSource := colexectestutils.NewFiniteBatchSource(testAllocator, batch, sourceTypes, nBatches)
 										joinType := descpb.InnerJoin
 										if fullOuter {
 											joinType = descpb.FullOuterJoin
 										}
-										hjSpec := MakeHashJoinerSpec(
+										hjSpec := colexecjoin.MakeHashJoinerSpec(
 											joinType,
 											[]uint32{0, 1}, []uint32{2, 3},
 											sourceTypes, sourceTypes,
 											rightDistinct,
 										)
-										hj := NewHashJoiner(
+										hj := colexecjoin.NewHashJoiner(
 											testAllocator, testAllocator, hjSpec,
-											leftSource, rightSource, HashJoinerInitialNumBuckets,
+											leftSource, rightSource,
+											colexecjoin.HashJoinerInitialNumBuckets, colexecop.DefaultMemoryLimit,
 										)
 										hj.Init()
 
@@ -1108,38 +1110,6 @@ func BenchmarkHashJoiner(b *testing.B) {
 			}
 		})
 	}
-}
-
-// TestHashingDoesNotAllocate ensures that our use of the noescape hack to make
-// sure hashing with unsafe.Pointer doesn't allocate still works correctly.
-func TestHashingDoesNotAllocate(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	var sum uintptr
-	foundAllocations := 0
-	for i := 0; i < 10; i++ {
-		// Sometimes, Go allocates somewhere else. To make this test not flaky,
-		// let's just make sure that at least one of the rounds of this loop doesn't
-		// allocate at all.
-		s := &runtime.MemStats{}
-		runtime.ReadMemStats(s)
-		numAlloc := s.TotalAlloc
-		i := 10
-		x := memhash64(noescape(unsafe.Pointer(&i)), 0)
-		runtime.ReadMemStats(s)
-
-		if numAlloc != s.TotalAlloc {
-			foundAllocations++
-		}
-		sum += x
-	}
-	if foundAllocations == 10 {
-		// Uhoh, we allocated every single time. This probably means we regressed,
-		// and our hash function allocates.
-		t.Fatalf("memhash64(noescape(&i)) allocated at least once")
-	}
-	t.Log(sum)
 }
 
 // TestHashJoinerProjection tests that planning of hash joiner correctly
@@ -1164,8 +1134,8 @@ func TestHashJoinerProjection(t *testing.T) {
 
 	leftTypes := []*types.T{types.Bool, types.Int, types.Bytes}
 	rightTypes := []*types.T{types.Int, types.Float, types.Decimal}
-	leftTuples := tuples{{false, 1, "foo"}}
-	rightTuples := tuples{{1, 1.1, decs[1]}}
+	leftTuples := colexectestutils.Tuples{{false, 1, "foo"}}
+	rightTuples := colexectestutils.Tuples{{1, 1.1, decs[1]}}
 
 	spec := &execinfrapb.ProcessorSpec{
 		Core: execinfrapb.ProcessorCoreUnion{
@@ -1189,16 +1159,16 @@ func TestHashJoinerProjection(t *testing.T) {
 		ResultTypes: []*types.T{types.Int, types.Int, types.Bool, types.Decimal, types.Float, types.Bytes},
 	}
 
-	leftSource := newOpTestInput(1, leftTuples, leftTypes)
-	rightSource := newOpTestInput(1, rightTuples, rightTypes)
-	args := &NewColOperatorArgs{
+	leftSource := colexectestutils.NewOpTestInput(testAllocator, 1, leftTuples, leftTypes)
+	rightSource := colexectestutils.NewOpTestInput(testAllocator, 1, rightTuples, rightTypes)
+	args := &colexecargs.NewColOperatorArgs{
 		Spec:                spec,
-		Inputs:              []colexecbase.Operator{leftSource, rightSource},
+		Inputs:              []colexecop.Operator{leftSource, rightSource},
 		StreamingMemAccount: testMemAcc,
 	}
 	args.TestingKnobs.UseStreamingMemAccountForBuffering = true
 	args.TestingKnobs.DiskSpillingDisabled = true
-	hjOp, err := TestNewColOperator(ctx, flowCtx, args)
+	hjOp, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
 	require.NoError(t, err)
 	hjOp.Op.Init()
 	for b := hjOp.Op.Next(ctx); b.Length() > 0; b = hjOp.Op.Next(ctx) {

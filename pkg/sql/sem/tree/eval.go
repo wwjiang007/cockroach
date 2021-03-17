@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -3002,9 +3003,20 @@ func (e *MultipleResultsError) Error() string {
 	return fmt.Sprintf("%s: unexpected multiple results", e.SQL)
 }
 
+// DatabaseRegionConfig is a wrapper around DatabaseDescriptor_RegionConfig
+// related methods which avoids a circular dependency between descpb and tree.
+type DatabaseRegionConfig interface {
+	IsValidRegionNameString(r string) bool
+	PrimaryRegionString() string
+}
+
 // EvalDatabase consists of functions that reference the session database
 // and is to be used from EvalContext.
 type EvalDatabase interface {
+	// CurrentDatabaseRegionConfig returns the RegionConfig of the current
+	// session database.
+	CurrentDatabaseRegionConfig() (DatabaseRegionConfig, error)
+
 	// ParseQualifiedTableName parses a SQL string of the form
 	// `[ database_name . ] [ schema_name . ] table_name`.
 	// NB: this is deprecated! Use parser.ParseQualifiedTableName when possible.
@@ -3020,6 +3032,15 @@ type EvalDatabase interface {
 	// LookupSchema looks up the schema with the given name in the given
 	// database.
 	LookupSchema(ctx context.Context, dbName, scName string) (found bool, scMeta SchemaMeta, err error)
+
+	// IsTableVisible checks if the table with the given ID belongs to a schema
+	// on the given sessiondata.SearchPath.
+	IsTableVisible(
+		ctx context.Context,
+		curDB string,
+		searchPath sessiondata.SearchPath,
+		tableID int64,
+	) (isVisible bool, exists bool, err error)
 }
 
 // EvalPlanner is a limited planner that can be used from EvalContext.
@@ -3072,6 +3093,14 @@ type EvalPlanner interface {
 	CompactEngineSpan(
 		ctx context.Context, nodeID int32, storeID int32, startKey []byte, endKey []byte,
 	) error
+
+	// MemberOfWithAdminOption is used to collect a list of roles (direct and
+	// indirect) that the member is part of. See the comment on the planner
+	// implementation in authorization.go
+	MemberOfWithAdminOption(
+		ctx context.Context,
+		member security.SQLUsername,
+	) (map[security.SQLUsername]bool, error)
 }
 
 // EvalSessionAccessor is a limited interface to access session variables.
@@ -3118,12 +3147,6 @@ type ClientNoticeSender interface {
 // this to sqlutil.InternalExecutor or sql.InternalExecutor, and use the
 // alternatives.
 type InternalExecutor interface {
-	// Query is part of the sqlutil.InternalExecutor interface.
-	Query(
-		ctx context.Context, opName string, txn *kv.Txn,
-		stmt string, qargs ...interface{},
-	) ([]Datums, error)
-
 	// QueryRow is part of the sqlutil.InternalExecutor interface.
 	QueryRow(
 		ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
@@ -3173,6 +3196,23 @@ type SequenceOperators interface {
 	// `newVal` is returned. Otherwise, the next call to nextval will return
 	// `newVal + seqOpts.Increment`.
 	SetSequenceValue(ctx context.Context, seqName *TableName, newVal int64, isCalled bool) error
+
+	// IncrementSequenceByID increments the given sequence and returns the result.
+	// It returns an error if the given ID is not a sequence.
+	// Takes in a sequence ID rather than a name, unlike IncrementSequence.
+	IncrementSequenceByID(ctx context.Context, seqID int64) (int64, error)
+
+	// GetLatestValueInSessionForSequenceByID returns the value most recently obtained by
+	// nextval() for the given sequence in this session.
+	// Takes in a sequence ID rather than a name, unlike GetLatestValueInSessionForSequence.
+	GetLatestValueInSessionForSequenceByID(ctx context.Context, seqID int64) (int64, error)
+
+	// SetSequenceValueByID sets the sequence's value.
+	// If isCalled is false, the sequence is set such that the next time nextval() is called,
+	// `newVal` is returned. Otherwise, the next call to nextval will return
+	// `newVal + seqOpts.Increment`.
+	// Takes in a sequence ID rather than a name, unlike SetSequenceValue.
+	SetSequenceValueByID(ctx context.Context, seqID int64, newVal int64, isCalled bool) error
 }
 
 // TenantOperator is capable of interacting with tenant state, allowing SQL
@@ -3214,6 +3254,9 @@ type EvalContextTestingKnobs struct {
 	// cost of each expression in the query tree for the purpose of creating
 	// alternate query plans in the optimizer.
 	OptimizerCostPerturbation float64
+	// If set, mutations.MaxBatchSize and row.getKVBatchSize will be overridden
+	// to use the non-test value.
+	ForceProductionBatchSizes bool
 
 	CallbackGenerators map[string]*CallbackValueGenerator
 }
@@ -3858,7 +3901,7 @@ func (expr *CoalesceExpr) Eval(ctx *EvalContext) (Datum, error) {
 
 // Eval implements the TypedExpr interface.
 // Note: if you're modifying this function, please make sure to adjust
-// colexec.comparisonExprAdapter implementations accordingly.
+// colexeccmp.ComparisonExprAdapter implementations accordingly.
 func (expr *ComparisonExpr) Eval(ctx *EvalContext) (Datum, error) {
 	left, err := expr.Left.(TypedExpr).Eval(ctx)
 	if err != nil {
@@ -3908,7 +3951,7 @@ func EvalComparisonExprWithSubOperator(
 	return evalDatumsCmp(ctx, expr.Operator, expr.SubOperator, expr.Fn, left, datums)
 }
 
-// EvalArgsAndGetGenerator evaluates the arguments and instanciates a
+// EvalArgsAndGetGenerator evaluates the arguments and instantiates a
 // ValueGenerator for use by set projections.
 func (expr *FuncExpr) EvalArgsAndGetGenerator(ctx *EvalContext) (ValueGenerator, error) {
 	if expr.fn == nil || expr.fnProps.Class != GeneratorClass {
@@ -5365,7 +5408,7 @@ func (c *CallbackValueGenerator) Values() (Datums, error) {
 }
 
 // Close is part of the ValueGenerator interface.
-func (c *CallbackValueGenerator) Close() {}
+func (c *CallbackValueGenerator) Close(_ context.Context) {}
 
 // Sqrt returns the square root of x.
 func Sqrt(x float64) (*DFloat, error) {

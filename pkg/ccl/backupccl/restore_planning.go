@@ -10,6 +10,7 @@ package backupccl
 
 import (
 	"context"
+	"go/constant"
 	"net/url"
 	"path"
 	"sort"
@@ -33,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
@@ -49,7 +51,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -120,6 +121,38 @@ func rewriteTypesInExpr(expr string, rewrites DescRewriteMap) (string, error) {
 	})
 	ctx.FormatNode(parsed)
 	return ctx.CloseAndGetString(), nil
+}
+
+// rewriteSequencesInExpr rewrites all sequence IDs in the input expression
+// string according to rewrites.
+func rewriteSequencesInExpr(expr string, rewrites DescRewriteMap) (string, error) {
+	parsed, err := parser.ParseExpr(expr)
+	if err != nil {
+		return "", err
+	}
+	rewriteFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		annotateTypeExpr, id, ok := schemaexpr.GetTypeExprAndSeqID(expr)
+		if !ok {
+			return true, expr, nil
+		}
+
+		rewrite, ok := rewrites[descpb.ID(id)]
+		if !ok {
+			return true, expr, nil
+		}
+		annotateTypeExpr.Expr = tree.NewNumVal(
+			constant.MakeInt64(int64(rewrite.ID)),
+			strconv.Itoa(int(rewrite.ID)),
+			false, /* negative */
+		)
+		return false, annotateTypeExpr, nil
+	}
+
+	newExpr, err := tree.SimpleVisit(parsed, rewriteFunc)
+	if err != nil {
+		return "", err
+	}
+	return newExpr.String(), nil
 }
 
 // maybeFilterMissingViews filters the set of tables to restore to exclude views
@@ -359,17 +392,17 @@ func allocateDescriptorRewrites(
 		// DB.
 		descriptorRewrites[tempSysDBID] = &jobspb.RestoreDetails_DescriptorRewrite{ID: tempSysDBID}
 		for _, table := range tablesByID {
-			if table.GetParentID() == systemschema.SystemDB.ID {
+			if table.GetParentID() == systemschema.SystemDB.GetID() {
 				descriptorRewrites[table.GetID()] = &jobspb.RestoreDetails_DescriptorRewrite{ParentID: tempSysDBID}
 			}
 		}
 		for _, sc := range typesByID {
-			if sc.GetParentID() == systemschema.SystemDB.ID {
+			if sc.GetParentID() == systemschema.SystemDB.GetID() {
 				descriptorRewrites[sc.GetID()] = &jobspb.RestoreDetails_DescriptorRewrite{ParentID: tempSysDBID}
 			}
 		}
 		for _, typ := range typesByID {
-			if typ.GetParentID() == systemschema.SystemDB.ID {
+			if typ.GetParentID() == systemschema.SystemDB.GetID() {
 				descriptorRewrites[typ.GetID()] = &jobspb.RestoreDetails_DescriptorRewrite{ParentID: tempSysDBID}
 			}
 		}
@@ -541,22 +574,37 @@ func allocateDescriptorRewrites(
 				}
 				// Check that the table name is _not_ in use.
 				// This would fail the CPut later anyway, but this yields a prettier error.
-				if err := CheckObjectExists(ctx, txn, p.ExecCfg().Codec, parentID, table.GetParentSchemaID(), table.Name); err != nil {
+				tableName := tree.NewUnqualifiedTableName(tree.Name(table.GetName()))
+				err := catalogkv.CheckObjectCollision(ctx, txn, p.ExecCfg().Codec, parentID, table.GetParentSchemaID(), tableName)
+				if err != nil {
 					return err
 				}
 
 				// Check privileges.
-				{
-					parentDB, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, p.ExecCfg().Codec, parentID)
-					if err != nil {
-						return errors.Wrapf(err,
-							"failed to lookup parent DB %d", errors.Safe(parentID))
-					}
-
-					if err := p.CheckPrivilege(ctx, parentDB, privilege.CREATE); err != nil {
-						return err
-					}
+				parentDB, err := catalogkv.MustGetDatabaseDescByID(ctx, txn, p.ExecCfg().Codec, parentID)
+				if err != nil {
+					return errors.Wrapf(err,
+						"failed to lookup parent DB %d", errors.Safe(parentID))
 				}
+				if err := p.CheckPrivilege(ctx, parentDB, privilege.CREATE); err != nil {
+					return err
+				}
+
+				// We're restoring a table and not its parent database.  If the
+				// new database we're placing the table in is a multi-region database,
+				// block the restore. We do this because we currently have no way to
+				// modify this table and make it multi-region friendly. Long-term we'd
+				// want to modify the table so that it can exist in the multi-region
+				// database.
+				// https://github.com/cockroachdb/cockroach/issues/59804
+				if parentDB.GetRegionConfig() != nil {
+					return pgerror.Newf(pgcode.FeatureNotSupported,
+						"cannot restore individual table %d into multi-region database %d",
+						table.GetID(),
+						parentDB.GetID(),
+					)
+				}
+
 				// Create the table rewrite with the new parent ID. We've done all the
 				// up-front validation that we can.
 				descriptorRewrites[table.ID] = &jobspb.RestoreDetails_DescriptorRewrite{ParentID: parentID}
@@ -602,11 +650,18 @@ func allocateDescriptorRewrites(
 				}
 
 				// See if there is an existing type with the same name.
-				found, id, err := catalogkv.LookupObjectID(ctx, txn, p.ExecCfg().Codec, parentID, typ.GetParentSchemaID(), typ.Name)
+				desc, err := catalogkv.GetDescriptorCollidingWithObject(
+					ctx,
+					txn,
+					p.ExecCfg().Codec,
+					parentID,
+					typ.GetParentSchemaID(),
+					typ.Name,
+				)
 				if err != nil {
 					return err
 				}
-				if !found {
+				if desc == nil {
 					// If we didn't find a type with the same name, then mark that we
 					// need to create the type.
 
@@ -620,7 +675,9 @@ func allocateDescriptorRewrites(
 
 					// Ensure that there isn't a collision with the array type name.
 					arrTyp := typesByID[typ.ArrayTypeID]
-					if err := CheckObjectExists(ctx, txn, p.ExecCfg().Codec, parentID, typ.GetParentSchemaID(), arrTyp.Name); err != nil {
+					typeName := tree.NewUnqualifiedTypeName(tree.Name(arrTyp.GetName()))
+					err := catalogkv.CheckObjectCollision(ctx, txn, p.ExecCfg().Codec, parentID, typ.GetParentSchemaID(), typeName)
+					if err != nil {
 						return errors.Wrapf(err, "name collision for %q's array type", typ.Name)
 					}
 					// Create the rewrite entry for the array type as well.
@@ -629,11 +686,6 @@ func allocateDescriptorRewrites(
 					// If there was a name collision, we'll try to see if we can remap
 					// this type to the type existing in the cluster.
 
-					// See what kind of object we collided with.
-					desc, err := catalogkv.GetAnyDescriptorByID(ctx, txn, p.ExecCfg().Codec, id, catalogkv.Immutable)
-					if err != nil {
-						return err
-					}
 					// If the collided object isn't a type, then error out.
 					existingType, isType := desc.(*typedesc.Immutable)
 					if !isType {
@@ -826,9 +878,8 @@ func maybeUpgradeTableDescsInBackupManifests(
 	// descriptors so that they can be looked up.
 	for _, backupManifest := range backupManifests {
 		for _, desc := range backupManifest.Descriptors {
-			if table := descpb.TableFromDescriptor(&desc, hlc.Timestamp{}); table != nil {
-				descGetter[table.ID] =
-					tabledesc.NewImmutable(*protoutil.Clone(table).(*descpb.TableDescriptor))
+			if table, _, _, _ := descpb.FromDescriptor(&desc); table != nil {
+				descGetter[table.ID] = tabledesc.NewBuilder(table).BuildImmutable()
 			}
 		}
 	}
@@ -836,18 +887,19 @@ func maybeUpgradeTableDescsInBackupManifests(
 	for i := range backupManifests {
 		backupManifest := &backupManifests[i]
 		for j := range backupManifest.Descriptors {
-			table := descpb.TableFromDescriptor(&backupManifest.Descriptors[j], hlc.Timestamp{})
+			table, _, _, _ := descpb.FromDescriptor(&backupManifest.Descriptors[j])
 			if table == nil {
 				continue
 			}
 			if !tabledesc.TableHasDeprecatedForeignKeyRepresentation(table) {
 				continue
 			}
-			desc, err := tabledesc.NewFilledInExistingMutable(ctx, descGetter, skipFKsWithNoMatchingTable, table)
+			b := tabledesc.NewBuilderForFKUpgrade(table, skipFKsWithNoMatchingTable)
+			err := b.RunPostDeserializationChanges(ctx, descGetter)
 			if err != nil {
 				return err
 			}
-			backupManifest.Descriptors[j] = *desc.DescriptorProto()
+			backupManifest.Descriptors[j] = *b.BuildExistingMutable().DescriptorProto()
 		}
 	}
 	return nil
@@ -1008,10 +1060,16 @@ func RewriteTableDescs(
 			descriptorRewrites, table.IsTemporary())
 		table.ParentID = tableRewrite.ParentID
 
-		// Remap type IDs in all serialized expressions within the TableDescriptor.
+		// Remap type IDs and sequence IDs in all serialized expressions within the TableDescriptor.
 		// TODO (rohany): This needs tests once partial indexes are ready.
 		if err := tabledesc.ForEachExprStringInTableDesc(table, func(expr *string) error {
 			newExpr, err := rewriteTypesInExpr(*expr, descriptorRewrites)
+			if err != nil {
+				return err
+			}
+			*expr = newExpr
+
+			newExpr, err = rewriteSequencesInExpr(*expr, descriptorRewrites)
 			if err != nil {
 				return err
 			}
@@ -1021,7 +1079,8 @@ func RewriteTableDescs(
 			return err
 		}
 
-		if err := table.ForeachNonDropIndex(func(index *descpb.IndexDescriptor) error {
+		if err := catalog.ForEachNonDropIndex(table, func(indexI catalog.Index) error {
+			index := indexI.IndexDesc()
 			// Verify that for any interleaved index being restored, the interleave
 			// parent is also being restored. Otherwise, the interleave entries in the
 			// restored IndexDescriptors won't have anything to point to.
@@ -1701,23 +1760,21 @@ func doRestorePlan(
 	if restoreStmt.Options.Detached {
 		// When running in detached mode, we simply create the job record.
 		// We do not wait for the job to finish.
-		aj, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
-			ctx, jr, p.ExtendedEvalContext().Txn)
+		jobID := p.ExecCfg().JobRegistry.MakeJobID()
+		_, err := p.ExecCfg().JobRegistry.CreateAdoptableJobWithTxn(
+			ctx, jr, jobID, p.ExtendedEvalContext().Txn)
 		if err != nil {
 			return err
 		}
-		resultsCh <- tree.Datums{tree.NewDInt(tree.DInt(*aj.ID()))}
+		resultsCh <- tree.Datums{tree.NewDInt(tree.DInt(jobID))}
 		collectTelemetry()
 		return nil
 	}
 
 	var sj *jobs.StartableJob
+	jobID := p.ExecCfg().JobRegistry.MakeJobID()
 	if err := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-		sj, err = p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, jr, txn, resultsCh)
-		if err != nil {
-			return err
-		}
-		return nil
+		return p.ExecCfg().JobRegistry.CreateStartableJobWithTxn(ctx, &sj, jobID, txn, jr)
 	}); err != nil {
 		if sj != nil {
 			if cleanupErr := sj.CleanupOnRollback(ctx); cleanupErr != nil {
@@ -1728,7 +1785,13 @@ func doRestorePlan(
 	}
 
 	collectTelemetry()
-	return sj.Run(ctx)
+	if err := sj.Start(ctx); err != nil {
+		return err
+	}
+	if err := sj.AwaitCompletion(ctx); err != nil {
+		return err
+	}
+	return sj.ReportExecutionResults(ctx, resultsCh)
 }
 
 func init() {

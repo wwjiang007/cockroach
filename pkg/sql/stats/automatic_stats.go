@@ -244,7 +244,7 @@ func MakeRefresher(
 func (r *Refresher) Start(
 	ctx context.Context, stopper *stop.Stopper, refreshInterval time.Duration,
 ) error {
-	stopper.RunWorker(context.Background(), func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(context.Background(), "refresher", func(ctx context.Context) {
 		// We always sleep for r.asOfTime at the beginning of each refresh, so
 		// subtract it from the refreshInterval.
 		refreshInterval -= r.asOfTime
@@ -306,7 +306,7 @@ func (r *Refresher) Start(
 			case mut := <-r.mutations:
 				r.mutationCounts[mut.tableID] += int64(mut.rowsAffected)
 
-			case <-stopper.ShouldStop():
+			case <-stopper.ShouldQuiesce():
 				return
 			}
 		}
@@ -333,24 +333,33 @@ AND drop_time IS NULL
 `,
 		initialTableCollectionDelay)
 
-	rows, err := r.ex.Query(
+	it, err := r.ex.QueryIterator(
 		ctx,
 		"get-tables",
 		nil, /* txn */
 		getAllTablesQuery,
 	)
+	if err == nil {
+		var ok bool
+		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+			row := it.Cur()
+			tableID := descpb.ID(*row[0].(*tree.DInt))
+			// Don't create statistics for system tables or virtual tables.
+			// TODO(rytaft): Don't add views here either. Unfortunately views are not
+			// identified differently from tables in crdb_internal.tables.
+			if !descpb.IsReservedID(tableID) && !descpb.IsVirtualTable(tableID) {
+				r.mutationCounts[tableID] += 0
+			}
+		}
+	}
 	if err != nil {
+		// Note that it is ok if the iterator returned partial results before
+		// encountering an error - in that case we added entries to
+		// r.mutationCounts for some of the tables and operation of adding an
+		// entry is idempotent (i.e. we didn't mess up anything for the next
+		// call to this method).
 		log.Errorf(ctx, "failed to get tables for automatic stats: %v", err)
 		return
-	}
-	for _, row := range rows {
-		tableID := descpb.ID(*row[0].(*tree.DInt))
-		// Don't create statistics for system tables or virtual tables.
-		// TODO(rytaft): Don't add views here either. Unfortunately views are not
-		// identified differently from tables in crdb_internal.tables.
-		if !descpb.IsReservedID(tableID) && !descpb.IsVirtualTable(tableID) {
-			r.mutationCounts[tableID] += 0
-		}
 	}
 }
 

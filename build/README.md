@@ -30,9 +30,9 @@ executable.
 ### Deployment
 
 The deploy image is a downsized image containing a minimal environment for
-running CockroachDB. It is based on Debian Jessie and contains only the main
-CockroachDB binary. To fetch this image, run `docker pull
-cockroachdb/cockroach` in the usual fashion.
+running CockroachDB. It is based on RedHat's `ubi8/ubi-minimal` image and
+contains only the main CockroachDB binary, libgeos libraries, and licenses. To
+fetch this image, run `docker pull cockroachdb/cockroach` in the usual fashion.
 
 To build the image yourself, use the Dockerfile in the `deploy` directory after
 building a release version of the binary with the development image described in
@@ -45,6 +45,7 @@ usual fashion. To be more specific, the steps to do this are:
 go/src/github.com/cockroachdb/cockroach $ ./build/builder.sh mkrelease linux-gnu
 go/src/github.com/cockroachdb/cockroach $ cp ./cockroach-linux-2.6.32-gnu-amd64 build/deploy/cockroach
 go/src/github.com/cockroachdb/cockroach $ cp ./lib.docker_amd64/libgeos_c.so ./lib.docker_amd64/libgeos.so build/deploy/
+go/src/github.com/cockroachdb/cockroach $ cp -r licenses build/deploy/
 go/src/github.com/cockroachdb/cockroach $ cd build/deploy && docker build -t cockroachdb/cockroach .
 ```
 
@@ -57,10 +58,21 @@ which may or may not work (and are not officially supported).
 
 ## Basic Process
 
-- Edit `build/builder/Dockerfile` as desired
-- Run `build/builder.sh init` to test -- this will build the image locally. Beware this can take a lot of time. The result of `init` is a docker image version which you can subsequently stick into the `version` variable inside the `builder.sh` script for testing locally.
-- Once you are happy with the result, run `build/builder.sh push` which pushes your image towards Docker hub, so that it becomes available to others. The result is again a version number, which you then *must* copy back into `builder.sh`. Then commit the change to both Dockerfile and `builder.sh` and submit a PR.
-- Finally, use this version number to update the `builder.dockerImage` configuration parameter in TeamCity under the [`Cockroach`](https://teamcity.cockroachdb.com/admin/editProject.html?projectId=Cockroach&tab=projectParams) and [`Internal`](https://teamcity.cockroachdb.com/admin/editProject.html?projectId=Internal&tab=projectParams) projects.
+- Edit `build/builder/Dockerfile` as desired.
+- Run `build/builder.sh init` to test -- this will build the image locally.
+  Beware this can take a lot of time. The result of `init` is a docker image
+  version which you can subsequently stick into the `version` variable inside
+  the `builder.sh` script for testing locally.
+- When you're happy with the result, commit your changes, submit a pull request,
+  and have it reviewed.
+- Ask someone with permissions to run the `Build and Push new Builder Image`
+  build configuration in TeamCity. This will build and push the new Docker image
+  to [DockerHub](https://hub.docker.com/repository/docker/cockroachdb/builder).
+- Copy the tag of the new image (which will look like `YYYYMMDD-NNNNNN`) into
+  `build/builder.sh`, re-commit your changes, and update the pull request. You
+  can now merge the pull request once you've got a sign-off.
+- Finally, use the tag of the new image to update the `builder.dockerImage`
+  configuration parameter in TeamCity under the [`Cockroach`](https://teamcity.cockroachdb.com/admin/editProject.html?projectId=Cockroach&tab=projectParams) and [`Internal`](https://teamcity.cockroachdb.com/admin/editProject.html?projectId=Internal&tab=projectParams) projects.
 
 ## Updating the golang version
 
@@ -77,6 +89,8 @@ back to this document and perform these steps:
 * [ ] Bump the default installed version of Go in `bootstrap-debian.sh` ([source](./bootstrap/bootstrap-debian.sh#L40-42)).
 * [ ] Replace other mentions of the older version of go (grep for `golang:<old_version>` and `go<old_version>`).
 * [ ] Update the `builder.dockerImage` parameter in the TeamCity [`Cockroach`](https://teamcity.cockroachdb.com/admin/editProject.html?projectId=Cockroach&tab=projectParams) and [`Internal`](https://teamcity.cockroachdb.com/admin/editProject.html?projectId=Internal&tab=projectParams) projects.
+* [ ] Adjust `GO_VERSION` in the TeamCity agent image ([setup script](./packer/teamcity-agent.sh))
+  and ask the Developer Infrastructure team to deploy new images.
 
 You can test the new builder image in TeamCity by using the custom parameters
 UI (the "..." icon next to the "Run" button) to verify the image before
@@ -85,6 +99,20 @@ committing the change.
 ## Updating the nodejs version
 
 Please follow the instructions above on updating the golang version, omitting the go-version-check.sh step.
+
+## Updating the `bazelbuilder` image
+
+The `bazelbuilder` image is used exclusively for performing builds using Bazel. Only add dependencies to the image that are necessary for performing Bazel builds. The process for updating the image is as follows:
+
+- Edit `build/bazelbuilder/Dockerfile` as desired.
+- Perform the normal sequence of steps for pushing a new Docker image (for `$TAG`, you can use the value of `date +%Y%m%d-%H%M%S`):
+```
+    docker build build/bazelbuilder
+    docker image tag $IMAGE_HASH cockroachdb/bazel:$TAG
+    docker image push cockroachdb/bazel:$TAG
+```
+- Then, update `build/teamcity-bazel-support.sh` with the new tag and commit all your changes.
+- Ensure the "Github CI (Optional)" job passes on your PR before merging.
 
 #  Dependencies
 
@@ -95,14 +123,20 @@ Dependencies are managed using `go mod`. We use `go mod vendor` so that we can i
 ### Installing or updating a dependency
 
 Run `go get -u <dependency>`. To get a specific version, run `go get -u <dependency>@<version|branch|sha>`.
+You should see changes in `go.mod` when running `git diff`.
 
 When updating a dependency, you should run `go mod tidy` after `go get` to ensure the old entries
 are removed from go.sum.
 
-You must then run `make vendor_rebuild` to ensure the modules are installed. These changes must
-then be committed in the submodule directory (see [Working with Submodules](#working-with-submodules)).
+You must then run `make vendor_rebuild` to ensure the modules are installed.
+Ensure the vendor changes are as expected by running `cd vendor && git status`. If your import
+is missing, ensure it is used in code. This can be a blank dependency, e.g.
+`import _ "golang.org/api/compute/v1"`. These changes must then be committed in the submodule directory
+(see [Working with Submodules](#working-with-submodules)).
 
-Programs can then be run using `go build -mod=vendor ...` or `go test -mod=vendor ...`.
+Finally, run `make bazel-generate` to regenerate `DEPS.bzl` with the updated Go dependency information.
+
+Programs can then be run using `go build ...` or `go test ...`.
 
 ### Removing a dependency
 

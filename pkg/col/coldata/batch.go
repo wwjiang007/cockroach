@@ -65,7 +65,8 @@ type Batch interface {
 	// ResetInternalBatch resets a batch and its underlying Vecs for reuse. It's
 	// important for callers to call ResetInternalBatch if they own internal
 	// batches that they reuse as not doing this could result in correctness
-	// or memory blowup issues.
+	// or memory blowup issues. It unsets the selection and sets the length to
+	// 0.
 	ResetInternalBatch()
 	// String returns a pretty representation of this batch.
 	String() string
@@ -79,6 +80,7 @@ var _ Batch = &MemBatch{}
 // (the best number according to that benchmark was 1280, but it was negligibly
 // better, so we decided to keep 1024 as it is a power of 2).
 var defaultBatchSize = int64(util.ConstantWithMetamorphicTestRange(
+	"coldata-batch-size",
 	1024, /* defaultValue */
 	// min is set to 3 to match colexec's minBatchSize setting.
 	3, /* min */
@@ -245,8 +247,17 @@ func (m *MemBatch) SetSelection(b bool) {
 func (m *MemBatch) SetLength(length int) {
 	m.length = length
 	if length > 0 {
+		// In order to maintain the invariant of Bytes vectors we need to update
+		// offsets up to the element with the largest index that can be accessed
+		// by the batch.
+		maxIdx := length - 1
+		if m.useSel {
+			// Note that here we rely on the fact that selection vectors are
+			// increasing sequences.
+			maxIdx = m.sel[length-1]
+		}
 		for i, ok := m.bytesVecIdxs.Next(0); ok; i, ok = m.bytesVecIdxs.Next(i + 1) {
-			m.b[i].Bytes().UpdateOffsetsToBeNonDecreasing(length)
+			m.b[i].Bytes().UpdateOffsetsToBeNonDecreasing(maxIdx + 1)
 		}
 	}
 }
@@ -292,11 +303,7 @@ func (m *MemBatch) Reset(typs []*types.T, length int, factory ColumnFactory) {
 	// Note that we're intentionally not calling m.SetLength() here because
 	// that would update offsets in the bytes vectors which is not necessary
 	// since those will get reset in ResetInternalBatch anyway.
-	m.length = length
 	m.b = m.b[:len(typs)]
-	for i := range m.b {
-		m.b[i].SetLength(length)
-	}
 	m.sel = m.sel[:length]
 	for i, ok := m.bytesVecIdxs.Next(0); ok; i, ok = m.bytesVecIdxs.Next(i + 1) {
 		if i >= len(typs) {
@@ -304,10 +311,12 @@ func (m *MemBatch) Reset(typs []*types.T, length int, factory ColumnFactory) {
 		}
 	}
 	m.ResetInternalBatch()
+	m.SetLength(length)
 }
 
 // ResetInternalBatch implements the Batch interface.
 func (m *MemBatch) ResetInternalBatch() {
+	m.SetLength(0 /* length */)
 	m.SetSelection(false)
 	for _, v := range m.b {
 		if v.CanonicalTypeFamily() != types.UnknownFamily {

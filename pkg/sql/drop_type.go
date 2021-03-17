@@ -29,8 +29,8 @@ import (
 )
 
 type dropTypeNode struct {
-	n  *tree.DropType
-	td map[descpb.ID]*typedesc.Mutable
+	n      *tree.DropType
+	toDrop map[descpb.ID]*typedesc.Mutable
 }
 
 // Use to satisfy the linter.
@@ -46,8 +46,8 @@ func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, err
 	}
 
 	node := &dropTypeNode{
-		n:  n,
-		td: make(map[descpb.ID]*typedesc.Mutable),
+		n:      n,
+		toDrop: make(map[descpb.ID]*typedesc.Mutable),
 	}
 	if n.DropBehavior == tree.DropCascade {
 		return nil, unimplemented.NewWithIssue(51480, "DROP TYPE CASCADE is not yet supported")
@@ -62,7 +62,7 @@ func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, err
 			continue
 		}
 		// If we've already seen this type, then skip it.
-		if _, ok := node.td[typeDesc.ID]; ok {
+		if _, ok := node.toDrop[typeDesc.ID]; ok {
 			continue
 		}
 		switch typeDesc.Kind {
@@ -100,10 +100,9 @@ func (p *planner) DropType(ctx context.Context, n *tree.DropType) (planNode, err
 		if err := p.canDropTypeDesc(ctx, mutArrayDesc, n.DropBehavior); err != nil {
 			return nil, err
 		}
-
 		// Record these descriptors for deletion.
-		node.td[typeDesc.ID] = typeDesc
-		node.td[mutArrayDesc.ID] = mutArrayDesc
+		node.toDrop[typeDesc.ID] = typeDesc
+		node.toDrop[mutArrayDesc.ID] = mutArrayDesc
 	}
 	return node, nil
 }
@@ -115,17 +114,9 @@ func (p *planner) canDropTypeDesc(
 		return err
 	}
 	if len(desc.ReferencingDescriptorIDs) > 0 && behavior != tree.DropCascade {
-		var dependentNames []string
-		for _, id := range desc.ReferencingDescriptorIDs {
-			desc, err := p.Descriptors().GetMutableTableVersionByID(ctx, id, p.txn)
-			if err != nil {
-				return errors.Wrapf(err, "type has dependent objects")
-			}
-			fqName, err := p.getQualifiedTableName(ctx, desc)
-			if err != nil {
-				return errors.Wrapf(err, "type %q has dependent objects", desc.Name)
-			}
-			dependentNames = append(dependentNames, fqName.FQString())
+		dependentNames, err := p.getFullyQualifiedTableNamesFromIDs(ctx, desc.ReferencingDescriptorIDs)
+		if err != nil {
+			return errors.Wrapf(err, "type %q has dependent objects", desc.Name)
 		}
 		return pgerror.Newf(
 			pgcode.DependentObjectsStillExist,
@@ -138,14 +129,23 @@ func (p *planner) canDropTypeDesc(
 }
 
 func (n *dropTypeNode) startExec(params runParams) error {
-	for _, typ := range n.td {
-		if err := params.p.dropTypeImpl(params.ctx, typ, tree.AsStringWithFQNames(n.n, params.Ann()), true /* queueJob */); err != nil {
+	for _, typeDesc := range n.toDrop {
+		typeFQName, err := getTypeNameFromTypeDescriptor(
+			oneAtATimeSchemaResolver{params.ctx, params.p},
+			typeDesc,
+		)
+		if err != nil {
 			return err
 		}
+		err = params.p.dropTypeImpl(params.ctx, typeDesc, "dropping type "+typeFQName.FQString(), true /* queueJob */)
+		if err != nil {
+			return err
+		}
+		event := &eventpb.DropType{
+			TypeName: typeFQName.FQString(),
+		}
 		// Log a Drop Type event.
-		// TODO(knz): This logging is imperfect, see this issue:
-		// https://github.com/cockroachdb/cockroach/issues/57734
-		if err := params.p.logEvent(params.ctx, typ.ID, &eventpb.DropType{TypeName: typ.Name}); err != nil {
+		if err := params.p.logEvent(params.ctx, typeDesc.ID, event); err != nil {
 			return err
 		}
 	}
@@ -185,7 +185,12 @@ func (p *planner) removeTypeBackReference(
 func (p *planner) addBackRefsFromAllTypesInTable(
 	ctx context.Context, desc *tabledesc.Mutable,
 ) error {
-	typeIDs, err := desc.GetAllReferencedTypeIDs(func(id descpb.ID) (catalog.TypeDescriptor, error) {
+	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
+		ctx, p.txn, desc.GetParentID(), tree.DatabaseLookupFlags{Required: true})
+	if err != nil {
+		return err
+	}
+	typeIDs, err := desc.GetAllReferencedTypeIDs(dbDesc, func(id descpb.ID) (catalog.TypeDescriptor, error) {
 		mutDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, id)
 		if err != nil {
 			return nil, err
@@ -207,7 +212,12 @@ func (p *planner) addBackRefsFromAllTypesInTable(
 func (p *planner) removeBackRefsFromAllTypesInTable(
 	ctx context.Context, desc *tabledesc.Mutable,
 ) error {
-	typeIDs, err := desc.GetAllReferencedTypeIDs(func(id descpb.ID) (catalog.TypeDescriptor, error) {
+	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
+		ctx, p.txn, desc.GetParentID(), tree.DatabaseLookupFlags{Required: true})
+	if err != nil {
+		return err
+	}
+	typeIDs, err := desc.GetAllReferencedTypeIDs(dbDesc, func(id descpb.ID) (catalog.TypeDescriptor, error) {
 		mutDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, id)
 		if err != nil {
 			return nil, err

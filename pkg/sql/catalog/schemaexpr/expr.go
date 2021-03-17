@@ -45,10 +45,16 @@ func DequalifyAndValidateExpr(
 	tn *tree.TableName,
 ) (string, catalog.TableColSet, error) {
 	var colIDs catalog.TableColSet
+	nonDropColumns := desc.NonDropColumns()
+	nonDropColumnDescs := make([]descpb.ColumnDescriptor, len(nonDropColumns))
+	for i, col := range nonDropColumns {
+		nonDropColumnDescs[i] = *col.ColumnDesc()
+	}
+
 	sourceInfo := colinfo.NewSourceInfoForSingleTable(
 		*tn, colinfo.ResultColumnsFromColDescs(
 			desc.GetID(),
-			desc.AllNonDropColumns(),
+			nonDropColumnDescs,
 		),
 	)
 	expr, err := dequalifyColumnRefs(ctx, sourceInfo, expr)
@@ -101,12 +107,12 @@ func ExtractColumnIDs(
 			return true, expr, nil
 		}
 
-		col, _, err := desc.FindColumnByName(c.ColumnName)
+		col, err := desc.FindColumnWithName(c.ColumnName)
 		if err != nil {
 			return false, nil, err
 		}
 
-		colIDs.Add(col.ID)
+		colIDs.Add(col.GetID())
 		return false, expr, nil
 	})
 
@@ -138,7 +144,7 @@ func HasValidColumnReferences(desc catalog.TableDescriptor, rootExpr tree.Expr) 
 			return true, expr, nil
 		}
 
-		_, _, err = desc.FindColumnByName(c.ColumnName)
+		_, err = desc.FindColumnWithName(c.ColumnName)
 		if err != nil {
 			return false, expr, returnFalsePseudoError
 		}
@@ -183,9 +189,15 @@ func deserializeExprForFormatting(
 		return nil, err
 	}
 
+	// Replace any IDs in the expr with their fully qualified names.
+	seqReplacedExpr, err := replaceIDsWithFQNames(ctx, expr, semaCtx)
+	if err != nil {
+		return nil, err
+	}
+
 	// Replace the column variables with dummyColumns so that they can be
 	// type-checked.
-	replacedExpr, _, err := replaceColumnVars(desc, expr)
+	replacedExpr, _, err := replaceColumnVars(desc, seqReplacedExpr)
 	if err != nil {
 		return nil, err
 	}

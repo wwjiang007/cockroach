@@ -41,6 +41,8 @@ func IndexForDisplay(
 	table catalog.TableDescriptor,
 	tableName *tree.TableName,
 	index *descpb.IndexDescriptor,
+	partition string,
+	interleave string,
 	semaCtx *tree.SemaContext,
 ) (string, error) {
 	f := tree.NewFmtCtx(tree.FmtSimple)
@@ -75,6 +77,9 @@ func IndexForDisplay(
 		}
 		f.WriteByte(')')
 	}
+
+	f.WriteString(interleave)
+	f.WriteString(partition)
 
 	if index.GeoConfig.S2Geometry != nil || index.GeoConfig.S2Geography != nil {
 		var s2Config *geoindex.S2Config
@@ -113,13 +118,13 @@ func IndexForDisplay(
 		}
 
 		if index.GeoConfig.S2Geometry != nil {
-			col, err := table.FindColumnByID(index.InvertedColumnID())
+			col, err := table.FindColumnWithID(index.InvertedColumnID())
 			if err != nil {
 				return "", errors.Wrapf(err, "expected column %q to exist in table", index.InvertedColumnName())
 			}
-			defaultConfig, err := geoindex.GeometryIndexConfigForSRID(col.Type.GeoSRIDOrZero())
+			defaultConfig, err := geoindex.GeometryIndexConfigForSRID(col.GetType().GeoSRIDOrZero())
 			if err != nil {
-				return "", errors.Wrapf(err, "expected SRID definition for %d", col.Type.GeoSRIDOrZero())
+				return "", errors.Wrapf(err, "expected SRID definition for %d", col.GetType().GeoSRIDOrZero())
 			}
 			cfg := index.GeoConfig.S2Geometry
 

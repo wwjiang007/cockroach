@@ -126,13 +126,12 @@ func createRangeData(
 }
 
 func verifyRDReplicatedOnlyMVCCIter(
-	t *testing.T,
-	desc *roachpb.RangeDescriptor,
-	readWriter storage.ReadWriter,
-	expectedKeys []storage.MVCCKey,
+	t *testing.T, desc *roachpb.RangeDescriptor, eng storage.Engine, expectedKeys []storage.MVCCKey,
 ) {
 	t.Helper()
 	verify := func(t *testing.T, useSpanSet, reverse bool) {
+		readWriter := eng.NewReadOnly()
+		defer readWriter.Close()
 		if useSpanSet {
 			var spans spanset.SpanSet
 			spans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{
@@ -170,7 +169,7 @@ func verifyRDReplicatedOnlyMVCCIter(
 			if key := iter.Key(); !key.Equal(expectedKeys[i]) {
 				k1, ts1 := key.Key, key.Timestamp
 				k2, ts2 := expectedKeys[i].Key, expectedKeys[i].Timestamp
-				t.Errorf("%d: expected %q(%d); got %q(%d)", i, k2, ts2, k1, ts1)
+				t.Errorf("%d: expected %q(%s); got %q(%s)", i, k2, ts2, k1, ts1)
 			}
 			if reverse {
 				i--
@@ -192,11 +191,10 @@ func verifyRDReplicatedOnlyMVCCIter(
 }
 
 func verifyRDEngineIter(
-	t *testing.T,
-	desc *roachpb.RangeDescriptor,
-	readWriter storage.ReadWriter,
-	expectedKeys []storage.MVCCKey,
+	t *testing.T, desc *roachpb.RangeDescriptor, eng storage.Engine, expectedKeys []storage.MVCCKey,
 ) {
+	readWriter := eng.NewReadOnly()
+	defer readWriter.Close()
 	iter := NewReplicaEngineDataIterator(desc, readWriter, false)
 	defer iter.Close()
 	i := 0
@@ -220,7 +218,7 @@ func verifyRDEngineIter(
 		if !k.Equal(expectedKeys[i]) {
 			k1, ts1 := k.Key, k.Timestamp
 			k2, ts2 := expectedKeys[i].Key, expectedKeys[i].Timestamp
-			t.Errorf("%d: expected %q(%d); got %q(%d)", i, k2, ts2, k1, ts1)
+			t.Errorf("%d: expected %q(%s); got %q(%s)", i, k2, ts2, k1, ts1)
 		}
 		i++
 		iter.Next()
@@ -235,7 +233,7 @@ func verifyRDEngineIter(
 func TestReplicaDataIteratorEmptyRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	eng := storage.NewDefaultInMem()
+	eng := storage.NewDefaultInMemForTesting()
 	defer eng.Close()
 
 	desc := &roachpb.RangeDescriptor{
@@ -257,7 +255,7 @@ func TestReplicaDataIteratorEmptyRange(t *testing.T) {
 func TestReplicaDataIterator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	eng := storage.NewDefaultInMem()
+	eng := storage.NewDefaultInMemForTesting()
 	defer eng.Close()
 
 	descPre := roachpb.RangeDescriptor{

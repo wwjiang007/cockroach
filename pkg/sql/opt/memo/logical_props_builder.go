@@ -49,8 +49,12 @@ type logicalPropsBuilder struct {
 }
 
 func (b *logicalPropsBuilder) init(evalCtx *tree.EvalContext, mem *Memo) {
-	b.evalCtx = evalCtx
-	b.mem = mem
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*b = logicalPropsBuilder{
+		evalCtx: evalCtx,
+		mem:     mem,
+	}
 	b.sb.init(evalCtx, mem.Metadata())
 }
 
@@ -666,6 +670,12 @@ func (b *logicalPropsBuilder) buildExceptAllProps(except *ExceptAllExpr, rel *pr
 	b.buildSetProps(except, rel)
 }
 
+func (b *logicalPropsBuilder) buildLocalityOptimizedSearchProps(
+	locOptSearch *LocalityOptimizedSearchExpr, rel *props.Relational,
+) {
+	b.buildSetProps(locOptSearch, rel)
+}
+
 func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relational) {
 	BuildSharedProps(setNode, &rel.Shared)
 
@@ -708,6 +718,34 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 	case opt.UnionOp, opt.IntersectOp, opt.ExceptOp:
 		// These operators eliminate duplicates, so a strict key exists.
 		rel.FuncDeps.AddStrictKey(rel.OutputCols, rel.OutputCols)
+	}
+	switch setNode.Op() {
+	case opt.UnionOp, opt.UnionAllOp, opt.LocalityOptimizedSearchOp:
+		// If columns at ordinals (i, j) are equivalent in both the left input
+		// and right input, then the output columns at ordinals at (i, j) are
+		// also equivalent.
+		for i := range setPrivate.OutCols {
+			for j := i + 1; j < len(setPrivate.OutCols); j++ {
+				if leftProps.FuncDeps.AreColsEquiv(setPrivate.LeftCols[i], setPrivate.LeftCols[j]) &&
+					rightProps.FuncDeps.AreColsEquiv(setPrivate.RightCols[i], setPrivate.RightCols[j]) {
+					rel.FuncDeps.AddEquivalency(setPrivate.OutCols[i], setPrivate.OutCols[j])
+				}
+			}
+		}
+	case opt.IntersectOp, opt.IntersectAllOp, opt.ExceptOp, opt.ExceptAllOp:
+		// Intersect, IntersectAll, Except and ExceptAll only output rows from
+		// the left input, so if columns at ordinals (i, j) are equivalent in
+		// the left input, then they are equivalent in the output.
+		// TODO(mgartner): The entire FD set on the left side can be used, but
+		// columns may need to be mapped. Intersections can combine FD
+		// information from both the left and the right.
+		for i := range setPrivate.OutCols {
+			for j := i + 1; j < len(setPrivate.OutCols); j++ {
+				if leftProps.FuncDeps.AreColsEquiv(setPrivate.LeftCols[i], setPrivate.LeftCols[j]) {
+					rel.FuncDeps.AddEquivalency(setPrivate.OutCols[i], setPrivate.OutCols[j])
+				}
+			}
+		}
 	}
 
 	// Cardinality
@@ -1650,6 +1688,8 @@ func MakeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 	}
 
 	fd = &props.FuncDepSet{}
+
+	// Add keys from indexes.
 	for i := 0; i < tab.IndexCount(); i++ {
 		var keyCols opt.ColSet
 		index := tab.Index(i)
@@ -1685,6 +1725,83 @@ func MakeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 			fd.AddStrictKey(keyCols, allCols)
 		}
 	}
+
+	// Add keys from unique constraints.
+	if !md.TableMeta(tabID).IgnoreUniqueWithoutIndexKeys {
+		for i := 0; i < tab.UniqueCount(); i++ {
+			unique := tab.Unique(i)
+
+			if !unique.Validated() {
+				// This unique constraint has not been validated, so we cannot use it
+				// as a key.
+				continue
+			}
+
+			if _, isPartial := unique.Predicate(); isPartial {
+				// Partial constraints cannot be considered while building functional
+				// dependency keys for the table because their keys are only unique
+				// for a subset of the rows in the table.
+				continue
+			}
+
+			// If any of the columns are nullable, add a lax key FD. Otherwise, add a
+			// strict key.
+			var keyCols opt.ColSet
+			hasNulls := false
+			for i := 0; i < unique.ColumnCount(); i++ {
+				ord := unique.ColumnOrdinal(tab, i)
+				keyCols.Add(tabID.ColumnID(ord))
+				if tab.Column(ord).IsNullable() {
+					hasNulls = true
+				}
+			}
+
+			if excludeColumn != 0 && keyCols.Contains(excludeColumn) {
+				// See comment above where excludeColumn is set.
+				// (Virtual tables currently do not have UNIQUE WITHOUT INDEX constraints
+				// or implicitly partitioned UNIQUE indexes, but we add this check in case
+				// of future changes.)
+				continue
+			}
+
+			if hasNulls {
+				fd.AddLaxKey(keyCols, allCols)
+			} else {
+				fd.AddStrictKey(keyCols, allCols)
+			}
+		}
+	}
+
+	// Add computed columns.
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		if tab.Column(i).IsComputed() {
+			tabMeta := md.TableMeta(tabID)
+			colID := tabMeta.MetaID.ColumnID(i)
+			expr := tabMeta.ComputedCols[colID]
+			if expr == nil {
+				// The computed columns haven't been added to the metadata.
+				continue
+			}
+			if v, ok := expr.(*VariableExpr); ok {
+				// This computed column is exactly equal to another column in the table,
+				// so add an equivalency.
+				fd.AddEquivalency(v.Col, colID)
+				continue
+			}
+			// Else, this computed column is an immutable expression over zero or more
+			// other columns in the table.
+
+			from := getOuterCols(expr)
+			// We want to set up the FD: from --> colID.
+			// This does not necessarily hold for "composite" types like decimals or
+			// collated strings. For example if d is a decimal, d::TEXT can have
+			// different values for equal values of d, like 1 and 1.0.
+			if !CanBeCompositeSensitive(md, expr) {
+				fd.AddSynthesizedCol(from, colID)
+			}
+		}
+	}
+
 	md.SetTableAnnotation(tabID, fdAnnID, fd)
 	return fd
 }
@@ -1719,17 +1836,24 @@ func (b *logicalPropsBuilder) makeSetCardinality(
 	return card
 }
 
-// rejectNullCols returns the set of all columns that are inferred to be not-
-// null, based on the filter conditions.
-func (b *logicalPropsBuilder) rejectNullCols(filters FiltersExpr) opt.ColSet {
+// NullColsRejectedByFilter returns a set of columns that are "null rejected"
+// by the filters. An input row with a NULL value on any of these columns will
+// not pass the filter.
+func NullColsRejectedByFilter(evalCtx *tree.EvalContext, filters FiltersExpr) opt.ColSet {
 	var notNullCols opt.ColSet
 	for i := range filters {
 		filterProps := filters[i].ScalarProps()
 		if filterProps.Constraints != nil {
-			notNullCols.UnionWith(filterProps.Constraints.ExtractNotNullCols(b.evalCtx))
+			notNullCols.UnionWith(filterProps.Constraints.ExtractNotNullCols(evalCtx))
 		}
 	}
 	return notNullCols
+}
+
+// rejectNullCols returns the set of all columns that are inferred to be not-
+// null, based on the filter conditions.
+func (b *logicalPropsBuilder) rejectNullCols(filters FiltersExpr) opt.ColSet {
+	return NullColsRejectedByFilter(b.evalCtx, filters)
 }
 
 // addFiltersToFuncDep returns the union of all functional dependencies from
@@ -1825,6 +1949,15 @@ func ensureLookupJoinInputProps(join *LookupJoinExpr, sb *statisticsBuilder) *pr
 		for i := range join.KeyCols {
 			indexColID := join.Table.ColumnID(index.Column(i).Ordinal())
 			relational.OutputCols.Add(indexColID)
+		}
+
+		// Include columns from the join condition in the output columns.
+		lookupExprCols := join.LookupExpr.OuterCols()
+		for i, n := 0, index.KeyColumnCount(); i < n; i++ {
+			indexColID := join.Table.ColumnID(index.Column(i).Ordinal())
+			if lookupExprCols.Contains(indexColID) {
+				relational.OutputCols.Add(indexColID)
+			}
 		}
 
 		relational.NotNullCols = tableNotNullCols(md, join.Table)
@@ -1948,7 +2081,9 @@ type joinPropsHelper struct {
 }
 
 func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
-	h.join = joinExpr
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*h = joinPropsHelper{join: joinExpr}
 
 	switch join := joinExpr.(type) {
 	case *LookupJoinExpr:
@@ -1956,7 +2091,7 @@ func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 		ensureLookupJoinInputProps(join, &b.sb)
 		h.joinType = join.JoinType
 		h.rightProps = &join.lookupProps
-		h.filters = join.On
+		h.filters = append(join.On, join.LookupExpr...)
 		b.addFiltersToFuncDep(h.filters, &h.filtersFD)
 		h.filterNotNullCols = b.rejectNullCols(h.filters)
 
@@ -1986,6 +2121,20 @@ func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 		h.filters = join.On
 		b.addFiltersToFuncDep(h.filters, &h.filtersFD)
 		h.filterNotNullCols = b.rejectNullCols(h.filters)
+
+		// Apply the prefix column equalities.
+		md := join.Memo().Metadata()
+		index := md.Table(join.Table).Index(join.Index)
+		for i, colID := range join.PrefixKeyCols {
+			indexColID := join.Table.ColumnID(index.Column(i).Ordinal())
+			h.filterNotNullCols.Add(colID)
+			h.filterNotNullCols.Add(indexColID)
+			h.filtersFD.AddEquivalency(colID, indexColID)
+			if colID == indexColID {
+				// This can happen if an index join was converted into a lookup join.
+				h.selfJoinCols.Add(colID)
+			}
+		}
 
 		// Inverted join always has a filter condition on the index keys.
 		h.filterIsTrue = false
@@ -2050,6 +2199,7 @@ func (h *joinPropsHelper) outputCols() opt.ColSet {
 	//
 	//   1. semi and anti joins, which only project the left columns
 	//   2. lookup joins, which can project a subset of input columns
+	//   3. inverted joins, which can project a subset of input columns
 	//
 	var cols opt.ColSet
 	switch h.joinType {
@@ -2063,6 +2213,10 @@ func (h *joinPropsHelper) outputCols() opt.ColSet {
 	if lookup, ok := h.join.(*LookupJoinExpr); ok {
 		// Remove any columns that are not projected by the lookup join.
 		cols.IntersectionWith(lookup.Cols)
+	}
+	if inv, ok := h.join.(*InvertedJoinExpr); ok {
+		// Remove any columns that are not projected by the inverted join.
+		cols.IntersectionWith(inv.Cols)
 	}
 
 	return cols

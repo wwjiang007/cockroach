@@ -12,10 +12,12 @@ package colexec
 
 import (
 	"context"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -28,10 +30,10 @@ import (
 // in the input operator.
 func NewSorter(
 	allocator *colmem.Allocator,
-	input colexecbase.Operator,
+	input colexecop.Operator,
 	inputTypes []*types.T,
 	orderingCols []execinfrapb.Ordering_Column,
-) (colexecbase.Operator, error) {
+) (colexecop.Operator, error) {
 	return newSorter(allocator, newAllSpooler(allocator, input, inputTypes), inputTypes, orderingCols)
 }
 
@@ -40,7 +42,7 @@ func newSorter(
 	input spooler,
 	inputTypes []*types.T,
 	orderingCols []execinfrapb.Ordering_Column,
-) (ResettableOperator, error) {
+) (colexecop.ResettableOperator, error) {
 	partitioners := make([]partitioner, len(orderingCols)-1)
 
 	var err error
@@ -97,36 +99,36 @@ type spooler interface {
 // allSpooler is the spooler that spools all tuples from the input. It is used
 // by the general sorter over the whole input.
 type allSpooler struct {
-	OneInputNode
-	NonExplainable
+	colexecop.OneInputNode
+	colexecop.NonExplainable
 
 	allocator *colmem.Allocator
 	// inputTypes contains the types of all of the columns from the input.
 	inputTypes []*types.T
 	// bufferedTuples stores all the values from the input after spooling. Each
 	// Vec in this batch is the entire column from the input.
-	bufferedTuples *appendOnlyBufferedBatch
+	bufferedTuples *colexecutils.AppendOnlyBufferedBatch
 	// spooled indicates whether spool() has already been called.
 	spooled       bool
 	windowedBatch coldata.Batch
 }
 
 var _ spooler = &allSpooler{}
-var _ resetter = &allSpooler{}
+var _ colexecop.Resetter = &allSpooler{}
 
 func newAllSpooler(
-	allocator *colmem.Allocator, input colexecbase.Operator, inputTypes []*types.T,
+	allocator *colmem.Allocator, input colexecop.Operator, inputTypes []*types.T,
 ) spooler {
 	return &allSpooler{
-		OneInputNode: NewOneInputNode(input),
+		OneInputNode: colexecop.NewOneInputNode(input),
 		allocator:    allocator,
 		inputTypes:   inputTypes,
 	}
 }
 
 func (p *allSpooler) init() {
-	p.input.Init()
-	p.bufferedTuples = newAppendOnlyBufferedBatch(p.allocator, p.inputTypes, nil /* colsToStore */)
+	p.Input.Init()
+	p.bufferedTuples = colexecutils.NewAppendOnlyBufferedBatch(p.allocator, p.inputTypes, nil /* colsToStore */)
 	p.windowedBatch = p.allocator.NewMemBatchWithFixedCapacity(p.inputTypes, 0 /* size */)
 }
 
@@ -135,9 +137,9 @@ func (p *allSpooler) spool(ctx context.Context) {
 		colexecerror.InternalError(errors.AssertionFailedf("spool() is called for the second time"))
 	}
 	p.spooled = true
-	for batch := p.input.Next(ctx); batch.Length() != 0; batch = p.input.Next(ctx) {
+	for batch := p.Input.Next(ctx); batch.Length() != 0; batch = p.Input.Next(ctx) {
 		p.allocator.PerformOperation(p.bufferedTuples.ColVecs(), func() {
-			p.bufferedTuples.append(batch, 0 /* startIdx */, batch.Length())
+			p.bufferedTuples.AppendTuples(batch, 0 /* startIdx */, batch.Length())
 		})
 	}
 }
@@ -173,12 +175,11 @@ func (p *allSpooler) getWindowedBatch(startIdx, endIdx int) coldata.Batch {
 	return p.windowedBatch
 }
 
-func (p *allSpooler) reset(ctx context.Context) {
-	if r, ok := p.input.(resetter); ok {
-		r.reset(ctx)
+func (p *allSpooler) Reset(ctx context.Context) {
+	if r, ok := p.Input.(colexecop.Resetter); ok {
+		r.Reset(ctx)
 	}
 	p.spooled = false
-	p.bufferedTuples.SetLength(0)
 	p.bufferedTuples.ResetInternalBatch()
 }
 
@@ -215,8 +216,8 @@ type sortOp struct {
 	exported int
 }
 
-var _ colexecbase.BufferingInMemoryOperator = &sortOp{}
-var _ resetter = &sortOp{}
+var _ colexecop.BufferingInMemoryOperator = &sortOp{}
+var _ colexecop.Resetter = &sortOp{}
 
 // colSorter is a single-column sorter, specialized on a particular type.
 type colSorter interface {
@@ -271,7 +272,10 @@ func (p *sortOp) Next(ctx context.Context) coldata.Batch {
 			if toEmit > coldata.BatchSize() {
 				toEmit = coldata.BatchSize()
 			}
-			p.output, _ = p.allocator.ResetMaybeReallocate(p.inputTypes, p.output, toEmit)
+			// For now, we don't enforce any footprint-based memory limit.
+			// TODO(yuzefovich): refactor this.
+			const maxBatchMemSize = math.MaxInt64
+			p.output, _ = p.allocator.ResetMaybeReallocate(p.inputTypes, p.output, toEmit, maxBatchMemSize)
 			newEmitted := p.emitted + toEmit
 			for j := 0; j < len(p.inputTypes); j++ {
 				// At this point, we have already fully sorted the input. It is ok to do
@@ -400,9 +404,9 @@ func (p *sortOp) sort(ctx context.Context) {
 	}
 }
 
-func (p *sortOp) reset(ctx context.Context) {
-	if r, ok := p.input.(resetter); ok {
-		r.reset(ctx)
+func (p *sortOp) Reset(ctx context.Context) {
+	if r, ok := p.input.(colexecop.Resetter); ok {
+		r.Reset(ctx)
 	}
 	p.emitted = 0
 	p.exported = 0
@@ -422,7 +426,7 @@ func (p *sortOp) Child(nth int, verbose bool) execinfra.OpNode {
 	return nil
 }
 
-func (p *sortOp) ExportBuffered(colexecbase.Operator) coldata.Batch {
+func (p *sortOp) ExportBuffered(context.Context, colexecop.Operator) coldata.Batch {
 	if p.exported == p.input.getNumTuples() {
 		return coldata.ZeroBatch
 	}

@@ -11,8 +11,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -31,7 +34,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
@@ -45,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -53,11 +59,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -123,6 +133,12 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	st := params.Settings
 	if params.Settings == nil {
 		st = cluster.MakeClusterSettings()
+		// TODO(sumeer): re-introduce this randomization.
+		// enabledSeparated := rand.Intn(2) == 0
+		// log.Infof(context.Background(),
+		//	"test Config is randomly setting enabledSeparated: %t",
+		//	enabledSeparated)
+		// storage.SeparatedIntentsEnabled.Override(&st.SV, enabledSeparated)
 	}
 	st.ExternalIODir = params.ExternalIODir
 	cfg := makeTestConfig(st)
@@ -213,6 +229,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.DisableWebSessionAuthentication {
 		cfg.EnableWebSessionAuthentication = false
 	}
+	if params.EnableDemoLoginEndpoint {
+		cfg.EnableDemoLoginEndpoint = true
+	}
 
 	// Ensure we have the correct number of engines. Add in-memory ones where
 	// needed. There must be at least one store/engine.
@@ -255,9 +274,10 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.Knobs.SQLExecutor == nil {
 		cfg.TestingKnobs.SQLExecutor = &sql.ExecutorTestingKnobs{}
 	}
-	if !params.DisableTestingDescriptorValidation {
-		cfg.TestingKnobs.SQLExecutor.(*sql.ExecutorTestingKnobs).TestingDescriptorValidation = true
-	}
+
+	// For test servers, leave interleaved tables enabled by default. We'll remove
+	// this when we remove interleaved tables altogether.
+	sql.InterleavedTablesEnabled.Override(&cfg.Settings.SV, true)
 
 	return cfg
 }
@@ -359,6 +379,27 @@ func (ts *TestServer) NodeLiveness() interface{} {
 	return nil
 }
 
+// HeartbeatNodeLiveness heartbeats the server's NodeLiveness record.
+func (ts *TestServer) HeartbeatNodeLiveness() error {
+	if ts == nil {
+		return errors.New("no node liveness instance")
+	}
+	nl := ts.nodeLiveness
+	l, ok := nl.Self()
+	if !ok {
+		return errors.New("liveness not found")
+	}
+
+	var err error
+	ctx := context.Background()
+	for r := retry.StartWithCtx(ctx, retry.Options{MaxRetries: 5}); r.Next(); {
+		if err = nl.Heartbeat(ctx, l); !errors.Is(err, liveness.ErrEpochIncremented) {
+			break
+		}
+	}
+	return err
+}
+
 // RPCContext returns the rpc context used by the TestServer.
 func (ts *TestServer) RPCContext() *rpc.Context {
 	if ts != nil {
@@ -395,6 +436,14 @@ func (ts *TestServer) PGServer() *pgwire.Server {
 func (ts *TestServer) RaftTransport() *kvserver.RaftTransport {
 	if ts != nil {
 		return ts.raftTransport
+	}
+	return nil
+}
+
+// NodeDialer returns the NodeDialer used by the TestServer.
+func (ts *TestServer) NodeDialer() *nodedialer.Dialer {
+	if ts != nil {
+		return ts.nodeDialer
 	}
 	return nil
 }
@@ -501,6 +550,11 @@ func makeSQLServerArgs(
 		ds,
 	)
 	db := kv.NewDB(baseCfg.AmbientCtx, tcsFactory, clock, stopper)
+	rangeFeedKnobs, _ := baseCfg.TestingKnobs.RangeFeed.(*rangefeed.TestingKnobs)
+	rangeFeedFactory, err := rangefeed.NewFactory(stopper, db, rangeFeedKnobs)
+	if err != nil {
+		return sqlServerArgs{}, err
+	}
 
 	circularInternalExecutor := &sql.InternalExecutor{}
 	// Protected timestamps won't be available (at first) in multi-tenant
@@ -543,13 +597,14 @@ func makeSQLServerArgs(
 	// writing): the blob service and DistSQL.
 	dummyRPCServer := grpc.NewServer()
 	sessionRegistry := sql.NewSessionRegistry()
+	contentionRegistry := contention.NewRegistry()
 	return sqlServerArgs{
 		sqlServerOptionalKVArgs: sqlServerOptionalKVArgs{
 			nodesStatusServer: serverpb.MakeOptionalNodesStatusServer(nil),
 			nodeLiveness:      optionalnodeliveness.MakeContainer(nil),
 			gossip:            gossip.MakeOptionalGossip(nil),
 			grpcServer:        dummyRPCServer,
-			isMeta1Leaseholder: func(_ context.Context, timestamp hlc.Timestamp) (bool, error) {
+			isMeta1Leaseholder: func(_ context.Context, _ hlc.ClockTimestamp) (bool, error) {
 				return false, errors.New("isMeta1Leaseholder is not available to secondary tenants")
 			},
 			nodeIDContainer:        idContainer,
@@ -573,54 +628,122 @@ func makeSQLServerArgs(
 		registry:                 registry,
 		recorder:                 recorder,
 		sessionRegistry:          sessionRegistry,
+		contentionRegistry:       contentionRegistry,
 		circularInternalExecutor: circularInternalExecutor,
 		circularJobRegistry:      &jobs.Registry{},
 		protectedtsProvider:      protectedTSProvider,
+		rangeFeedFactory:         rangeFeedFactory,
 		sqlStatusServer: newTenantStatusServer(
-			baseCfg.AmbientCtx, &adminPrivilegeChecker{ie: circularInternalExecutor}, sessionRegistry, baseCfg.Settings,
+			baseCfg.AmbientCtx, &adminPrivilegeChecker{ie: circularInternalExecutor},
+			sessionRegistry, contentionRegistry, baseCfg.Settings,
 		),
 	}, nil
+}
+
+// TestTenant is an in-memory instantiation of the SQL-only process created for
+// each active Cockroach tenant. TestTenant provides tests with access to
+// internal methods and state on SQLServer. It is typically started in tests by
+// calling the TestServerInterface.StartTenant method or by calling the wrapper
+// serverutils.StartTenant method.
+type TestTenant struct {
+	*SQLServer
+	sqlAddr  string
+	httpAddr string
+}
+
+// SQLAddr is part of the TestTenantInterface interface.
+func (t *TestTenant) SQLAddr() string {
+	return t.sqlAddr
+}
+
+// HTTPAddr is part of the TestTenantInterface interface.
+func (t *TestTenant) HTTPAddr() string {
+	return t.httpAddr
+}
+
+// PGServer is part of the TestTenantInterface interface.
+func (t *TestTenant) PGServer() interface{} {
+	return t.pgServer
+}
+
+// DiagnosticsReporter is part of the TestTenantInterface interface.
+func (t *TestTenant) DiagnosticsReporter() interface{} {
+	return t.diagnosticsReporter
+}
+
+// SetupIdleMonitor will monitor the active connections and if there are none,
+// will activate a `defaultCountdownDuration` countdown timer and terminate
+// the application. The monitoring will start after a warmup period
+// specified by warmupDuration. If the warmupDuration is zero, the idle
+// detection will be turned off.
+func SetupIdleMonitor(
+	ctx context.Context,
+	stopper *stop.Stopper,
+	warmupDuration time.Duration,
+	server netutil.Server,
+	countdownDuration ...time.Duration,
+) *IdleMonitor {
+	if warmupDuration != 0 {
+		log.VEventf(ctx, 2, "idle exit will activate after warmup duration of %s", warmupDuration)
+		oldConnStateHandler := server.ConnState
+		idleMonitor := MakeIdleMonitor(ctx, warmupDuration,
+			func() {
+				log.VEventf(ctx, 2, "idle exiting")
+				stopper.Stop(ctx)
+			},
+			countdownDuration...,
+		)
+		server.ConnState = func(conn net.Conn, state http.ConnState) {
+			if state == http.StateNew {
+				defer oldConnStateHandler(conn, state)
+				idleMonitor.NewConnection(ctx)
+			} else if state == http.StateClosed {
+				defer idleMonitor.CloseConnection(ctx)
+				oldConnStateHandler(conn, state)
+			}
+		}
+		return idleMonitor
+	}
+	return nil
 }
 
 // StartTenant starts a SQL tenant communicating with this TestServer.
 func (ts *TestServer) StartTenant(
 	params base.TestTenantArgs,
-) (pgAddr string, httpAddr string, _ error) {
+) (serverutils.TestTenantInterface, error) {
 	ctx := context.Background()
 
 	if !params.Existing {
 		if _, err := ts.InternalExecutor().(*sql.InternalExecutor).Exec(
 			ctx, "testserver-create-tenant", nil /* txn */, "SELECT crdb_internal.create_tenant($1)", params.TenantID.ToUint64(),
 		); err != nil {
-			return "", "", err
+			return nil, err
 		}
 	}
 
 	st := cluster.MakeTestingClusterSettings()
 	sqlCfg := makeTestSQLConfig(st, params.TenantID)
 	sqlCfg.TenantKVAddrs = []string{ts.ServingRPCAddr()}
-	sqlCfg.TenantIDCodecOverride = params.TenantIDCodecOverride
 	baseCfg := makeTestBaseConfig(st)
+	baseCfg.TestingKnobs = params.TestingKnobs
+	baseCfg.IdleExitAfter = params.IdleExitAfter
 	if params.AllowSettingClusterSettings {
 		baseCfg.TestingKnobs.TenantTestingKnobs = &sql.TenantTestingKnobs{
 			ClusterSettingsUpdater: st.MakeUpdater(),
 		}
 	}
-	baseCfg.TestingKnobs.SQLExecutor = &sql.ExecutorTestingKnobs{
-		DeterministicExplainAnalyze: params.DeterministicExplainAnalyze,
-	}
 	stopper := params.Stopper
 	if stopper == nil {
 		stopper = ts.Stopper()
 	}
-	addr, httpAddr, _, err := StartTenant(
+	sqlServer, addr, httpAddr, err := StartTenant(
 		ctx,
 		stopper,
 		ts.Cfg.ClusterName,
 		baseCfg,
 		sqlCfg,
 	)
-	return addr, httpAddr, err
+	return &TestTenant{SQLServer: sqlServer, sqlAddr: addr, httpAddr: httpAddr}, err
 }
 
 // StartTenant starts a stand-alone SQL server against a KV backend.
@@ -630,14 +753,14 @@ func StartTenant(
 	kvClusterName string, // NB: gone after https://github.com/cockroachdb/cockroach/issues/42519
 	baseCfg BaseConfig,
 	sqlCfg SQLConfig,
-) (pgAddr string, httpAddr string, instanceID base.SQLInstanceID, _ error) {
+) (sqlServer *SQLServer, pgAddr string, httpAddr string, _ error) {
 	args, err := makeSQLServerArgs(stopper, kvClusterName, baseCfg, sqlCfg)
 	if err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 	s, err := newSQLServer(ctx, args)
 	if err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 
 	// TODO(asubiotto): remove this. Right now it is needed to initialize the
@@ -651,30 +774,48 @@ func StartTenant(
 		nil, // tlsConfig
 		nil, // handler
 	)
-
-	pgL, err := listen(ctx, &args.Config.SQLAddr, &args.Config.SQLAdvertiseAddr, "sql")
-	if err != nil {
-		return "", "", 0, err
+	knobs := baseCfg.TestingKnobs.TenantTestingKnobs
+	if tenantKnobs, ok := knobs.(*sql.TenantTestingKnobs); ok && tenantKnobs.IdleExitCountdownDuration != 0 {
+		SetupIdleMonitor(ctx, args.stopper, baseCfg.IdleExitAfter, connManager, tenantKnobs.IdleExitCountdownDuration)
+	} else {
+		SetupIdleMonitor(ctx, args.stopper, baseCfg.IdleExitAfter, connManager)
 	}
 
-	args.stopper.RunWorker(ctx, func(ctx context.Context) {
-		<-args.stopper.ShouldQuiesce()
-		// NB: we can't do this as a Closer because (*Server).ServeWith is
-		// running in a worker and usually sits on accept(pgL) which unblocks
-		// only when pgL closes. In other words, pgL needs to close when
-		// quiescing starts to allow that worker to shut down.
-		_ = pgL.Close()
-	})
-
-	httpL, err := listen(ctx, &args.Config.HTTPAddr, &args.Config.HTTPAdvertiseAddr, "http")
+	pgL, err := ListenAndUpdateAddrs(ctx, &args.Config.SQLAddr, &args.Config.SQLAdvertiseAddr, "sql")
 	if err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 
-	args.stopper.RunWorker(ctx, func(ctx context.Context) {
-		<-args.stopper.ShouldQuiesce()
-		_ = httpL.Close()
-	})
+	{
+		waitQuiesce := func(ctx context.Context) {
+			<-args.stopper.ShouldQuiesce()
+			// NB: we can't do this as a Closer because (*Server).ServeWith is
+			// running in a worker and usually sits on accept(pgL) which unblocks
+			// only when pgL closes. In other words, pgL needs to close when
+			// quiescing starts to allow that worker to shut down.
+			_ = pgL.Close()
+		}
+		if err := args.stopper.RunAsyncTask(ctx, "wait-quiesce-pgl", waitQuiesce); err != nil {
+			waitQuiesce(ctx)
+			return nil, "", "", err
+		}
+	}
+
+	httpL, err := ListenAndUpdateAddrs(ctx, &args.Config.HTTPAddr, &args.Config.HTTPAdvertiseAddr, "http")
+	if err != nil {
+		return nil, "", "", err
+	}
+
+	{
+		waitQuiesce := func(ctx context.Context) {
+			<-args.stopper.ShouldQuiesce()
+			_ = httpL.Close()
+		}
+		if err := args.stopper.RunAsyncTask(ctx, "wait-quiesce-http", waitQuiesce); err != nil {
+			waitQuiesce(ctx)
+			return nil, "", "", err
+		}
+	}
 
 	pgLAddr := pgL.Addr().String()
 	httpLAddr := httpL.Addr().String()
@@ -687,7 +828,7 @@ func StartTenant(
 		pgLAddr,   // sql addr
 	)
 
-	args.stopper.RunWorker(ctx, func(ctx context.Context) {
+	if err := args.stopper.RunAsyncTask(ctx, "serve-http", func(ctx context.Context) {
 		mux := http.NewServeMux()
 		debugServer := debug.NewServer(args.Settings, s.pgServer.HBADebugFn())
 		mux.Handle("/", debugServer)
@@ -701,7 +842,9 @@ func StartTenant(
 		f := varsHandler{metricSource: args.recorder, st: args.Settings}.handleVars
 		mux.Handle(statusVars, http.HandlerFunc(f))
 		_ = http.Serve(httpL, mux)
-	})
+	}); err != nil {
+		return nil, "", "", err
+	}
 
 	const (
 		socketFile = "" // no unix socket
@@ -718,7 +861,7 @@ func StartTenant(
 		heapProfileDirName:   args.HeapProfileDirName,
 		runtime:              args.runtime,
 	}); err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 
 	s.execCfg.DistSQLPlanner.SetNodeInfo(roachpb.NodeDescriptor{NodeID: roachpb.NodeID(args.nodeIDContainer.SQLInstanceID())})
@@ -731,18 +874,27 @@ func StartTenant(
 		socketFile,
 		orphanedLeasesTimeThresholdNanos,
 	); err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
+
+	// Register the server's identifiers so that log events are
+	// decorated with the server's identity. This helps when gathering
+	// log events from multiple servers into the same log collector.
+	//
+	// We do this only here, as the identifiers may not be known before this point.
+	clusterID := args.rpcContext.ClusterID.Get().String()
+	log.SetNodeIDs(clusterID, 0 /* nodeID is not known for a SQL-only server. */)
+	log.SetTenantIDs(args.TenantID.String(), int32(s.SQLInstanceID()))
 
 	if err := s.startServeSQL(ctx,
 		args.stopper,
 		s.connManager,
 		s.pgL,
 		socketFile); err != nil {
-		return "", "", 0, err
+		return nil, "", "", err
 	}
 
-	return pgLAddr, httpLAddr, args.nodeIDContainer.SQLInstanceID(), nil
+	return s, pgLAddr, httpLAddr, nil
 }
 
 // ExpectedInitialRangeCount returns the expected number of ranges that should
@@ -851,6 +1003,16 @@ func (ts *TestServer) GetHTTPClient() (http.Client, error) {
 	return ts.Server.rpcContext.GetHTTPClient()
 }
 
+// UpdateChecker implements TestServerInterface.
+func (ts *TestServer) UpdateChecker() interface{} {
+	return ts.Server.updates
+}
+
+// DiagnosticsReporter implements TestServerInterface.
+func (ts *TestServer) DiagnosticsReporter() interface{} {
+	return ts.Server.sqlServer.diagnosticsReporter
+}
+
 const authenticatedUser = "authentic_user"
 
 func authenticatedUserName() security.SQLUsername {
@@ -865,8 +1027,7 @@ func authenticatedUserNameNoAdmin() security.SQLUsername {
 
 // GetAdminAuthenticatedHTTPClient implements the TestServerInterface.
 func (ts *TestServer) GetAdminAuthenticatedHTTPClient() (http.Client, error) {
-	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(
-		authenticatedUserName(), true)
+	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authenticatedUserName(), true)
 	return httpClient, err
 }
 
@@ -878,6 +1039,17 @@ func (ts *TestServer) GetAuthenticatedHTTPClient(isAdmin bool) (http.Client, err
 	}
 	httpClient, _, err := ts.getAuthenticatedHTTPClientAndCookie(authUser, isAdmin)
 	return httpClient, err
+}
+
+type v2AuthDecorator struct {
+	http.RoundTripper
+
+	session string
+}
+
+func (v *v2AuthDecorator) RoundTrip(r *http.Request) (*http.Response, error) {
+	r.Header.Add(apiV2AuthHeader, v.session)
+	return v.RoundTripper.RoundTrip(r)
 }
 
 func (ts *TestServer) getAuthenticatedHTTPClientAndCookie(
@@ -922,6 +1094,14 @@ func (ts *TestServer) getAuthenticatedHTTPClientAndCookie(
 			authClient.httpClient, err = ts.rpcContext.GetHTTPClient()
 			if err != nil {
 				return err
+			}
+			rawCookieBytes, err := protoutil.Marshal(rawCookie)
+			if err != nil {
+				return err
+			}
+			authClient.httpClient.Transport = &v2AuthDecorator{
+				RoundTripper: authClient.httpClient.Transport,
+				session:      base64.StdEncoding.EncodeToString(rawCookieBytes),
 			}
 			authClient.httpClient.Jar = cookieJar
 			authClient.cookie = rawCookie
@@ -1094,15 +1274,16 @@ func (ts *TestServer) MergeRanges(leftKey roachpb.Key) (roachpb.RangeDescriptor,
 	return ts.LookupRange(leftKey)
 }
 
-// SplitRange splits the range containing splitKey.
+// SplitRangeWithExpiration splits the range containing splitKey with a sticky
+// bit expiring at expirationTime.
 // The right range created by the split starts at the split key and extends to the
 // original range's end key.
 // Returns the new descriptors of the left and right ranges.
 //
 // splitKey must correspond to a SQL table key (it must end with a family ID /
 // col ID).
-func (ts *TestServer) SplitRange(
-	splitKey roachpb.Key,
+func (ts *TestServer) SplitRangeWithExpiration(
+	splitKey roachpb.Key, expirationTime hlc.Timestamp,
 ) (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
 	ctx := context.Background()
 	splitRKey, err := keys.Addr(splitKey)
@@ -1114,7 +1295,7 @@ func (ts *TestServer) SplitRange(
 			Key: splitKey,
 		},
 		SplitKey:       splitKey,
-		ExpirationTime: hlc.MaxTimestamp,
+		ExpirationTime: expirationTime,
 	}
 	_, pErr := kv.SendWrapped(ctx, ts.DB().NonTransactionalSender(), &splitReq)
 	if pErr != nil {
@@ -1188,13 +1369,21 @@ func (ts *TestServer) SplitRange(
 	return leftRangeDesc, rightRangeDesc, nil
 }
 
+// SplitRange is exactly like SplitRangeWithExpiration, except that it creates a
+// split with a sticky bit that never expires.
+func (ts *TestServer) SplitRange(
+	splitKey roachpb.Key,
+) (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
+	return ts.SplitRangeWithExpiration(splitKey, hlc.MaxTimestamp)
+}
+
 // GetRangeLease returns the current lease for the range containing key, and a
 // timestamp taken from the node.
 //
 // The lease is returned regardless of its status.
 func (ts *TestServer) GetRangeLease(
 	ctx context.Context, key roachpb.Key,
-) (_ roachpb.Lease, now hlc.Timestamp, _ error) {
+) (_ roachpb.Lease, now hlc.ClockTimestamp, _ error) {
 	leaseReq := roachpb.LeaseInfoRequest{
 		RequestHeader: roachpb.RequestHeader{
 			Key: key,
@@ -1212,15 +1401,20 @@ func (ts *TestServer) GetRangeLease(
 		&leaseReq,
 	)
 	if pErr != nil {
-		return roachpb.Lease{}, hlc.Timestamp{}, pErr.GoError()
+		return roachpb.Lease{}, hlc.ClockTimestamp{}, pErr.GoError()
 	}
-	return leaseResp.(*roachpb.LeaseInfoResponse).Lease, ts.Clock().Now(), nil
+	return leaseResp.(*roachpb.LeaseInfoResponse).Lease, ts.Clock().NowAsClockTimestamp(), nil
 
 }
 
 // ExecutorConfig is part of the TestServerInterface.
 func (ts *TestServer) ExecutorConfig() interface{} {
 	return *ts.sqlServer.execCfg
+}
+
+// Tracer is part of the TestServerInterface.
+func (ts *TestServer) Tracer() interface{} {
+	return ts.node.storeCfg.AmbientCtx.Tracer
 }
 
 // GCSystemLog deletes entries in the given system log table between
@@ -1272,28 +1466,48 @@ func (ts *TestServer) ForceTableGC(
 	return pErr.GoError()
 }
 
-// ScratchRangeEx splits off a range suitable to be used as KV scratch space.
-// (it doesn't overlap system spans or SQL tables).
-//
-// Calling this multiple times is undefined (but see TestCluster.ScratchRange()
-// which is idempotent).
-func (ts *TestServer) ScratchRangeEx() (roachpb.RangeDescriptor, error) {
-	scratchKey := keys.TableDataMax
-	_, rngDesc, err := ts.SplitRange(scratchKey)
-	if err != nil {
-		return roachpb.RangeDescriptor{}, err
-	}
-	return rngDesc, nil
-}
-
 // ScratchRange is like ScratchRangeEx, but only returns the start key of the
 // new range instead of the range descriptor.
 func (ts *TestServer) ScratchRange() (roachpb.Key, error) {
-	desc, err := ts.ScratchRangeEx()
+	_, desc, err := ts.ScratchRangeEx()
 	if err != nil {
 		return nil, err
 	}
 	return desc.StartKey.AsRawKey(), nil
+}
+
+// ScratchRangeEx splits off a range suitable to be used as KV scratch space.
+// (it doesn't overlap system spans or SQL tables).
+func (ts *TestServer) ScratchRangeEx() (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
+	scratchKey := keys.TableDataMax
+	return ts.SplitRange(scratchKey)
+}
+
+// ScratchRangeWithExpirationLease is like ScratchRangeWithExpirationLeaseEx but
+// returns a key for the RHS ranges, instead of both descriptors from the split.
+func (ts *TestServer) ScratchRangeWithExpirationLease() (roachpb.Key, error) {
+	_, desc, err := ts.ScratchRangeWithExpirationLeaseEx()
+	if err != nil {
+		return nil, err
+	}
+	return desc.StartKey.AsRawKey(), nil
+}
+
+// ScratchRangeWithExpirationLeaseEx is like ScratchRange but creates a range with
+// an expiration based lease.
+func (ts *TestServer) ScratchRangeWithExpirationLeaseEx() (
+	roachpb.RangeDescriptor,
+	roachpb.RangeDescriptor,
+	error,
+) {
+	scratchKey := roachpb.Key(bytes.Join([][]byte{keys.SystemPrefix,
+		roachpb.RKey("\x00aaa-testing")}, nil))
+	return ts.SplitRange(scratchKey)
+}
+
+// MetricsRecorder periodically records node-level and store-level metrics.
+func (ts *TestServer) MetricsRecorder() *status.MetricsRecorder {
+	return ts.node.recorder
 }
 
 type testServerFactoryImpl struct{}

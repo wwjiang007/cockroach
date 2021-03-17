@@ -14,12 +14,12 @@ import (
 	"context"
 	"sync"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 var insertNodePool = sync.Pool{
@@ -107,7 +107,7 @@ func (r *insertRun) initRowContainer(params runParams, columns colinfo.ResultCol
 		r.resultRowBuffer[i] = tree.DNull
 	}
 
-	colIDToRetIndex := r.ti.tableDesc().ColumnIdxMap()
+	colIDToRetIndex := catalog.ColumnIDToOrdinalMap(r.ti.tableDesc().PublicColumns())
 	r.rowIdxToTabColIdx = make([]int, len(r.insertCols))
 	for i, col := range r.insertCols {
 		if idx, ok := colIDToRetIndex.Get(col.ID); !ok {
@@ -130,9 +130,9 @@ func (r *insertRun) processSourceRow(params runParams, rowVals tree.Datums) erro
 	// written to when they are partial indexes and the row does not satisfy the
 	// predicate. This set is passed as a parameter to tableInserter.row below.
 	var pm row.PartialIndexUpdateHelper
-	partialIndexOrds := r.ti.tableDesc().PartialIndexOrds()
-	if !partialIndexOrds.Empty() {
-		partialIndexPutVals := rowVals[len(r.insertCols)+r.checkOrds.Len():]
+	if n := len(r.ti.tableDesc().PartialIndexes()); n > 0 {
+		offset := len(r.insertCols) + r.checkOrds.Len()
+		partialIndexPutVals := rowVals[offset : offset+n]
 
 		err := pm.Init(partialIndexPutVals, tree.Datums{}, r.ti.tableDesc())
 		if err != nil {
@@ -205,8 +205,6 @@ func (n *insertNode) BatchedNext(params runParams) (bool, error) {
 	if n.run.done {
 		return false, nil
 	}
-
-	tracing.AnnotateTrace()
 
 	// Advance one batch. First, clear the last batch.
 	n.run.ti.clearLastBatch(params.ctx)

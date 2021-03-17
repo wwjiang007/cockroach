@@ -100,9 +100,17 @@ func TestRandStep(t *testing.T) {
 			switch o := op.GetValue().(type) {
 			case *GetOperation:
 				if _, ok := keys[string(o.Key)]; ok {
-					client.GetExisting++
+					if o.ForUpdate {
+						client.GetExistingForUpdate++
+					} else {
+						client.GetExisting++
+					}
 				} else {
-					client.GetMissing++
+					if o.ForUpdate {
+						client.GetMissingForUpdate++
+					} else {
+						client.GetMissing++
+					}
 				}
 			case *PutOperation:
 				if _, ok := keys[string(o.Key)]; ok {
@@ -169,6 +177,8 @@ func TestRandStep(t *testing.T) {
 			} else if adds == 1 && removes == 1 {
 				counts.ChangeReplicas.AtomicSwapReplica++
 			}
+		case *TransferLeaseOperation:
+			counts.ChangeLease.TransferLease++
 		}
 		updateKeys(step.Op)
 

@@ -96,12 +96,17 @@ func NewUniquenessConstraintViolationError(
 			"duplicate key value: decoding err=%s", err)
 	}
 
+	// Exclude implicit partitioning columns and hash sharded index columns from
+	// the error message.
+	skipCols := index.ExplicitColumnStartIdx()
 	return errors.WithDetail(
 		pgerror.WithConstraintName(pgerror.Newf(pgcode.UniqueViolation,
 			"duplicate key value violates unique constraint %q", index.Name,
 		), index.Name),
 		fmt.Sprintf(
-			"Key (%s)=(%s) already exists.", strings.Join(names, ","), strings.Join(values, ","),
+			"Key (%s)=(%s) already exists.",
+			strings.Join(names[skipCols:], ","),
+			strings.Join(values[skipCols:], ","),
 		),
 	)
 }
@@ -154,25 +159,31 @@ func DecodeRowInfo(
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	index, err := tableDesc.FindIndexByID(indexID)
+	index, err := tableDesc.FindIndexWithID(indexID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	var rf Fetcher
 
-	colIDs := index.ColumnIDs
-	if allColumns {
-		if index.ID == tableDesc.GetPrimaryIndexID() {
-			publicColumns := tableDesc.GetPublicColumns()
-			colIDs = make([]descpb.ColumnID, len(publicColumns))
-			for i := range publicColumns {
-				colIDs[i] = publicColumns[i].ID
-			}
-		} else {
-			colIDs, _ = index.FullColumnIDs()
-			colIDs = append(colIDs, index.StoreColumnIDs...)
+	var colIDs []descpb.ColumnID
+	if !allColumns {
+		colIDs = make([]descpb.ColumnID, index.NumColumns())
+		for i := range colIDs {
+			colIDs[i] = index.GetColumnID(i)
 		}
+	} else if index.Primary() {
+		colIDs = make([]descpb.ColumnID, len(tableDesc.PublicColumns()))
+		for i, col := range tableDesc.PublicColumns() {
+			colIDs[i] = col.GetID()
+		}
+	} else {
+		colIDs = make([]descpb.ColumnID, 0, index.NumColumns()+index.NumExtraColumns()+index.NumStoredColumns())
+		_ = index.ForEachColumnID(func(id descpb.ColumnID) error {
+			colIDs = append(colIDs, id)
+			return nil
+		})
 	}
+
 	var valNeededForCol util.FastIntSet
 	valNeededForCol.AddRange(0, len(colIDs)-1)
 
@@ -180,16 +191,16 @@ func DecodeRowInfo(
 	cols := make([]descpb.ColumnDescriptor, len(colIDs))
 	for i, colID := range colIDs {
 		colIdxMap.Set(colID, i)
-		col, err := tableDesc.FindColumnByID(colID)
+		col, err := tableDesc.FindColumnWithID(colID)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		cols[i] = *col
+		cols[i] = *col.ColumnDesc()
 	}
 
 	tableArgs := FetcherTableArgs{
 		Desc:             tableDesc,
-		Index:            index,
+		Index:            index.IndexDesc(),
 		ColIdxMap:        colIdxMap,
 		IsSecondaryIndex: indexID != tableDesc.GetPrimaryIndexID(),
 		Cols:             cols,
@@ -232,7 +243,7 @@ func DecodeRowInfo(
 		}
 		values[i] = datums[i].String()
 	}
-	return index, names, values, nil
+	return index.IndexDesc(), names, values, nil
 }
 
 func (f *singleKVFetcher) close(context.Context) {}

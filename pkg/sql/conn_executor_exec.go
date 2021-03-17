@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -30,13 +31,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -356,13 +357,17 @@ func (ex *connExecutor) execStmtInOpenState(
 		case tree.ExplainPlan:
 			telemetry.Inc(sqltelemetry.ExplainAnalyzeUseCounter)
 			flags := explain.MakeFlags(&e.ExplainOptions)
-			flags.MakeDeterministic = ex.server.cfg.TestingKnobs.DeterministicExplainAnalyze
+			if ex.server.cfg.TestingKnobs.DeterministicExplain {
+				flags.Redact = explain.RedactAll
+			}
 			ih.SetOutputMode(explainAnalyzePlanOutput, flags)
 
 		case tree.ExplainDistSQL:
 			telemetry.Inc(sqltelemetry.ExplainAnalyzeDistSQLUseCounter)
 			flags := explain.MakeFlags(&e.ExplainOptions)
-			flags.MakeDeterministic = ex.server.cfg.TestingKnobs.DeterministicExplainAnalyze
+			if ex.server.cfg.TestingKnobs.DeterministicExplain {
+				flags.Redact = explain.RedactAll
+			}
 			ih.SetOutputMode(explainAnalyzeDistSQLOutput, flags)
 
 		default:
@@ -383,12 +388,22 @@ func (ex *connExecutor) execStmtInOpenState(
 	var needFinish bool
 	ctx, needFinish = ih.Setup(
 		ctx, ex.server.cfg, ex.appStats, p, ex.stmtDiagnosticsRecorder,
-		stmt.AnonymizedStr, os.ImplicitTxn.Get(),
+		stmt.AnonymizedStr, os.ImplicitTxn.Get(), ex.extraTxnState.shouldCollectExecutionStats,
 	)
 	if needFinish {
 		sql := stmt.SQL
 		defer func() {
-			retErr = ih.Finish(ex.server.cfg, ex.appStats, ex.statsCollector, p, ast, sql, res, retErr)
+			retErr = ih.Finish(
+				ex.server.cfg,
+				ex.appStats,
+				&ex.extraTxnState.accumulatedStats,
+				ex.statsCollector,
+				p,
+				ast,
+				sql,
+				res,
+				retErr,
+			)
 		}()
 		// TODO(radu): consider removing this if/when #46164 is addressed.
 		p.extendedEvalCtx.Context = ctx
@@ -634,15 +649,17 @@ func (ex *connExecutor) execStmtInOpenState(
 	alreadyRecording := ex.transitionCtx.sessionTracing.Enabled()
 	stmtTraceThreshold := traceStmtThreshold.Get(&ex.planner.execCfg.Settings.SV)
 	if !alreadyRecording && stmtTraceThreshold > 0 {
-		ctx, stmtThresholdSpan = createRootOrChildSpan(ctx, "trace-stmt-threshold", ex.transitionCtx.tracer)
+		ctx, stmtThresholdSpan = createRootOrChildSpan(ctx, "trace-stmt-threshold", ex.transitionCtx.tracer, tracing.WithForceRealSpan())
 		stmtThresholdSpan.SetVerbose(true)
 	}
 
 	if err := ex.dispatchToExecutionEngine(ctx, p, res); err != nil {
+		stmtThresholdSpan.Finish()
 		return nil, nil, err
 	}
 
 	if stmtThresholdSpan != nil {
+		stmtThresholdSpan.Finish()
 		logTraceAboveThreshold(
 			ctx,
 			stmtThresholdSpan.GetRecording(),
@@ -680,6 +697,7 @@ func (ex *connExecutor) execStmtInOpenState(
 		}
 		log.VEventf(ctx, 2, "push detected for non-refreshable txn but auto-retry not possible")
 	}
+
 	// No event was generated.
 	return nil, nil, nil
 }
@@ -728,7 +746,13 @@ func (ex *connExecutor) commitSQLTransaction(
 func (ex *connExecutor) commitSQLTransactionInternal(
 	ctx context.Context, ast tree.Statement,
 ) error {
-	if err := validatePrimaryKeys(&ex.extraTxnState.descCollection); err != nil {
+	if ex.extraTxnState.schemaChangerState.mode != sessiondata.UseNewSchemaChangerOff {
+		if err := ex.runPreCommitStages(ctx); err != nil {
+			return err
+		}
+	}
+
+	if err := ex.extraTxnState.descCollection.ValidateUncommittedDescriptors(ctx, ex.state.mu.txn); err != nil {
 		return err
 	}
 
@@ -745,22 +769,6 @@ func (ex *connExecutor) commitSQLTransactionInternal(
 	// we don't block the client.
 	if descs := ex.extraTxnState.descCollection.GetDescriptorsWithNewVersion(); descs != nil {
 		ex.extraTxnState.descCollection.ReleaseLeases(ctx)
-	}
-	return nil
-}
-
-// validatePrimaryKeys verifies that all tables modified in the transaction have
-// an enabled primary key after potentially undergoing DROP PRIMARY KEY, which
-// is required to be followed by ADD PRIMARY KEY.
-func validatePrimaryKeys(tc *descs.Collection) error {
-	tables := tc.GetUncommittedTables()
-	for _, table := range tables {
-		if !table.HasPrimaryKey() {
-			return unimplemented.NewWithIssuef(48026,
-				"primary key of table %s dropped without subsequent addition of new primary key",
-				table.Name,
-			)
-		}
 	}
 	return nil
 }
@@ -789,6 +797,22 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	ex.sessionTracing.TracePlanStart(ctx, stmt.AST.StatementTag())
 	ex.statsCollector.phaseTimes[plannerStartLogicalPlan] = timeutil.Now()
 
+	// If adminAuditLogging is enabled, we want to check for HasAdminRole
+	// before the deferred maybeLogStatement.
+	// We must check prior to execution in the case the txn is aborted due to
+	// an error. HasAdminRole can only be checked in a valid txn.
+	if adminAuditLog := adminAuditLogEnabled.Get(
+		&ex.planner.execCfg.Settings.SV,
+	); adminAuditLog {
+		if !ex.extraTxnState.hasAdminRoleCache.IsSet {
+			hasAdminRole, err := ex.planner.HasAdminRole(ctx)
+			if err != nil {
+				return err
+			}
+			ex.extraTxnState.hasAdminRoleCache.HasAdminRole = hasAdminRole
+			ex.extraTxnState.hasAdminRoleCache.IsSet = true
+		}
+	}
 	// Prepare the plan. Note, the error is processed below. Everything
 	// between here and there needs to happen even if there's an error.
 	err := ex.makeExecPlan(ctx, planner)
@@ -811,9 +835,11 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 			ctx,
 			ex.executorType,
 			ex.extraTxnState.autoRetryCounter,
+			ex.extraTxnState.txnCounter,
 			res.RowsAffected(),
 			res.Err(),
 			ex.statsCollector.phaseTimes[sessionQueryReceived],
+			&ex.extraTxnState.hasAdminRoleCache,
 		)
 	}()
 
@@ -889,6 +915,9 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	ex.sessionTracing.TraceExecEnd(ctx, res.Err(), res.RowsAffected())
 	ex.statsCollector.phaseTimes[plannerEndExecStmt] = timeutil.Now()
 
+	ex.extraTxnState.rowsRead += stats.rowsRead
+	ex.extraTxnState.bytesRead += stats.bytesRead
+
 	// Record the statement summary. This also closes the plan if the
 	// plan has not been closed earlier.
 	ex.recordStatementSummary(
@@ -912,17 +941,19 @@ func (ex *connExecutor) makeExecPlan(ctx context.Context, planner *planner) erro
 
 	flags := planner.curPlan.flags
 
-	// We don't execute the statement if:
-	// - plan contains a full table or full index scan.
-	// - the session setting disallows full table/index scans.
-	// - the query is not an internal query.
-	if (flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan)) &&
-		planner.EvalContext().SessionData.DisallowFullTableScans && ex.executorType == executorTypeExec {
-		return errors.WithHint(
-			pgerror.Newf(pgcode.TooManyRows,
-				"query `%s` contains a full table/index scan which is explicitly disallowed",
-				planner.stmt.SQL),
-			"try overriding the `disallow_full_table_scans` cluster/session setting")
+	if flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan) {
+		if ex.executorType == executorTypeExec && planner.EvalContext().SessionData.DisallowFullTableScans {
+			// We don't execute the statement if:
+			// - plan contains a full table or full index scan.
+			// - the session setting disallows full table/index scans.
+			// - the query is not an internal query.
+			return errors.WithHint(
+				pgerror.Newf(pgcode.TooManyRows,
+					"query `%s` contains a full table/index scan which is explicitly disallowed",
+					planner.stmt.SQL),
+				"try overriding the `disallow_full_table_scans` cluster/session setting")
+		}
+		ex.metrics.EngineMetrics.FullTableOrIndexScanCount.Inc(1)
 	}
 
 	// TODO(knz): Remove this accounting if/when savepoint rollbacks
@@ -960,6 +991,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 		planner.txn,
 		ex.server.cfg.Clock,
 		&ex.sessionTracing,
+		ex.server.cfg.ContentionRegistry,
 	)
 	recv.progressAtomic = progressAtomic
 	defer recv.Release()
@@ -973,6 +1005,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 		planCtx.saveFlows = planCtx.getDefaultSaveFlowsFunc(ctx, planner, planComponentTypeMainQuery)
 	}
 	planCtx.traceMetadata = planner.instrumentation.traceMetadata
+	planCtx.collectExecStats = planner.instrumentation.ShouldCollectExecStats()
 
 	var evalCtxFactory func() *extendedEvalContext
 	if len(planner.curPlan.subqueryPlans) != 0 ||
@@ -1452,6 +1485,15 @@ func (ex *connExecutor) recordTransactionStart() (onTxnFinish func(txnEvent), on
 	ex.extraTxnState.transactionStatementsHash = util.MakeFNV64()
 	ex.extraTxnState.transactionStatementIDs = nil
 	ex.extraTxnState.numRows = 0
+	ex.extraTxnState.shouldCollectExecutionStats = false
+	ex.extraTxnState.accumulatedStats = execstats.QueryLevelStats{}
+	ex.extraTxnState.rowsRead = 0
+	ex.extraTxnState.bytesRead = 0
+	if execStatsSampleRate := collectTxnStatsSampleRate.Get(&ex.server.GetExecutorConfig().Settings.SV); execStatsSampleRate > 0 {
+		ex.extraTxnState.shouldCollectExecutionStats = execStatsSampleRate > ex.rng.Float64()
+	}
+
+	ex.metrics.EngineMetrics.SQLTxnsOpen.Inc(1)
 
 	onTxnFinish = func(ev txnEvent) {
 		ex.phaseTimes[sessionEndExecTransaction] = timeutil.Now()
@@ -1462,6 +1504,11 @@ func (ex *connExecutor) recordTransactionStart() (onTxnFinish func(txnEvent), on
 		ex.extraTxnState.transactionStatementIDs = nil
 		ex.extraTxnState.transactionStatementsHash = util.MakeFNV64()
 		ex.extraTxnState.numRows = 0
+		// accumulatedStats are cleared, but shouldCollectExecutionStats is
+		// unchanged.
+		ex.extraTxnState.accumulatedStats = execstats.QueryLevelStats{}
+		ex.extraTxnState.rowsRead = 0
+		ex.extraTxnState.bytesRead = 0
 	}
 	return onTxnFinish, onTxnRestart
 }
@@ -1469,6 +1516,7 @@ func (ex *connExecutor) recordTransactionStart() (onTxnFinish func(txnEvent), on
 func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool, txnStart time.Time) {
 	txnEnd := timeutil.Now()
 	txnTime := txnEnd.Sub(txnStart)
+	ex.metrics.EngineMetrics.SQLTxnsOpen.Dec(1)
 	ex.metrics.EngineMetrics.SQLTxnLatency.RecordValue(txnTime.Nanoseconds())
 
 	txnServiceLat := ex.phaseTimes.getTransactionServiceLatency()
@@ -1486,6 +1534,10 @@ func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool, txnStart t
 		txnRetryLat,
 		commitLat,
 		ex.extraTxnState.numRows,
+		ex.extraTxnState.shouldCollectExecutionStats,
+		ex.extraTxnState.accumulatedStats,
+		ex.extraTxnState.rowsRead,
+		ex.extraTxnState.bytesRead,
 	)
 }
 
@@ -1494,11 +1546,9 @@ func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool, txnStart t
 // child span if one is found. A context derived from parentCtx which
 // additionally contains the new span is also returned.
 func createRootOrChildSpan(
-	parentCtx context.Context, opName string, tr *tracing.Tracer,
+	parentCtx context.Context, opName string, tr *tracing.Tracer, os ...tracing.SpanOption,
 ) (context.Context, *tracing.Span) {
-	// WithForceRealSpan is used to support the use of session tracing, which
-	// may start recording on this span.
-	return tracing.EnsureChildSpan(parentCtx, tr, opName, tracing.WithForceRealSpan())
+	return tracing.EnsureChildSpan(parentCtx, tr, opName, os...)
 }
 
 // logTraceAboveThreshold logs a span's recording if the duration is above a

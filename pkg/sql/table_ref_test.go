@@ -47,31 +47,29 @@ CREATE INDEX bc ON test.t(b, c);
 
 	// Retrieve the numeric descriptors.
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
-	tID := tableDesc.ID
+	tID := tableDesc.GetID()
 	var aID, bID, cID descpb.ColumnID
-	for i := range tableDesc.Columns {
-		c := &tableDesc.Columns[i]
-		switch c.Name {
+	for _, c := range tableDesc.PublicColumns() {
+		switch c.GetName() {
 		case "a":
-			aID = c.ID
+			aID = c.GetID()
 		case "b":
-			bID = c.ID
+			bID = c.GetID()
 		case "c":
-			cID = c.ID
+			cID = c.GetID()
 		}
 	}
 	pkID := tableDesc.GetPrimaryIndexID()
-	secID := tableDesc.GetPublicNonPrimaryIndexes()[0].ID
+	secID := tableDesc.PublicNonPrimaryIndexes()[0].GetID()
 
 	// Retrieve the numeric descriptors.
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "hidden")
-	tIDHidden := tableDesc.ID
+	tIDHidden := tableDesc.GetID()
 	var rowIDHidden descpb.ColumnID
-	for i := range tableDesc.Columns {
-		c := &tableDesc.Columns[i]
-		switch c.Name {
+	for _, c := range tableDesc.PublicColumns() {
+		switch c.GetName() {
 		case "rowid":
-			rowIDHidden = c.ID
+			rowIDHidden = c.GetID()
 		}
 	}
 

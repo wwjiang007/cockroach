@@ -18,10 +18,12 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/apd/v2"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -31,6 +33,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
+
+var testSinkFlushFrequency = 100 * time.Millisecond
 
 func waitForSchemaChange(
 	t testing.TB, sqlDB *sqlutils.SQLRunner, stmt string, arguments ...interface{},
@@ -60,7 +64,11 @@ func readNextMessages(t testing.TB, f cdctest.TestFeed, numMessages int, stripTs
 	for len(actual) < numMessages {
 		m, err := f.Next()
 		if log.V(1) {
-			log.Infof(context.Background(), `%v %s: %s->%s`, err, m.Topic, m.Key, m.Value)
+			if m != nil {
+				log.Infof(context.Background(), `msg %s: %s->%s (%s)`, m.Topic, m.Key, m.Value, m.Resolved)
+			} else {
+				log.Infof(context.Background(), `err %v`, err)
+			}
 		}
 		if err != nil {
 			t.Fatal(err)
@@ -152,6 +160,23 @@ func assertPayloadsAvro(
 	}
 }
 
+func assertRegisteredSubjects(t testing.TB, reg *testSchemaRegistry, expected []string) {
+	t.Helper()
+
+	actual := make([]string, 0, len(reg.mu.subjects))
+
+	for subject := range reg.mu.subjects {
+		actual = append(actual, subject)
+	}
+
+	sort.Strings(expected)
+	sort.Strings(actual)
+	if !reflect.DeepEqual(expected, actual) {
+		t.Fatalf("expected\n  %s\ngot\n  %s",
+			strings.Join(expected, "\n  "), strings.Join(actual, "\n  "))
+	}
+}
+
 func parseTimeToHLC(t testing.TB, s string) hlc.Timestamp {
 	t.Helper()
 	d, _, err := apd.NewFromString(s)
@@ -173,6 +198,11 @@ func expectResolvedTimestamp(t testing.TB, f cdctest.TestFeed) hlc.Timestamp {
 	} else if m == nil {
 		t.Fatal(`expected message`)
 	}
+	return extractResolvedTimestamp(t, m)
+}
+
+func extractResolvedTimestamp(t testing.TB, m *cdctest.TestFeedMessage) hlc.Timestamp {
+	t.Helper()
 	if m.Key != nil {
 		t.Fatalf(`unexpected row %s: %s -> %s`, m.Topic, m.Key, m.Value)
 	}
@@ -217,6 +247,7 @@ func expectResolvedTimestampAvro(
 
 func sinklessTest(testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory)) func(*testing.T) {
 	return func(t *testing.T) {
+		defer changefeedbase.TestingSetDefaultFlushFrequency(testSinkFlushFrequency)()
 		ctx := context.Background()
 		knobs := base.TestingKnobs{DistSQL: &execinfra.TestingKnobs{Changefeed: &TestingKnobs{}}}
 		s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
@@ -259,6 +290,7 @@ func enterpriseTestWithServerArgs(
 	testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory),
 ) func(*testing.T) {
 	return func(t *testing.T) {
+		defer changefeedbase.TestingSetDefaultFlushFrequency(testSinkFlushFrequency)()
 		ctx := context.Background()
 
 		flushCh := make(chan struct{}, 1)
@@ -298,6 +330,7 @@ func cloudStorageTest(
 	testFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory),
 ) func(*testing.T) {
 	return func(t *testing.T) {
+		defer changefeedbase.TestingSetDefaultFlushFrequency(testSinkFlushFrequency)()
 		ctx := context.Background()
 
 		dir, dirCleanupFn := testutils.TempDir(t)

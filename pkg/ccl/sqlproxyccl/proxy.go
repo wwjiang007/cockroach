@@ -117,12 +117,16 @@ func (s *Server) Proxy(proxyConn *Conn) error {
 	conn, msg, err := frontendAdmitter(proxyConn)
 	if err != nil {
 		var codeErr *CodeError
-		if errors.As(err, &codeErr) && codeErr.code == CodeUnexpectedInsecureStartupMessage {
+		if ok := errors.As(err, &codeErr); ok && codeErr.code == CodeUnexpectedInsecureStartupMessage {
 			sendErrToClient(
 				proxyConn, // Do this on the TCP connection as it means denying SSL
 				CodeUnexpectedInsecureStartupMessage,
 				"server requires encryption",
 			)
+		} else if ok {
+			sendErrToClient(proxyConn, codeErr.code, codeErr.Error())
+		} else {
+			sendErrToClient(proxyConn, CodeClientDisconnected, err.Error())
 		}
 		return err
 	}
@@ -136,23 +140,27 @@ func (s *Server) Proxy(proxyConn *Conn) error {
 	defer func() { _ = conn.Close() }()
 
 	backendDialer := s.opts.BackendDialer
+	var backendConfig *BackendConfig
+	if s.opts.BackendConfigFromParams != nil {
+		var clientErr error
+		backendConfig, clientErr = s.opts.BackendConfigFromParams(msg.Parameters, proxyConn)
+		if clientErr != nil {
+			var codeErr *CodeError
+			if !errors.As(clientErr, &codeErr) {
+				codeErr = &CodeError{
+					code: CodeParamsRoutingFailed,
+					err:  errors.Errorf("rejected by BackendConfigFromParams: %v", clientErr),
+				}
+			}
+			sendErrToClient(conn, codeErr.code, codeErr.Error())
+			return codeErr
+		}
+	}
 	if backendDialer == nil {
 		// This we need to keep until all the clients are switched to provide BackendDialer.
 		// It constructs a backend dialer from the information provided via
 		// BackendConfigFromParams function.
 		backendDialer = func(msg *pgproto3.StartupMessage) (net.Conn, error) {
-			backendConfig, clientErr := s.opts.BackendConfigFromParams(msg.Parameters, proxyConn)
-			if clientErr != nil {
-				var codeErr *CodeError
-				if !errors.As(clientErr, &codeErr) {
-					codeErr = &CodeError{
-						code: CodeParamsRoutingFailed,
-						err:  errors.Errorf("rejected by BackendConfigFromParams: %v", clientErr),
-					}
-				}
-				return nil, codeErr
-			}
-
 			// We should be able to remove this when the all clients switch to
 			// backend dialer.
 			if s.opts.ModifyRequestParams != nil {
@@ -161,6 +169,11 @@ func (s *Server) Proxy(proxyConn *Conn) error {
 
 			crdbConn, err := BackendDial(msg, backendConfig.OutgoingAddress, backendConfig.TLSConf)
 			if err != nil {
+				if codeErr := (*CodeError)(nil); errors.As(err, &codeErr) {
+					sendErrToClient(conn, codeErr.code, codeErr.Error())
+				} else {
+					sendErrToClient(conn, CodeBackendDisconnected, err.Error())
+				}
 				return nil, err
 			}
 
@@ -188,6 +201,19 @@ func (s *Server) Proxy(proxyConn *Conn) error {
 	}
 	defer func() { _ = crdbConn.Close() }()
 
+	if err := authenticate(conn, crdbConn); err != nil {
+		s.metrics.AuthFailedCount.Inc(1)
+		var codeErr *CodeError
+		if !errors.As(err, &codeErr) {
+			codeErr = &CodeError{
+				code: CodeParamsRoutingFailed,
+				err:  errors.Errorf("unrecognized auth failure"),
+			}
+		}
+		sendErrToClient(conn, codeErr.code, codeErr.Error())
+		return codeErr
+	}
+
 	s.metrics.SuccessfulConnCount.Inc(1)
 
 	// These channels are buffered because we'll only consume one of them.
@@ -197,12 +223,7 @@ func (s *Server) Proxy(proxyConn *Conn) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if s.opts.BackendConfigFromParams != nil {
-		// Ignore the next error as we already did all checks in the BackendDialer
-		// so there shouldn't be any errors here.
-		// This is temporary until Spas moves processing of OnConnectionSuccess and
-		// KeepAliveLoop outside of the proxy.
-		backendConfig, _ := s.opts.BackendConfigFromParams(msg.Parameters, proxyConn)
+	if backendConfig != nil {
 		if backendConfig.OnConnectionSuccess != nil {
 			backendConfig.OnConnectionSuccess()
 		}
@@ -243,6 +264,7 @@ func (s *Server) Proxy(proxyConn *Conn) error {
 			return NewErrorf(CodeIdleDisconnect, "terminating connection due to idle timeout: %v", err)
 		} else {
 			s.metrics.BackendDisconnectCount.Inc(1)
+			sendErrToClient(conn, CodeBackendDisconnected, "copying from target server to client")
 			return NewErrorf(CodeBackendDisconnected, "copying from target server to client: %s", err)
 		}
 	case err := <-errOutgoing:

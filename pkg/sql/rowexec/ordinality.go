@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // ordinalityProcessor is the processor of the WITH ORDINALITY operator, which
@@ -59,15 +58,12 @@ func newOrdinalityProcessor(
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{o.input},
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
-				o.ConsumerClosed()
-				return nil
-			}},
+		},
 	); err != nil {
 		return nil, err
 	}
 
-	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(ctx, flowCtx) {
 		o.input = newInputStatCollector(o.input)
 		o.ExecStatsForTrace = o.execStatsForTrace
 	}
@@ -76,9 +72,9 @@ func newOrdinalityProcessor(
 }
 
 // Start is part of the RowSource interface.
-func (o *ordinalityProcessor) Start(ctx context.Context) context.Context {
+func (o *ordinalityProcessor) Start(ctx context.Context) {
+	ctx = o.StartInternal(ctx, ordinalityProcName)
 	o.input.Start(ctx)
-	return o.StartInternal(ctx, ordinalityProcName)
 }
 
 // Next is part of the RowSource interface.
@@ -106,12 +102,6 @@ func (o *ordinalityProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerM
 	}
 	return nil, o.DrainHelper()
 
-}
-
-// ConsumerClosed is part of the RowSource interface.
-func (o *ordinalityProcessor) ConsumerClosed() {
-	// The consumer is done, Next() will not be called again.
-	o.InternalClose()
 }
 
 // execStatsForTrace implements ProcessorBase.ExecStatsForTrace.

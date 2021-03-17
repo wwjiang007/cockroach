@@ -32,7 +32,7 @@ type Applier struct {
 	}
 }
 
-// MakeApplier constructs an Applier that executes against the given DB.
+// MakeApplier constructs an Applier that executes against the given DBs.
 func MakeApplier(dbs ...*kv.DB) *Applier {
 	a := &Applier{
 		dbs: dbs,
@@ -82,6 +82,9 @@ func applyOp(ctx context.Context, db *kv.DB, op *Operation) {
 		_, err := db.AdminChangeReplicas(ctx, o.Key, desc, o.Changes)
 		// TODO(dan): Save returned desc?
 		o.Result = resultError(ctx, err)
+	case *TransferLeaseOperation:
+		err := db.AdminTransferLease(ctx, o.Key, o.Target)
+		o.Result = resultError(ctx, err)
 	case *ClosureTxnOperation:
 		var savedTxn *kv.Txn
 		txnErr := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -122,6 +125,7 @@ func applyOp(ctx context.Context, db *kv.DB, op *Operation) {
 
 type clientI interface {
 	Get(context.Context, interface{}) (kv.KeyValue, error)
+	GetForUpdate(context.Context, interface{}) (kv.KeyValue, error)
 	Put(context.Context, interface{}, interface{}) error
 	Scan(context.Context, interface{}, interface{}, int64) ([]kv.KeyValue, error)
 	ScanForUpdate(context.Context, interface{}, interface{}, int64) ([]kv.KeyValue, error)
@@ -131,7 +135,11 @@ type clientI interface {
 func applyClientOp(ctx context.Context, db clientI, op *Operation) {
 	switch o := op.GetValue().(type) {
 	case *GetOperation:
-		kv, err := db.Get(ctx, o.Key)
+		fn := db.Get
+		if o.ForUpdate {
+			fn = db.GetForUpdate
+		}
+		kv, err := fn(ctx, o.Key)
 		if err != nil {
 			o.Result = resultError(ctx, err)
 		} else {
@@ -175,7 +183,11 @@ func applyBatchOp(
 	for i := range o.Ops {
 		switch subO := o.Ops[i].GetValue().(type) {
 		case *GetOperation:
-			b.Get(subO.Key)
+			if subO.ForUpdate {
+				b.GetForUpdate(subO.Key)
+			} else {
+				b.Get(subO.Key)
+			}
 		case *PutOperation:
 			b.Put(subO.Key, subO.Value)
 		case *ScanOperation:
@@ -259,7 +271,7 @@ func newGetReplicasFn(dbs ...*kv.DB) GetReplicasFn {
 	ctx := context.Background()
 	return func(key roachpb.Key) []roachpb.ReplicationTarget {
 		desc := getRangeDesc(ctx, key, dbs...)
-		replicas := desc.Replicas().All()
+		replicas := desc.Replicas().Descriptors()
 		targets := make([]roachpb.ReplicationTarget, len(replicas))
 		for i, replica := range replicas {
 			targets[i] = roachpb.ReplicationTarget{

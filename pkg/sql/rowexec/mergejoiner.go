@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -75,7 +74,7 @@ func newMergeJoiner(
 		trackMatchedRight: shouldEmitUnmatchedRow(rightSide, spec.Type) || spec.Type == descpb.RightSemiJoin,
 	}
 
-	if sp := tracing.SpanFromContext(flowCtx.EvalCtx.Ctx()); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
 		m.leftSource = newInputStatCollector(m.leftSource)
 		m.rightSource = newInputStatCollector(m.rightSource)
 		m.ExecStatsForTrace = m.execStatsForTrace
@@ -87,7 +86,7 @@ func newMergeJoiner(
 		post, output,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{leftSource, rightSource},
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				m.close()
 				return nil
 			},
@@ -115,11 +114,10 @@ func newMergeJoiner(
 }
 
 // Start is part of the RowSource interface.
-func (m *mergeJoiner) Start(ctx context.Context) context.Context {
-	m.streamMerger.start(ctx)
+func (m *mergeJoiner) Start(ctx context.Context) {
 	ctx = m.StartInternal(ctx, mergeJoinerProcName)
+	m.streamMerger.start(ctx)
 	m.cancelChecker = cancelchecker.NewCancelChecker(ctx)
-	return ctx
 }
 
 // Next is part of the Processor interface.
@@ -261,9 +259,8 @@ func (m *mergeJoiner) nextRow() (rowenc.EncDatumRow, *execinfrapb.ProducerMetada
 
 func (m *mergeJoiner) close() {
 	if m.InternalClose() {
-		ctx := m.Ctx
-		m.streamMerger.close(ctx)
-		m.MemMonitor.Stop(ctx)
+		m.streamMerger.close(m.Ctx)
+		m.MemMonitor.Stop(m.Ctx)
 	}
 }
 

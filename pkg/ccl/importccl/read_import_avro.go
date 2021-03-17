@@ -18,7 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -398,7 +398,7 @@ func newImportAvroPipeline(
 ) (importRowProducer, importRowConsumer, error) {
 	fieldIdxByName := make(map[string]int)
 	for idx, col := range avro.importContext.tableDesc.VisibleColumns() {
-		fieldIdxByName[col.Name] = idx
+		fieldIdxByName[col.GetName()] = idx
 	}
 
 	consumer := &avroConsumer{
@@ -454,7 +454,7 @@ var _ inputConverter = &avroInputReader{}
 
 func newAvroInputReader(
 	kvCh chan row.KVBatch,
-	tableDesc *tabledesc.Immutable,
+	tableDesc catalog.TableDescriptor,
 	avroOpts roachpb.AvroOptions,
 	walltime int64,
 	parallelism int,

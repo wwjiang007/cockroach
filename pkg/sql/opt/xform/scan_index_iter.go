@@ -88,12 +88,16 @@ func (it *scanIndexIter) Init(
 	filters memo.FiltersExpr,
 	rejectFlags indexRejectFlags,
 ) {
-	it.mem = mem
-	it.im = im
-	it.tabMeta = mem.Metadata().TableMeta(scanPrivate.Table)
-	it.scanPrivate = scanPrivate
-	it.filters = filters
-	it.rejectFlags = rejectFlags
+	// This initialization pattern ensures that fields are not unwittingly
+	// reused. Field reuse must be explicit.
+	*it = scanIndexIter{
+		mem:         mem,
+		im:          im,
+		tabMeta:     mem.Metadata().TableMeta(scanPrivate.Table),
+		scanPrivate: scanPrivate,
+		filters:     filters,
+		rejectFlags: rejectFlags,
+	}
 	it.filtersMutateChecker.Init(it.filters)
 }
 
@@ -160,6 +164,11 @@ func (it *scanIndexIter) SetOriginalFilters(filters memo.FiltersExpr) {
 // index, the filters are the remaining filters after proving partial index
 // implication (see partialidx.Implicator). Otherwise, the filters are the same
 // filters that were passed to Init.
+//
+// Note that the filters argument CANNOT be mutated in the callback function
+// because these filters are used internally by scanIndexIter for partial index
+// implication while iterating over indexes. In tests the filtersMutateChecker
+// will detect a callback that mutates filters and panic.
 type enumerateIndexFunc func(idx cat.Index, filters memo.FiltersExpr, indexCols opt.ColSet, isCovering bool)
 
 // ForEach calls the given callback function for every index of the Scan
@@ -209,7 +218,7 @@ func (it *scanIndexIter) ForEachStartingAfter(ord int, f enumerateIndexFunc) {
 			continue
 		}
 
-		pred, isPartialIndex := it.tabMeta.PartialIndexPredicates[ord]
+		pred, isPartialIndex := it.tabMeta.PartialIndexPredicate(ord)
 
 		// Skip over partial indexes if rejectPartialIndexes is set.
 		if it.hasRejectFlags(rejectPartialIndexes) && isPartialIndex {

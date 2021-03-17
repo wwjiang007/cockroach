@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -99,21 +100,11 @@ func TestPutS3(t *testing.T) {
 	})
 
 	t.Run("auth-specified", func(t *testing.T) {
-		testExportStore(t, fmt.Sprintf(
-			"s3://%s/%s?%s=%s&%s=%s",
-			bucket, "backup-test",
-			cloudimpl.AWSAccessKeyParam, url.QueryEscape(creds.AccessKeyID),
-			cloudimpl.AWSSecretParam, url.QueryEscape(creds.SecretAccessKey),
-		), false, user, nil, nil)
-		testListFiles(t,
-			fmt.Sprintf(
-				"s3://%s/%s?%s=%s&%s=%s",
-				bucket, "listing-test",
-				cloudimpl.AWSAccessKeyParam, url.QueryEscape(creds.AccessKeyID),
-				cloudimpl.AWSSecretParam, url.QueryEscape(creds.SecretAccessKey),
-			),
-			user, nil, nil,
+		uri := cloudimpl.S3URI(bucket, "backup-test",
+			&roachpb.ExternalStorage_S3{AccessKey: creds.AccessKeyID, Secret: creds.SecretAccessKey, Region: "us-east-1"},
 		)
+		testExportStore(t, uri, false, user, nil, nil)
+		testListFiles(t, uri, user, nil, nil)
 	})
 
 	// Tests that we can put an object with server side encryption specified.
@@ -292,4 +283,26 @@ func TestS3BucketDoesNotExist(t *testing.T) {
 	_, err = s.ReadFile(ctx, "")
 	require.Error(t, err, "")
 	require.True(t, errors.Is(err, cloudimpl.ErrFileDoesNotExist))
+}
+
+func TestAntagonisticS3Read(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Check if we can create aws session with implicit crendentials.
+	_, err := session.NewSession()
+	if err != nil {
+		skip.IgnoreLint(t, "No AWS credentials")
+	}
+	bucket := os.Getenv("AWS_S3_BUCKET")
+	if bucket == "" {
+		skip.IgnoreLint(t, "AWS_S3_BUCKET env var must be set")
+	}
+
+	s3file := fmt.Sprintf(
+		"s3://%s/%s?%s=%s", bucket, "antagonistic-read",
+		cloudimpl.AuthParam, cloudimpl.AuthParamImplicit)
+	conf, err := cloudimpl.ExternalStorageConfFromURI(s3file, security.RootUserName())
+	require.NoError(t, err)
+
+	testAntagonisticRead(t, conf)
 }

@@ -12,12 +12,13 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
@@ -44,7 +45,7 @@ type scanNode struct {
 	// Enforce this using NoCopy.
 	_ util.NoCopy
 
-	desc  *tabledesc.Immutable
+	desc  catalog.TableDescriptor
 	index *descpb.IndexDescriptor
 
 	// Set if an index was explicitly specified.
@@ -59,7 +60,7 @@ type scanNode struct {
 	// be gained (e.g. for tables with wide rows) by reading only certain
 	// columns from KV using point lookups instead of a single range lookup for
 	// the entire row.
-	cols []*descpb.ColumnDescriptor
+	cols []catalog.Column
 	// There is a 1-1 correspondence between cols and resultColumns.
 	resultColumns colinfo.ResultColumns
 
@@ -101,6 +102,13 @@ type scanNode struct {
 	// containsSystemColumns holds whether or not this scan is expected to
 	// produce any system columns.
 	containsSystemColumns bool
+
+	// localityOptimized is true if this scan is part of a locality optimized
+	// search strategy, which uses a limited UNION ALL operator to try to find a
+	// row on nodes in the gateway's region before fanning out to remote nodes. In
+	// order for this optimization to work, the DistSQL planner must create a
+	// local plan.
+	localityOptimized bool
 }
 
 // scanColumnsConfig controls the "schema" of a scan node.
@@ -114,6 +122,15 @@ type scanColumnsConfig struct {
 	// wantedColumns. Note that if addUnwantedAsHidden flag is set, the hidden
 	// columns are not included here.
 	wantedColumnsOrdinals []uint32
+
+	// virtualColumn maps the column ID of the virtual column (if it exists) to
+	// the column type actually stored in the index. For example, the inverted
+	// column of an inverted index has type bytes, even though the column
+	// descriptor matches the source column (Geometry, Geography, JSON or Array).
+	virtualColumn *struct {
+		colID tree.ColumnID
+		typ   *types.T
+	}
 
 	// When set, the columns that are not in the wantedColumns list are added to
 	// the list of columns as hidden columns.
@@ -193,7 +210,7 @@ func (n *scanNode) limitHint() int64 {
 func (n *scanNode) initTable(
 	ctx context.Context,
 	p *planner,
-	desc *tabledesc.Immutable,
+	desc catalog.TableDescriptor,
 	indexFlags *tree.IndexFlags,
 	colCfg scanColumnsConfig,
 ) error {
@@ -221,79 +238,59 @@ func (n *scanNode) initTable(
 func (n *scanNode) lookupSpecifiedIndex(indexFlags *tree.IndexFlags) error {
 	if indexFlags.Index != "" {
 		// Search index by name.
-		indexName := string(indexFlags.Index)
-		if indexName == n.desc.GetPrimaryIndex().Name {
-			n.specifiedIndex = n.desc.GetPrimaryIndex()
-		} else {
-			for i := range n.desc.GetPublicNonPrimaryIndexes() {
-				if indexName == n.desc.GetPublicNonPrimaryIndexes()[i].Name {
-					n.specifiedIndex = &n.desc.GetPublicNonPrimaryIndexes()[i]
-					break
-				}
-			}
-		}
-		if n.specifiedIndex == nil {
+		foundIndex, _ := n.desc.FindIndexWithName(string(indexFlags.Index))
+		if foundIndex == nil || !foundIndex.Public() {
 			return errors.Errorf("index %q not found", tree.ErrString(&indexFlags.Index))
 		}
+		n.specifiedIndex = foundIndex.IndexDesc()
 	} else if indexFlags.IndexID != 0 {
 		// Search index by ID.
-		if n.desc.GetPrimaryIndexID() == descpb.IndexID(indexFlags.IndexID) {
-			n.specifiedIndex = n.desc.GetPrimaryIndex()
-		} else {
-			for i := range n.desc.GetPublicNonPrimaryIndexes() {
-				if n.desc.GetPublicNonPrimaryIndexes()[i].ID == descpb.IndexID(indexFlags.IndexID) {
-					n.specifiedIndex = &n.desc.GetPublicNonPrimaryIndexes()[i]
-					break
-				}
-			}
-		}
-		if n.specifiedIndex == nil {
+		foundIndex, _ := n.desc.FindIndexWithID(descpb.IndexID(indexFlags.IndexID))
+		if foundIndex == nil || !foundIndex.Public() {
 			return errors.Errorf("index [%d] not found", indexFlags.IndexID)
 		}
+		n.specifiedIndex = foundIndex.IndexDesc()
 	}
 	return nil
 }
 
 // initColsForScan initializes cols according to desc and colCfg.
 func initColsForScan(
-	desc *tabledesc.Immutable, colCfg scanColumnsConfig,
-) (cols []*descpb.ColumnDescriptor, err error) {
+	desc catalog.TableDescriptor, colCfg scanColumnsConfig,
+) (cols []catalog.Column, err error) {
 	if colCfg.wantedColumns == nil {
 		return nil, errors.AssertionFailedf("unexpectedly wantedColumns is nil")
 	}
 
-	cols = make([]*descpb.ColumnDescriptor, 0, len(desc.ReadableColumns()))
+	cols = make([]catalog.Column, 0, len(desc.DeletableColumns()))
 	for _, wc := range colCfg.wantedColumns {
-		var c *descpb.ColumnDescriptor
-		var err error
-		if colinfo.IsColIDSystemColumn(descpb.ColumnID(wc)) {
-			// If the requested column is a system column, then retrieve the
-			// corresponding descriptor.
-			c, err = colinfo.GetSystemColumnDescriptorFromID(descpb.ColumnID(wc))
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			// Otherwise, collect the descriptors from the table's columns.
-			if id := descpb.ColumnID(wc); colCfg.visibility == execinfra.ScanVisibilityPublic {
-				c, err = desc.FindActiveColumnByID(id)
-			} else {
-				c, _, err = desc.FindReadableColumnByID(id)
-			}
-			if err != nil {
-				return cols, err
+		id := descpb.ColumnID(wc)
+		col, err := desc.FindColumnWithID(id)
+		if err != nil {
+			return cols, err
+		}
+		if !col.IsSystemColumn() {
+			if colCfg.visibility != execinfra.ScanVisibilityPublic {
+				col = desc.ReadableColumns()[col.Ordinal()]
+			} else if !col.Public() {
+				return cols, fmt.Errorf("column-id \"%d\" does not exist", id)
 			}
 		}
 
-		cols = append(cols, c)
+		// If this is a virtual column, create a new descriptor with the correct
+		// type.
+		if vc := colCfg.virtualColumn; vc != nil && vc.colID == wc && !vc.typ.Identical(col.GetType()) {
+			col = col.DeepCopy()
+			col.ColumnDesc().Type = vc.typ
+		}
+		cols = append(cols, col)
 	}
 
 	if colCfg.addUnwantedAsHidden {
-		for i := range desc.Columns {
-			c := &desc.Columns[i]
+		for _, c := range desc.PublicColumns() {
 			found := false
 			for _, wc := range colCfg.wantedColumns {
-				if descpb.ColumnID(wc) == c.ID {
+				if descpb.ColumnID(wc) == c.GetID() {
 					found = true
 					break
 				}
@@ -302,9 +299,9 @@ func initColsForScan(
 				// NB: we could amortize this allocation using a second slice,
 				// but addUnwantedAsHidden is only used by scrub, so doing so
 				// doesn't seem worth it.
-				col := *c
-				col.Hidden = true
-				cols = append(cols, &col)
+				col := c.DeepCopy()
+				col.ColumnDesc().Hidden = true
+				cols = append(cols, col)
 			}
 		}
 	}
@@ -315,7 +312,7 @@ func initColsForScan(
 // Initializes the column structures.
 func (n *scanNode) initDescDefaults(colCfg scanColumnsConfig) error {
 	n.colCfg = colCfg
-	n.index = n.desc.GetPrimaryIndex()
+	n.index = n.desc.GetPrimaryIndex().IndexDesc()
 
 	var err error
 	n.cols, err = initColsForScan(n.desc, n.colCfg)
@@ -324,6 +321,6 @@ func (n *scanNode) initDescDefaults(colCfg scanColumnsConfig) error {
 	}
 
 	// Set up the rest of the scanNode.
-	n.resultColumns = colinfo.ResultColumnsFromColDescPtrs(n.desc.GetID(), n.cols)
+	n.resultColumns = colinfo.ResultColumnsFromColumns(n.desc.GetID(), n.cols)
 	return nil
 }

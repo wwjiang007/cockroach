@@ -19,12 +19,10 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -266,7 +264,7 @@ func (f *cloudStorageSinkFile) Write(p []byte) (int, error) {
 // induction we have the required proof.
 //
 type cloudStorageSink struct {
-	nodeID            roachpb.NodeID
+	srcID             base.SQLInstanceID
 	sinkID            int64
 	targetMaxFileSize int64
 	settings          *cluster.Settings
@@ -301,7 +299,7 @@ var cloudStorageSinkIDAtomic int64
 func makeCloudStorageSink(
 	ctx context.Context,
 	baseURI string,
-	nodeID roachpb.NodeID,
+	srcID base.SQLInstanceID,
 	targetMaxFileSize int64,
 	settings *cluster.Settings,
 	opts map[string]string,
@@ -315,7 +313,7 @@ func makeCloudStorageSink(
 
 	sinkID := atomic.AddInt64(&cloudStorageSinkIDAtomic, 1)
 	s := &cloudStorageSink{
-		nodeID:            nodeID,
+		srcID:             srcID,
 		sinkID:            sinkID,
 		settings:          settings,
 		targetMaxFileSize: targetMaxFileSize,
@@ -372,10 +370,8 @@ func makeCloudStorageSink(
 	return s, nil
 }
 
-func (s *cloudStorageSink) getOrCreateFile(
-	topic string, schemaID descpb.DescriptorVersion,
-) *cloudStorageSinkFile {
-	key := cloudStorageSinkKey{topic, schemaID}
+func (s *cloudStorageSink) getOrCreateFile(topic TopicDescriptor) *cloudStorageSinkFile {
+	key := cloudStorageSinkKey{topic.GetName(), int64(topic.GetVersion())}
 	if item := s.files.Get(key); item != nil {
 		return item.(*cloudStorageSinkFile)
 	}
@@ -392,13 +388,13 @@ func (s *cloudStorageSink) getOrCreateFile(
 
 // EmitRow implements the Sink interface.
 func (s *cloudStorageSink) EmitRow(
-	ctx context.Context, table catalog.TableDescriptor, key, value []byte, updated hlc.Timestamp,
+	ctx context.Context, topic TopicDescriptor, key, value []byte, updated hlc.Timestamp,
 ) error {
 	if s.files == nil {
 		return errors.New(`cannot EmitRow on a closed sink`)
 	}
 
-	file := s.getOrCreateFile(table.GetName(), table.GetVersion())
+	file := s.getOrCreateFile(topic)
 
 	// TODO(dan): Memory monitoring for this
 	if _, err := file.Write(value); err != nil {
@@ -456,10 +452,10 @@ func (s *cloudStorageSink) EmitResolvedTimestamp(
 // schema 2 file, leading to a violation of our ordering guarantees (see comment
 // on cloudStorageSink)
 func (s *cloudStorageSink) flushTopicVersions(
-	ctx context.Context, topic string, maxVersionToFlush descpb.DescriptorVersion,
+	ctx context.Context, topic string, maxVersionToFlush int64,
 ) (err error) {
-	var toRemoveAlloc [2]descpb.DescriptorVersion // generally avoid allocating
-	toRemove := toRemoveAlloc[:0]                 // schemaIDs of flushed files
+	var toRemoveAlloc [2]int64    // generally avoid allocating
+	toRemove := toRemoveAlloc[:0] // schemaIDs of flushed files
 	gte := cloudStorageSinkKey{topic: topic}
 	lt := cloudStorageSinkKey{topic: topic, schemaID: maxVersionToFlush + 1}
 	s.files.AscendRange(gte, lt, func(i btree.Item) (wantMore bool) {
@@ -524,7 +520,7 @@ func (s *cloudStorageSink) flushFile(ctx context.Context, file *cloudStorageSink
 	// `%d.RESOLVED` files to lexicographically succeed data files that have the
 	// same timestamp. This works because ascii `-` < ascii '.'.
 	filename := fmt.Sprintf(`%s-%s-%d-%d-%08x-%s-%x%s`, s.dataFileTs,
-		s.jobSessionID, s.nodeID, s.sinkID, fileID, file.topic, file.schemaID, s.ext)
+		s.jobSessionID, s.srcID, s.sinkID, fileID, file.topic, file.schemaID, s.ext)
 	if s.prevFilename != "" && filename < s.prevFilename {
 		return errors.AssertionFailedf("error: detected a filename %s that lexically "+
 			"precedes a file emitted before: %s", filename, s.prevFilename)
@@ -541,7 +537,7 @@ func (s *cloudStorageSink) Close() error {
 
 type cloudStorageSinkKey struct {
 	topic    string
-	schemaID descpb.DescriptorVersion
+	schemaID int64
 }
 
 func (k cloudStorageSinkKey) Less(other btree.Item) bool {

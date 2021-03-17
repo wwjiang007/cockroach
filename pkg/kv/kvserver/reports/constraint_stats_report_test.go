@@ -809,8 +809,8 @@ func compileTestCase(tc baseReportTestCase) (compiledTestCase, error) {
 		storeDescs = append(storeDescs, sds...)
 	}
 	storeResolver := func(r *roachpb.RangeDescriptor) []roachpb.StoreDescriptor {
-		stores := make([]roachpb.StoreDescriptor, len(r.Replicas().Voters()))
-		for i, rep := range r.Replicas().Voters() {
+		stores := make([]roachpb.StoreDescriptor, len(r.Replicas().VoterDescriptors()))
+		for i, rep := range r.Replicas().VoterDescriptors() {
 			for _, desc := range storeDescs {
 				if rep.StoreID == desc.StoreID {
 					stores[i] = desc
@@ -863,7 +863,7 @@ func generateTableZone(t table, tableDesc descpb.TableDescriptor) (*zonepb.ZoneC
 		var err error
 		tableZone.SubzoneSpans, err = sql.GenerateSubzoneSpans(
 			nil, uuid.UUID{} /* clusterID */, keys.SystemSQLCodec,
-			tabledesc.NewImmutable(tableDesc), tableZone.Subzones, false /* hasNewSubzones */)
+			tabledesc.NewBuilder(&tableDesc).BuildImmutableTable(), tableZone.Subzones, false /* hasNewSubzones */)
 		if err != nil {
 			return nil, errors.Wrap(err, "error generating subzone spans")
 		}
@@ -1086,7 +1086,7 @@ func (b *systemConfigBuilder) addTableDesc(id int, tableDesc descpb.TableDescrip
 	}
 	// Use a bogus timestamp for the descriptor modification time.
 	ts := hlc.Timestamp{WallTime: 123}
-	descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(context.Background(), desc, ts)
+	descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(desc, ts)
 	var v roachpb.Value
 	if err := v.SetProto(desc); err != nil {
 		panic(err)

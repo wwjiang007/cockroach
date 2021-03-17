@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -142,24 +141,19 @@ func newWindower(
 	}
 	w.outputRow = make(rowenc.EncDatumRow, len(w.outputTypes))
 
-	st := flowCtx.Cfg.Settings
 	// Limit the memory use by creating a child monitor with a hard limit.
 	// windower will overflow to disk if this limit is not enough.
-	limit := flowCtx.Cfg.TestingKnobs.MemoryLimitBytes
-	if limit <= 0 {
-		limit = execinfra.SettingWorkMemBytes.Get(&st.SV)
-		if limit < memRequiredByWindower {
+	limit := execinfra.GetWorkMemLimit(flowCtx.Cfg)
+	if limit < memRequiredByWindower {
+		if !flowCtx.Cfg.TestingKnobs.ForceDiskSpill && flowCtx.Cfg.TestingKnobs.MemoryLimitBytes == 0 {
 			return nil, errors.Errorf(
 				"window functions require %d bytes of RAM but only %d are in the budget. "+
 					"Consider increasing sql.distsql.temp_storage.workmem setting",
 				memRequiredByWindower, limit)
 		}
-	} else {
-		if flowCtx.Cfg.TestingKnobs.ForceDiskSpill || limit < memRequiredByWindower {
-			// The limit is set very low by the tests, but the windower requires
-			// some amount of RAM, so we override the limit.
-			limit = memRequiredByWindower
-		}
+		// The limit is set very low by the tests, but the windower requires
+		// some amount of RAM, so we override the limit.
+		limit = memRequiredByWindower
 	}
 	limitedMon := mon.NewMonitorInheritWithLimit("windower-limited", limit, evalCtx.Mon)
 	limitedMon.Start(ctx, evalCtx.Mon, mon.BoundAccount{})
@@ -174,7 +168,7 @@ func newWindower(
 		output,
 		limitedMon,
 		execinfra.ProcStateOpts{InputsToDrain: []execinfra.RowSource{w.input},
-			TrailingMetaCallback: func(context.Context) []execinfrapb.ProducerMetadata {
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				w.close()
 				return nil
 			}},
@@ -182,7 +176,7 @@ func newWindower(
 		return nil, err
 	}
 
-	w.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.Cfg.DiskMonitor, "windower-disk")
+	w.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "windower-disk")
 	w.allRowsPartitioned = rowcontainer.NewHashDiskBackedRowContainer(
 		evalCtx, w.MemMonitor, w.diskMonitor, flowCtx.Cfg.TempStorage,
 	)
@@ -201,7 +195,7 @@ func newWindower(
 	// them to reuse the same shared memory account with the windower.
 	evalCtx.SingleDatumAggMemAccount = &w.acc
 
-	if sp := tracing.SpanFromContext(ctx); sp != nil && sp.IsVerbose() {
+	if execinfra.ShouldCollectStats(ctx, flowCtx) {
 		w.input = newInputStatCollector(w.input)
 		w.ExecStatsForTrace = w.execStatsForTrace
 	}
@@ -210,12 +204,11 @@ func newWindower(
 }
 
 // Start is part of the RowSource interface.
-func (w *windower) Start(ctx context.Context) context.Context {
-	w.input.Start(ctx)
+func (w *windower) Start(ctx context.Context) {
 	ctx = w.StartInternal(ctx, windowerProcName)
+	w.input.Start(ctx)
 	w.cancelChecker = cancelchecker.NewCancelChecker(ctx)
 	w.runningState = windowerAccumulating
-	return ctx
 }
 
 // Next is part of the RowSource interface.

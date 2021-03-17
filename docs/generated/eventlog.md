@@ -32,6 +32,25 @@ SQL-level events for individual tenants.
 Events in this category are logged to channel OPS.
 
 
+### `certs_reload`
+
+An event of type `certs_reload` is recorded when the TLS certificates are
+reloaded/rotated from disk.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Success` | Whether the operation completed without errors. | no |
+| `ErrorMessage` | If an error was encountered, the text of the error. | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+
 ### `node_decommissioned`
 
 An event of type `node_decommissioned` is recorded when a node is marked as
@@ -150,6 +169,123 @@ An event of type `set_cluster_setting` is recorded when a cluster setting is cha
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+
+## SQL Access Audit Events
+
+Events in this category are generated when a table has been
+marked as audited via `ALTER ... EXPERIMENTAL_AUDIT SET`.
+
+This feature is experimental.
+
+Note: these events are not written to `system.eventlog`, even
+when the cluster setting `system.eventlog.enabled` is set. They
+are only emitted via external logging.
+
+Events in this category are logged to channel SENSITIVE_ACCESS.
+
+
+### `admin_query`
+
+An event of type `admin_query` is recorded when a user with admin privileges (the user
+is directly or indirectly a member of the admin role) executes a query.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. | yes |
+| `User` | The user account that triggered the event. | yes |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `ExecMode` | How the statement was being executed (exec/prepare, etc.) | no |
+| `NumRows` | Number of rows returned. For mutation statements (INSERT, etc) that do not produce result rows, this field reports the number of rows affected. | no |
+| `SQLSTATE` | The SQLSTATE code for the error, if an error was encountered. Empty/omitted if no error. | no |
+| `ErrorText` | The text of the error if any. | yes |
+| `Age` | Age of the query in milliseconds. | no |
+| `NumRetries` | Number of retries, when the txn was reretried automatically by the server. | no |
+| `FullTableScan` | Whether the query contains a full table scan. | no |
+| `FullIndexScan` | Whether the query contains a full secondary index scan. | no |
+| `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
+
+### `sensitive_table_access`
+
+An event of type `sensitive_table_access` is recorded when an access is performed to
+a table marked as audited.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `TableName` | The name of the table being audited. | yes |
+| `AccessMode` | How the table was accessed (r=read / rw=read/write). | no |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. | yes |
+| `User` | The user account that triggered the event. | yes |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `ExecMode` | How the statement was being executed (exec/prepare, etc.) | no |
+| `NumRows` | Number of rows returned. For mutation statements (INSERT, etc) that do not produce result rows, this field reports the number of rows affected. | no |
+| `SQLSTATE` | The SQLSTATE code for the error, if an error was encountered. Empty/omitted if no error. | no |
+| `ErrorText` | The text of the error if any. | yes |
+| `Age` | Age of the query in milliseconds. | no |
+| `NumRetries` | Number of retries, when the txn was reretried automatically by the server. | no |
+| `FullTableScan` | Whether the query contains a full table scan. | no |
+| `FullIndexScan` | Whether the query contains a full secondary index scan. | no |
+| `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
+
+## SQL Execution Log
+
+Events in this category report executed queries.
+
+Note: these events are not written to `system.eventlog`, even
+when the cluster setting `system.eventlog.enabled` is set. They
+are only emitted via external logging.
+
+Events in this category are logged to channel SQL_EXEC.
+
+
+### `query_execute`
+
+An event of type `query_execute` is recorded when a query is executed,
+and the cluster setting `sql.trace.log_statement_execute` is set.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. | yes |
+| `User` | The user account that triggered the event. | yes |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `ExecMode` | How the statement was being executed (exec/prepare, etc.) | no |
+| `NumRows` | Number of rows returned. For mutation statements (INSERT, etc) that do not produce result rows, this field reports the number of rows affected. | no |
+| `SQLSTATE` | The SQLSTATE code for the error, if an error was encountered. Empty/omitted if no error. | no |
+| `ErrorText` | The text of the error if any. | yes |
+| `Age` | Age of the query in milliseconds. | no |
+| `NumRetries` | Number of retries, when the txn was reretried automatically by the server. | no |
+| `FullTableScan` | Whether the query contains a full table scan. | no |
+| `FullIndexScan` | Whether the query contains a full secondary index scan. | no |
+| `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 
 ## SQL Logical Schema Changes
 
@@ -163,6 +299,98 @@ in each tenant's own system.eventlog table.
 
 Events in this category are logged to channel SQL_SCHEMA.
 
+
+### `alter_database_add_region`
+
+An event of type `alter_database_add_region` is recorded when a region is added to a database.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `DatabaseName` | The name of the database. | yes |
+| `RegionName` | The region being added. | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. | yes |
+| `User` | The user account that triggered the event. | yes |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+
+### `alter_database_drop_region`
+
+AlterDatabaseAddRegion is recorded when a region is added to a database.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `DatabaseName` | The name of the database. | yes |
+| `RegionName` | The region being dropped. | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. | yes |
+| `User` | The user account that triggered the event. | yes |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+
+### `alter_database_primary_region`
+
+An event of type `alter_database_primary_region` is recorded when a primary region is added/modified.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `DatabaseName` | The name of the database. | yes |
+| `PrimaryRegionName` | The new primary region. | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. | yes |
+| `User` | The user account that triggered the event. | yes |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+
+### `alter_database_survival_goal`
+
+An event of type `alter_database_survival_goal` is recorded when the survival goal is modified.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `DatabaseName` | The name of the database. | yes |
+| `SurvivalGoal` | The new survival goal | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. | yes |
+| `User` | The user account that triggered the event. | yes |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `alter_index`
 
@@ -186,6 +414,7 @@ An event of type `alter_index` is recorded when an index is altered.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `alter_sequence`
 
@@ -207,6 +436,7 @@ An event of type `alter_sequence` is recorded when a sequence is altered.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `alter_table`
 
@@ -230,6 +460,7 @@ An event of type `alter_table` is recorded when a table is altered.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `alter_type`
 
@@ -251,6 +482,7 @@ EventAlterType is recorded when a user-defined type is altered.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `comment_on_column`
 
@@ -275,6 +507,7 @@ An event of type `comment_on_column` is recorded when a column is commented.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `comment_on_database`
 
@@ -298,6 +531,7 @@ CommentOnTable is recorded when a database is commented.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `comment_on_index`
 
@@ -322,6 +556,7 @@ An event of type `comment_on_index` is recorded when an index is commented.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `comment_on_table`
 
@@ -345,6 +580,7 @@ An event of type `comment_on_table` is recorded when a table is commented.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `convert_to_schema`
 
@@ -367,6 +603,7 @@ An event of type `convert_to_schema` is recorded when a database is converted to
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `create_database`
 
@@ -388,6 +625,7 @@ An event of type `create_database` is recorded when a database is created.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `create_index`
 
@@ -411,6 +649,7 @@ An event of type `create_index` is recorded when an index is created.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `create_schema`
 
@@ -433,6 +672,7 @@ An event of type `create_schema` is recorded when a schema is created.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `create_sequence`
 
@@ -455,6 +695,7 @@ An event of type `create_sequence` is recorded when a sequence is created.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `create_statistics`
 
@@ -480,6 +721,7 @@ Events of this type are only collected when the cluster setting
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `create_table`
 
@@ -502,6 +744,7 @@ An event of type `create_table` is recorded when a table is created.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `create_type`
 
@@ -524,6 +767,7 @@ An event of type `create_type` is recorded when a user-defined type is created.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `create_view`
 
@@ -547,6 +791,7 @@ An event of type `create_view` is recorded when a view is created.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `drop_database`
 
@@ -569,6 +814,7 @@ An event of type `drop_database` is recorded when a database is dropped.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `drop_index`
 
@@ -593,6 +839,7 @@ An event of type `drop_index` is recorded when an index is dropped.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `drop_schema`
 
@@ -614,6 +861,7 @@ An event of type `drop_schema` is recorded when a schema is dropped.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `drop_sequence`
 
@@ -635,6 +883,7 @@ An event of type `drop_sequence` is recorded when a sequence is dropped.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `drop_table`
 
@@ -657,6 +906,7 @@ An event of type `drop_table` is recorded when a table is dropped.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `drop_type`
 
@@ -678,6 +928,7 @@ An event of type `drop_type` is recorded when a user-defined type is dropped.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `drop_view`
 
@@ -700,6 +951,7 @@ An event of type `drop_view` is recorded when a view is dropped.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `finish_schema_change`
 
@@ -758,6 +1010,7 @@ An event of type `rename_database` is recorded when a database is renamed.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `rename_schema`
 
@@ -780,6 +1033,7 @@ An event of type `rename_schema` is recorded when a schema is renamed.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `rename_table`
 
@@ -802,6 +1056,7 @@ An event of type `rename_table` is recorded when a table, sequence or view is re
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `rename_type`
 
@@ -824,6 +1079,7 @@ An event of type `rename_type` is recorded when a user-defined type is renamed.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `reverse_schema_change`
 
@@ -847,6 +1103,30 @@ encounters a problem and is reversed.
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `MutationID` | The descriptor mutation that this schema change was processing. | no |
 
+### `set_schema`
+
+An event of type `set_schema` is recorded when a table, view, sequence or type's schema is changed.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `DescriptorName` | The old name of the affected descriptor. | yes |
+| `NewDescriptorName` | The new name of the affected descriptor. | yes |
+| `DescriptorType` | The descriptor type being changed (table, view, sequence, type). | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. | yes |
+| `User` | The user account that triggered the event. | yes |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+
 ### `truncate_table`
 
 An event of type `truncate_table` is recorded when a table is truncated.
@@ -867,6 +1147,7 @@ An event of type `truncate_table` is recorded when a table is truncated.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `unsafe_delete_descriptor`
 
@@ -896,6 +1177,7 @@ patch releases without advance notice.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `unsafe_delete_namespace_entry`
 
@@ -925,6 +1207,7 @@ patch releases without advance notice.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `unsafe_upsert_descriptor`
 
@@ -950,6 +1233,7 @@ using crdb_internal.unsafe_upsert_descriptor().
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `unsafe_upsert_namespace_entry`
 
@@ -981,6 +1265,7 @@ patch releases without advance notice.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ## SQL Privilege changes
 
@@ -1016,6 +1301,7 @@ An event of type `alter_database_owner` is recorded when a database's owner is c
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `alter_schema_owner`
 
@@ -1038,6 +1324,7 @@ An event of type `alter_schema_owner` is recorded when a schema's owner is chang
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `alter_table_owner`
 
@@ -1060,6 +1347,7 @@ An event of type `alter_table_owner` is recorded when the owner of a table, view
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `alter_type_owner`
 
@@ -1082,6 +1370,7 @@ An event of type `alter_type_owner` is recorded when the owner of a user-defiend
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `change_database_privilege`
 
@@ -1104,6 +1393,7 @@ added to / removed from a user for a database object.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 | `Grantee` | The user/role affected by the grant or revoke operation. | yes |
 | `GrantedPrivileges` | The privileges being granted to the grantee. | no |
 | `RevokedPrivileges` | The privileges being revoked from the grantee. | no |
@@ -1129,6 +1419,7 @@ removed from a user for a schema object.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 | `Grantee` | The user/role affected by the grant or revoke operation. | yes |
 | `GrantedPrivileges` | The privileges being granted to the grantee. | no |
 | `RevokedPrivileges` | The privileges being revoked from the grantee. | no |
@@ -1154,6 +1445,7 @@ from a user for a table, sequence or view object.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 | `Grantee` | The user/role affected by the grant or revoke operation. | yes |
 | `GrantedPrivileges` | The privileges being granted to the grantee. | no |
 | `RevokedPrivileges` | The privileges being revoked from the grantee. | no |
@@ -1179,9 +1471,267 @@ removed from a user for a type object.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 | `Grantee` | The user/role affected by the grant or revoke operation. | yes |
 | `GrantedPrivileges` | The privileges being granted to the grantee. | no |
 | `RevokedPrivileges` | The privileges being revoked from the grantee. | no |
+
+## SQL Session events
+
+Events in this category report SQL client connections
+and sessions.
+
+They are relative to a particular SQL tenant.
+In a multi-tenant setup, copies of these miscellaneous events are
+preserved in each tenant's own system.eventlog table.
+
+Events in this category are logged to channel SESSIONS.
+
+
+### `client_authentication_failed`
+
+An event of type `client_authentication_failed` is reported when a client session
+did not authenticate successfully.
+
+Events of this type are only emitted when the cluster setting
+`server.auth_log.sql_sessions.enabled` is set.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Reason` | The reason for the authentication failure. See below for possible values for type `AuthFailReason`. | no |
+| `Detail` | The detailed error for the authentication failure. | yes |
+| `Method` | The authentication method used. | no |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
+| `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
+| `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+| `Transport` | The connection type after transport negotiation. | no |
+| `User` | The username the session is for. This is the username passed by the client, after case-folding and Unicode normalization. | yes |
+
+### `client_authentication_info`
+
+An event of type `client_authentication_info` is reported for intermediate
+steps during the authentication process.
+
+Events of this type are only emitted when the cluster setting
+`server.auth_log.sql_sessions.enabled` is set.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Method` | The authentication method used, once known. | no |
+| `Info` | The authentication progress message. | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
+| `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
+| `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+| `Transport` | The connection type after transport negotiation. | no |
+| `User` | The username the session is for. This is the username passed by the client, after case-folding and Unicode normalization. | yes |
+
+### `client_authentication_ok`
+
+An event of type `client_authentication_ok` is reported when a client session
+was authenticated successfully.
+
+Events of this type are only emitted when the cluster setting
+`server.auth_log.sql_sessions.enabled` is set.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Method` | The authentication method used. | no |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
+| `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
+| `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+| `Transport` | The connection type after transport negotiation. | no |
+| `User` | The username the session is for. This is the username passed by the client, after case-folding and Unicode normalization. | yes |
+
+### `client_connection_end`
+
+An event of type `client_connection_end` is reported when a client connection
+is closed. This is reported even when authentication
+fails, and even for simple cancellation messages.
+
+Events of this type are only emitted when the cluster setting
+`server.auth_log.sql_connections.enabled` is set.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Duration` | The duration of the connection in nanoseconds. | no |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
+| `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
+| `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+
+### `client_connection_start`
+
+An event of type `client_connection_start` is reported when a client connection
+is established. This is reported even when authentication
+fails, and even for simple cancellation messages.
+
+Events of this type are only emitted when the cluster setting
+`server.auth_log.sql_connections.enabled` is set.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
+| `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
+| `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+
+### `client_session_end`
+
+An event of type `client_session_end` is reported when a client session
+is completed.
+
+Events of this type are only emitted when the cluster setting
+`server.auth_log.sql_sessions.enabled` is set.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Duration` | The duration of the connection in nanoseconds. | no |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `InstanceID` | The instance ID (not tenant ID) of the SQL server where the event was originated. | no |
+| `Network` | The network protocol for this connection: tcp4, tcp6, unix, etc. | no |
+| `RemoteAddress` | The remote address of the SQL client. Note that when using a proxy or other intermediate server, this field will contain the address of the intermediate server. | yes |
+| `Transport` | The connection type after transport negotiation. | no |
+| `User` | The username the session is for. This is the username passed by the client, after case-folding and Unicode normalization. | yes |
+
+## SQL Slow Query Log
+
+Events in this category report slow query execution.
+
+Note: these events are not written to `system.eventlog`, even
+when the cluster setting `system.eventlog.enabled` is set. They
+are only emitted via external logging.
+
+Events in this category are logged to channel SQL_PERF.
+
+
+### `slow_query`
+
+An event of type `slow_query` is recorded when a query triggers the "slow query" condition.
+
+As of this writing, the condition requires:
+- the cluster setting `sql.log.slow_query.latency_threshold`
+set to a non-zero value, AND
+- EITHER of the following conditions:
+- the actual age of the query exceeds the configured threshold; OR
+- the query performs a full table/index scan.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. | yes |
+| `User` | The user account that triggered the event. | yes |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `ExecMode` | How the statement was being executed (exec/prepare, etc.) | no |
+| `NumRows` | Number of rows returned. For mutation statements (INSERT, etc) that do not produce result rows, this field reports the number of rows affected. | no |
+| `SQLSTATE` | The SQLSTATE code for the error, if an error was encountered. Empty/omitted if no error. | no |
+| `ErrorText` | The text of the error if any. | yes |
+| `Age` | Age of the query in milliseconds. | no |
+| `NumRetries` | Number of retries, when the txn was reretried automatically by the server. | no |
+| `FullTableScan` | Whether the query contains a full table scan. | no |
+| `FullIndexScan` | Whether the query contains a full secondary index scan. | no |
+| `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
+
+## SQL Slow Query Log (Internal)
+
+Events in this category report slow query execution by
+internal executors, i.e. when CockroachDB internally issues
+SQL statements.
+
+Note: these events are not written to `system.eventlog`, even
+when the cluster setting `system.eventlog.enabled` is set. They
+are only emitted via external logging.
+
+Events in this category are logged to channel SQL_INTERNAL_PERF.
+
+
+### `slow_query_internal`
+
+An event of type `slow_query_internal` is recorded when a query triggers the "slow query" condition,
+and the cluster setting `sql.log.slow_query.internal_queries.enabled` is
+set.
+See the documentation for the event type `slow_query` for details about
+the "slow query" condition.
+
+
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. | yes |
+| `User` | The user account that triggered the event. | yes |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `ExecMode` | How the statement was being executed (exec/prepare, etc.) | no |
+| `NumRows` | Number of rows returned. For mutation statements (INSERT, etc) that do not produce result rows, this field reports the number of rows affected. | no |
+| `SQLSTATE` | The SQLSTATE code for the error, if an error was encountered. Empty/omitted if no error. | no |
+| `ErrorText` | The text of the error if any. | yes |
+| `Age` | Age of the query in milliseconds. | no |
+| `NumRetries` | Number of retries, when the txn was reretried automatically by the server. | no |
+| `FullTableScan` | Whether the query contains a full table scan. | no |
+| `FullIndexScan` | Whether the query contains a full secondary index scan. | no |
+| `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 
 ## SQL User and Role operations
 
@@ -1216,6 +1766,7 @@ An event of type `alter_role` is recorded when a role is altered.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `create_role`
 
@@ -1237,6 +1788,7 @@ An event of type `create_role` is recorded when a role is created.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ### `drop_role`
 
@@ -1258,6 +1810,7 @@ An event of type `drop_role` is recorded when a role is dropped.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 
 ## Zone config events
 
@@ -1292,6 +1845,7 @@ An event of type `remove_zone_config` is recorded when a zone config is removed.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 | `Target` | The target object of the zone config change. | yes |
 | `Config` | The applied zone config in YAML format. | yes |
 | `Options` | The SQL representation of the applied zone config options. | yes |
@@ -1313,8 +1867,32 @@ An event of type `set_zone_config` is recorded when a zone config is changed.
 | `User` | The user account that triggered the event. | yes |
 | `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
 | `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | yes |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
 | `Target` | The target object of the zone config change. | yes |
 | `Config` | The applied zone config in YAML format. | yes |
 | `Options` | The SQL representation of the applied zone config options. | yes |
+
+
+
+
+## Enumeration types
+
+### `AuthFailReason`
+
+AuthFailReason is the inventory of possible reasons for an
+authentication failure.
+
+
+| Value | Textual alias in code or documentation | Description |
+|--|--|
+| 0 | UNKNOWN | is reported when the reason is unknown. |
+| 1 | USER_RETRIEVAL_ERROR | occurs when there was an internal error accessing the principals. |
+| 2 | USER_NOT_FOUND | occurs when the principal is unknown. |
+| 3 | LOGIN_DISABLED | occurs when the user does not have LOGIN privileges. |
+| 4 | METHOD_NOT_FOUND | occurs when no HBA rule matches or the method does not exist. |
+| 5 | PRE_HOOK_ERROR | occurs when the authentication handshake encountered a protocol error. |
+| 6 | CREDENTIALS_INVALID | occurs when the client-provided credentials were invalid. |
+| 7 | CREDENTIALS_EXPIRED | occur when the credentials provided by the client are expired. |
+
 
 

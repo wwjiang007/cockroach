@@ -19,11 +19,13 @@ go_library(
         "//pkg/util/protoutil",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_pebble//:pebble",
     ],
 )
 
 go_test(
     name = "spanset_test",
+    size = "small",
     srcs = ["spanset_test.go"],
     embed = [":spanset"],
     deps = [

@@ -36,15 +36,15 @@ func init() {
 }
 
 func declareKeysClearRange(
-	desc *roachpb.RangeDescriptor,
+	rs ImmutableRangeState,
 	header roachpb.Header,
 	req roachpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
 ) {
-	DefaultDeclareKeys(desc, header, req, latchSpans, lockSpans)
+	DefaultDeclareKeys(rs, header, req, latchSpans, lockSpans)
 	// We look up the range descriptor key to check whether the span
 	// is equal to the entire range for fast stats updating.
-	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(desc.StartKey)})
+	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
 }
 
 // ClearRange wipes all MVCC versions of keys covered by the specified
@@ -82,23 +82,16 @@ func ClearRange(
 	cArgs.Stats.Subtract(statsDelta)
 
 	// If the total size of data to be cleared is less than
-	// clearRangeBytesThreshold, clear the individual values manually,
+	// clearRangeBytesThreshold, clear the individual values with an iterator,
 	// instead of using a range tombstone (inefficient for small ranges).
 	if total := statsDelta.Total(); total < ClearRangeBytesThreshold {
 		log.VEventf(ctx, 2, "delta=%d < threshold=%d; using non-range clear", total, ClearRangeBytesThreshold)
-		iter := readWriter.NewEngineIterator(storage.IterOptions{UpperBound: to})
-		valid, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: from})
-		for ; valid; valid, err = iter.NextEngineKey() {
-			var k storage.EngineKey
-			if k, err = iter.UnsafeEngineKey(); err != nil {
-				break
-			}
-			if err = readWriter.ClearEngineKey(k); err != nil {
-				return result.Result{}, err
-			}
-		}
-		iter.Close()
-		if err != nil {
+		iter := readWriter.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+			LowerBound: from,
+			UpperBound: to,
+		})
+		defer iter.Close()
+		if err = readWriter.ClearIterRange(iter, from, to); err != nil {
 			return result.Result{}, err
 		}
 		return pd, nil

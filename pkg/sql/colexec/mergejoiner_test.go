@@ -13,27 +13,25 @@ package colexec
 import (
 	"context"
 	"fmt"
-	"math"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecjoin"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/stretchr/testify/require"
 )
 
 func createSpecForMergeJoiner(tc *joinTestCase) *execinfrapb.ProcessorSpec {
@@ -102,229 +100,229 @@ func getMJTestCases() []*joinTestCase {
 			description:  "basic test",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}, {3}, {4}},
-			rightTuples:  tuples{{1}, {2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}, {3}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {2}, {3}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {2}, {3}, {4}},
+			expected:     colexectestutils.Tuples{{1}, {2}, {3}, {4}},
 		},
 		{
 			description:  "basic test, no out cols",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}, {3}, {4}},
-			rightTuples:  tuples{{1}, {2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}, {3}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {2}, {3}, {4}},
 			leftOutCols:  []uint32{},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{}, {}, {}, {}},
+			expected:     colexectestutils.Tuples{{}, {}, {}, {}},
 		},
 		{
 			description:  "basic test, out col on left",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}, {3}, {4}},
-			rightTuples:  tuples{{1}, {2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}, {3}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {2}, {3}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {2}, {3}, {4}},
+			expected:     colexectestutils.Tuples{{1}, {2}, {3}, {4}},
 		},
 		{
 			description:  "basic test, out col on right",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}, {3}, {4}},
-			rightTuples:  tuples{{1}, {2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}, {3}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {2}, {3}, {4}},
 			leftOutCols:  []uint32{},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {2}, {3}, {4}},
+			expected:     colexectestutils.Tuples{{1}, {2}, {3}, {4}},
 		},
 		{
 			description:  "basic test, L missing",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {3}, {4}},
-			rightTuples:  tuples{{1}, {2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {3}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {2}, {3}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {3}, {4}},
+			expected:     colexectestutils.Tuples{{1}, {3}, {4}},
 		},
 		{
 			description:  "basic test, R missing",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}, {3}, {4}},
-			rightTuples:  tuples{{1}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}, {3}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {3}, {4}},
 			leftOutCols:  []uint32{},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {3}, {4}},
+			expected:     colexectestutils.Tuples{{1}, {3}, {4}},
 		},
 		{
 			description:  "basic test, L duplicate",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {1}, {2}, {3}, {4}},
-			rightTuples:  tuples{{1}, {2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {1}, {2}, {3}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {2}, {3}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {1}, {2}, {3}, {4}},
+			expected:     colexectestutils.Tuples{{1}, {1}, {2}, {3}, {4}},
 		},
 		{
 			description:  "basic test, R duplicate",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}, {3}, {4}},
-			rightTuples:  tuples{{1}, {1}, {2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}, {3}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {1}, {2}, {3}, {4}},
 			leftOutCols:  []uint32{},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {1}, {2}, {3}, {4}},
+			expected:     colexectestutils.Tuples{{1}, {1}, {2}, {3}, {4}},
 		},
 		{
 			description:  "basic test, R duplicate 2",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}},
-			rightTuples:  tuples{{1}, {1}, {2}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}},
+			rightTuples:  colexectestutils.Tuples{{1}, {1}, {2}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {1}, {2}},
+			expected:     colexectestutils.Tuples{{1}, {1}, {2}},
 		},
 		{
 			description:  "basic test, L+R duplicates",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {1}, {2}, {3}, {4}},
-			rightTuples:  tuples{{1}, {1}, {2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {1}, {2}, {3}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {1}, {2}, {3}, {4}},
 			leftOutCols:  []uint32{},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {1}, {1}, {1}, {2}, {3}, {4}},
+			expected:     colexectestutils.Tuples{{1}, {1}, {1}, {1}, {2}, {3}, {4}},
 		},
 		{
 			description:  "basic test, L+R duplicate, multiple runs",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}, {2}, {2}, {3}, {4}},
-			rightTuples:  tuples{{1}, {1}, {2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}, {2}, {2}, {3}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {1}, {2}, {3}, {4}},
 			leftOutCols:  []uint32{},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {1}, {2}, {2}, {2}, {3}, {4}},
+			expected:     colexectestutils.Tuples{{1}, {1}, {2}, {2}, {2}, {3}, {4}},
 		},
 		{
 			description:  "cross product test",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {1}, {1}, {1}},
-			rightTuples:  tuples{{1}, {1}, {1}, {1}},
+			leftTuples:   colexectestutils.Tuples{{1}, {1}, {1}, {1}},
+			rightTuples:  colexectestutils.Tuples{{1}, {1}, {1}, {1}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}},
+			expected:     colexectestutils.Tuples{{1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}, {1}},
 		},
 		{
 			description:  "multi output column test",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
-			rightTuples:  tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, 10, 1, 11}, {2, 20, 2, 12}, {3, 30, 3, 13}, {4, 40, 4, 14}},
+			expected:     colexectestutils.Tuples{{1, 10, 1, 11}, {2, 20, 2, 12}, {3, 30, 3, 13}, {4, 40, 4, 14}},
 		},
 		{
 			description:  "multi output column test, test output coldata projection",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
-			rightTuples:  tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, 1}, {2, 2}, {3, 3}, {4, 4}},
+			expected:     colexectestutils.Tuples{{1, 1}, {2, 2}, {3, 3}, {4, 4}},
 		},
 		{
 			description:  "multi output column test, test output coldata projection",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
-			rightTuples:  tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{1},
 			rightOutCols: []uint32{1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{10, 11}, {20, 12}, {30, 13}, {40, 14}},
+			expected:     colexectestutils.Tuples{{10, 11}, {20, 12}, {30, 13}, {40, 14}},
 		},
 		{
 			description:  "multi output column test, L run",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {2, 20}, {2, 21}, {3, 30}, {4, 40}},
-			rightTuples:  tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {2, 20}, {2, 21}, {3, 30}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, 11}, {2, 12}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, 10, 1, 11}, {2, 20, 2, 12}, {2, 21, 2, 12}, {3, 30, 3, 13}, {4, 40, 4, 14}},
+			expected:     colexectestutils.Tuples{{1, 10, 1, 11}, {2, 20, 2, 12}, {2, 21, 2, 12}, {3, 30, 3, 13}, {4, 40, 4, 14}},
 		},
 		{
 			description:  "multi output column test, R run",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
-			rightTuples:  tuples{{1, 11}, {1, 111}, {2, 12}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, 11}, {1, 111}, {2, 12}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, 10, 1, 11}, {1, 10, 1, 111}, {2, 20, 2, 12}, {3, 30, 3, 13}, {4, 40, 4, 14}},
+			expected:     colexectestutils.Tuples{{1, 10, 1, 11}, {1, 10, 1, 111}, {2, 20, 2, 12}, {3, 30, 3, 13}, {4, 40, 4, 14}},
 		},
 		{
 			description:  "logic test",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{-1, -1}, {0, 4}, {2, 1}, {3, 4}, {5, 4}},
-			rightTuples:  tuples{{0, 5}, {1, 3}, {3, 2}, {4, 6}},
+			leftTuples:   colexectestutils.Tuples{{-1, -1}, {0, 4}, {2, 1}, {3, 4}, {5, 4}},
+			rightTuples:  colexectestutils.Tuples{{0, 5}, {1, 3}, {3, 2}, {4, 6}},
 			leftOutCols:  []uint32{1},
 			rightOutCols: []uint32{1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{4, 5}, {4, 2}},
+			expected:     colexectestutils.Tuples{{4, 5}, {4, 2}},
 		},
 		{
 			description:  "multi output column test, runs (to test saved output), reordered out columns",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {1, 10}, {1, 10}, {2, 20}, {3, 30}, {4, 40}},
-			rightTuples:  tuples{{1, 11}, {1, 11}, {2, 12}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {1, 10}, {1, 10}, {2, 20}, {3, 30}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, 11}, {1, 11}, {2, 12}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{1, 0},
 			rightOutCols: []uint32{1, 0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{10, 1, 11, 1},
 				{10, 1, 11, 1},
 				{10, 1, 11, 1},
@@ -340,13 +338,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "multi output column test, runs (to test saved output), reordered out columns that dont start at 0",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {1, 10}, {1, 10}, {2, 20}, {3, 30}, {4, 40}},
-			rightTuples:  tuples{{1, 11}, {1, 11}, {2, 12}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {1, 10}, {1, 10}, {2, 20}, {3, 30}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, 11}, {1, 11}, {2, 12}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{1, 0},
 			rightOutCols: []uint32{1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{10, 1, 11},
 				{10, 1, 11},
 				{10, 1, 11},
@@ -362,13 +360,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "equality column is correctly indexed",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{10, 1}, {10, 1}, {10, 1}, {20, 2}, {30, 3}, {40, 4}},
-			rightTuples:  tuples{{1, 11}, {1, 11}, {2, 12}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{10, 1}, {10, 1}, {10, 1}, {20, 2}, {30, 3}, {40, 4}},
+			rightTuples:  colexectestutils.Tuples{{1, 11}, {1, 11}, {2, 12}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{1, 0},
 			rightOutCols: []uint32{1},
 			leftEqCols:   []uint32{1},
 			rightEqCols:  []uint32{0},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1, 10, 11},
 				{1, 10, 11},
 				{1, 10, 11},
@@ -384,13 +382,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "multi column equality basic test",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
-			rightTuples:  tuples{{1, 10}, {2, 20}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {2, 20}, {3, 30}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, 10}, {2, 20}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1, 10, 1, 10},
 				{2, 20, 2, 20},
 			},
@@ -399,13 +397,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "multi column equality runs",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {1, 10}, {1, 10}, {2, 20}, {3, 30}, {4, 40}},
-			rightTuples:  tuples{{1, 10}, {1, 10}, {2, 20}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {1, 10}, {1, 10}, {2, 20}, {3, 30}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, 10}, {1, 10}, {2, 20}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1, 10, 1, 10},
 				{1, 10, 1, 10},
 				{1, 10, 1, 10},
@@ -419,13 +417,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "multi column non-consecutive equality cols",
 			leftTypes:    []*types.T{types.Int, types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int, types.Int},
-			leftTuples:   tuples{{1, 123, 1}, {1, 234, 10}},
-			rightTuples:  tuples{{1, 1, 345}, {1, 10, 456}},
+			leftTuples:   colexectestutils.Tuples{{1, 123, 1}, {1, 234, 10}},
+			rightTuples:  colexectestutils.Tuples{{1, 1, 345}, {1, 10, 456}},
 			leftOutCols:  []uint32{0, 2, 1},
 			rightOutCols: []uint32{0, 2, 1},
 			leftEqCols:   []uint32{0, 2},
 			rightEqCols:  []uint32{0, 1},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1, 1, 123, 1, 345, 1},
 				{1, 10, 234, 1, 456, 10},
 			},
@@ -434,13 +432,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "multi column equality: new batch ends run",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 1}, {1, 1}, {3, 3}, {4, 3}},
-			rightTuples:  tuples{{1, 1}, {1, 2}, {3, 3}, {3, 3}},
+			leftTuples:   colexectestutils.Tuples{{1, 1}, {1, 1}, {3, 3}, {4, 3}},
+			rightTuples:  colexectestutils.Tuples{{1, 1}, {1, 2}, {3, 3}, {3, 3}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1, 1, 1, 1},
 				{1, 1, 1, 1},
 				{3, 3, 3, 3},
@@ -451,13 +449,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "multi column equality: reordered eq columns",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 1}, {1, 1}, {3, 3}, {4, 3}},
-			rightTuples:  tuples{{1, 1}, {1, 2}, {3, 3}, {3, 3}},
+			leftTuples:   colexectestutils.Tuples{{1, 1}, {1, 1}, {3, 3}, {4, 3}},
+			rightTuples:  colexectestutils.Tuples{{1, 1}, {1, 2}, {3, 3}, {3, 3}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{1, 0},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1, 1, 1, 1},
 				{1, 1, 1, 1},
 				{3, 3, 3, 3},
@@ -468,13 +466,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "cross batch, distinct group",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 2}, {1, 2}, {1, 2}, {2, 2}},
-			rightTuples:  tuples{{1, 2}},
+			leftTuples:   colexectestutils.Tuples{{1, 2}, {1, 2}, {1, 2}, {2, 2}},
+			rightTuples:  colexectestutils.Tuples{{1, 2}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{1, 2, 1, 2},
 				{1, 2, 1, 2},
 				{1, 2, 1, 2},
@@ -484,13 +482,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "templating basic test",
 			leftTypes:    []*types.T{types.Bool, types.Int2, types.Float},
 			rightTypes:   []*types.T{types.Bool, types.Int2, types.Float},
-			leftTuples:   tuples{{true, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
-			rightTuples:  tuples{{true, int16(10), 1.2}, {false, int16(20), 2.2}, {true, int16(30), 3.9}},
+			leftTuples:   colexectestutils.Tuples{{true, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
+			rightTuples:  colexectestutils.Tuples{{true, int16(10), 1.2}, {false, int16(20), 2.2}, {true, int16(30), 3.9}},
 			leftOutCols:  []uint32{0, 1, 2},
 			rightOutCols: []uint32{0, 1, 2},
 			leftEqCols:   []uint32{0, 1, 2},
 			rightEqCols:  []uint32{0, 1, 2},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{true, 10, 1.2, true, 10, 1.2},
 			},
 		},
@@ -498,13 +496,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "templating cross product test",
 			leftTypes:    []*types.T{types.Bool, types.Int2, types.Float},
 			rightTypes:   []*types.T{types.Bool, types.Int2, types.Float},
-			leftTuples:   tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
-			rightTuples:  tuples{{false, int16(10), 1.2}, {true, int16(20), 2.3}, {true, int16(20), 2.4}, {true, int16(31), 3.9}},
+			leftTuples:   colexectestutils.Tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
+			rightTuples:  colexectestutils.Tuples{{false, int16(10), 1.2}, {true, int16(20), 2.3}, {true, int16(20), 2.4}, {true, int16(31), 3.9}},
 			leftOutCols:  []uint32{0, 1, 2},
 			rightOutCols: []uint32{0, 1, 2},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{false, 10, 1.2, false, 10, 1.2},
 				{true, 20, 2.2, true, 20, 2.3},
 				{true, 20, 2.2, true, 20, 2.4},
@@ -514,13 +512,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "templating reordered eq columns",
 			leftTypes:    []*types.T{types.Bool, types.Int2, types.Float},
 			rightTypes:   []*types.T{types.Bool, types.Int2, types.Float},
-			leftTuples:   tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
-			rightTuples:  tuples{{false, int16(10), 1.2}, {true, int16(20), 2.3}, {true, int16(20), 2.4}, {true, int16(31), 3.9}},
+			leftTuples:   colexectestutils.Tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
+			rightTuples:  colexectestutils.Tuples{{false, int16(10), 1.2}, {true, int16(20), 2.3}, {true, int16(20), 2.4}, {true, int16(31), 3.9}},
 			leftOutCols:  []uint32{0, 1, 2},
 			rightOutCols: []uint32{0, 1, 2},
 			leftEqCols:   []uint32{1, 0},
 			rightEqCols:  []uint32{1, 0},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{false, 10, 1.2, false, 10, 1.2},
 				{true, 20, 2.2, true, 20, 2.3},
 				{true, 20, 2.2, true, 20, 2.4},
@@ -530,13 +528,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "templating reordered eq columns non symmetrical",
 			leftTypes:    []*types.T{types.Bool, types.Int2, types.Float},
 			rightTypes:   []*types.T{types.Int2, types.Float, types.Bool},
-			leftTuples:   tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
-			rightTuples:  tuples{{int16(10), 1.2, false}, {int16(20), 2.2, true}, {int16(21), 2.2, true}, {int16(30), 3.2, false}},
+			leftTuples:   colexectestutils.Tuples{{false, int16(10), 1.2}, {true, int16(20), 2.2}, {true, int16(30), 3.2}},
+			rightTuples:  colexectestutils.Tuples{{int16(10), 1.2, false}, {int16(20), 2.2, true}, {int16(21), 2.2, true}, {int16(30), 3.2, false}},
 			leftOutCols:  []uint32{0, 1, 2},
 			rightOutCols: []uint32{0, 1, 2},
 			leftEqCols:   []uint32{2, 0},
 			rightEqCols:  []uint32{1, 2},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{false, 10, 1.2, 10, 1.2, false},
 				{true, 20, 2.2, 20, 2.2, true},
 				{true, 20, 2.2, 21, 2.2, true},
@@ -546,13 +544,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "null handling",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{nil}, {0}},
-			rightTuples:  tuples{{nil}, {0}},
+			leftTuples:   colexectestutils.Tuples{{nil}, {0}},
+			rightTuples:  colexectestutils.Tuples{{nil}, {0}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{0, 0},
 			},
 		},
@@ -560,13 +558,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "null handling multi column, nulls on left",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, 0}, {0, nil}},
-			rightTuples:  tuples{{nil, nil}, {0, 1}},
+			leftTuples:   colexectestutils.Tuples{{nil, 0}, {0, nil}},
+			rightTuples:  colexectestutils.Tuples{{nil, nil}, {0, 1}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{0, nil, 0, 1},
 			},
 		},
@@ -574,13 +572,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "null handling multi column, nulls on right",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, 0}, {0, 1}},
-			rightTuples:  tuples{{nil, nil}, {0, nil}},
+			leftTuples:   colexectestutils.Tuples{{nil, 0}, {0, 1}},
+			rightTuples:  colexectestutils.Tuples{{nil, nil}, {0, nil}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{0, 1, 0, nil},
 			},
 		},
@@ -588,13 +586,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "desc test",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{4}, {3}, {2}, {1}},
-			rightTuples:  tuples{{4}, {2}, {1}},
+			leftTuples:   colexectestutils.Tuples{{4}, {3}, {2}, {1}},
+			rightTuples:  colexectestutils.Tuples{{4}, {2}, {1}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{4, 4}, {2, 2}, {1, 1}},
+			expected:     colexectestutils.Tuples{{4, 4}, {2, 2}, {1, 1}},
 
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
@@ -603,13 +601,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "desc nulls test",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{4}, {3}, {nil}, {1}},
-			rightTuples:  tuples{{4}, {nil}, {2}, {1}},
+			leftTuples:   colexectestutils.Tuples{{4}, {3}, {nil}, {1}},
+			rightTuples:  colexectestutils.Tuples{{4}, {nil}, {2}, {1}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{4, 4}, {1, 1}},
+			expected:     colexectestutils.Tuples{{4, 4}, {1, 1}},
 
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
@@ -618,13 +616,13 @@ func getMJTestCases() []*joinTestCase {
 			description:  "desc nulls test end on 0",
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{9}, {9}, {8}, {0}, {nil}},
-			rightTuples:  tuples{{9}, {9}, {8}, {0}, {nil}},
+			leftTuples:   colexectestutils.Tuples{{9}, {9}, {8}, {0}, {nil}},
+			rightTuples:  colexectestutils.Tuples{{9}, {9}, {8}, {0}, {nil}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{9, 9}, {9, 9}, {9, 9}, {9, 9}, {8, 8}, {0, 0}},
+			expected:     colexectestutils.Tuples{{9, 9}, {9, 9}, {9, 9}, {9, 9}, {8, 8}, {0, 0}},
 
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
@@ -633,104 +631,104 @@ func getMJTestCases() []*joinTestCase {
 			description:  "non-equality columns with nulls",
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, nil}, {2, 2}, {2, 2}, {3, nil}, {4, nil}},
-			rightTuples:  tuples{{1, 1}, {2, nil}, {2, nil}, {3, nil}, {4, 4}, {4, 4}},
+			leftTuples:   colexectestutils.Tuples{{1, nil}, {2, 2}, {2, 2}, {3, nil}, {4, nil}},
+			rightTuples:  colexectestutils.Tuples{{1, 1}, {2, nil}, {2, nil}, {3, nil}, {4, 4}, {4, 4}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, nil, 1, 1}, {2, 2, 2, nil}, {2, 2, 2, nil}, {2, 2, 2, nil}, {2, 2, 2, nil}, {3, nil, 3, nil}, {4, nil, 4, 4}, {4, nil, 4, 4}},
+			expected:     colexectestutils.Tuples{{1, nil, 1, 1}, {2, 2, 2, nil}, {2, 2, 2, nil}, {2, 2, 2, nil}, {2, 2, 2, nil}, {3, nil, 3, nil}, {4, nil, 4, 4}, {4, nil, 4, 4}},
 		},
 		{
 			description:  "basic LEFT OUTER JOIN test, L and R exhausted at the same time",
 			joinType:     descpb.LeftOuterJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}, {3}, {4}, {4}},
-			rightTuples:  tuples{{0}, {2}, {3}, {4}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}, {3}, {4}, {4}},
+			rightTuples:  colexectestutils.Tuples{{0}, {2}, {3}, {4}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, nil}, {2, 2}, {3, 3}, {4, 4}, {4, 4}, {4, 4}, {4, 4}},
+			expected:     colexectestutils.Tuples{{1, nil}, {2, 2}, {3, 3}, {4, 4}, {4, 4}, {4, 4}, {4, 4}},
 		},
 		{
 			description:  "basic LEFT OUTER JOIN test, R exhausted first",
 			joinType:     descpb.LeftOuterJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {1}, {3}, {5}, {6}, {7}},
-			rightTuples:  tuples{{2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {1}, {3}, {5}, {6}, {7}},
+			rightTuples:  colexectestutils.Tuples{{2}, {3}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, nil}, {1, nil}, {3, 3}, {5, nil}, {6, nil}, {7, nil}},
+			expected:     colexectestutils.Tuples{{1, nil}, {1, nil}, {3, 3}, {5, nil}, {6, nil}, {7, nil}},
 		},
 		{
 			description:  "basic LEFT OUTER JOIN test, L exhausted first",
 			joinType:     descpb.LeftOuterJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{3}, {5}, {6}, {7}},
-			rightTuples:  tuples{{2}, {3}, {4}, {6}, {8}, {9}},
+			leftTuples:   colexectestutils.Tuples{{3}, {5}, {6}, {7}},
+			rightTuples:  colexectestutils.Tuples{{2}, {3}, {4}, {6}, {8}, {9}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{3, 3}, {5, nil}, {6, 6}, {7, nil}},
+			expected:     colexectestutils.Tuples{{3, 3}, {5, nil}, {6, 6}, {7, nil}},
 		},
 		{
 			description:  "multi output column LEFT OUTER JOIN test with nulls",
 			joinType:     descpb.LeftOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
-			rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, nil}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, 10, 1, nil}, {2, 20, nil, nil}, {3, nil, 3, 13}, {4, 40, 4, 14}},
+			expected:     colexectestutils.Tuples{{1, 10, 1, nil}, {2, 20, nil, nil}, {3, nil, 3, 13}, {4, 40, 4, 14}},
 		},
 		{
 			description:  "null in equality column LEFT OUTER JOIN",
 			joinType:     descpb.LeftOuterJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil}, {nil}, {1}, {3}},
-			rightTuples:  tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
+			leftTuples:   colexectestutils.Tuples{{nil}, {nil}, {1}, {3}},
+			rightTuples:  colexectestutils.Tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil, nil, nil}, {nil, nil, nil}, {1, 1, 1}, {3, 3, 3}},
+			expected:     colexectestutils.Tuples{{nil, nil, nil}, {nil, nil, nil}, {1, 1, 1}, {3, 3, 3}},
 		},
 		{
 			description:  "multi equality column LEFT OUTER JOIN test with nulls",
 			joinType:     descpb.LeftOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
-			rightTuples:  tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
+			leftTuples:   colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected:     tuples{{nil, nil, nil, nil}, {nil, 10, nil, nil}, {1, nil, nil, nil}, {1, 10, nil, nil}, {2, 20, 2, 20}, {4, 40, nil, nil}},
+			expected:     colexectestutils.Tuples{{nil, nil, nil, nil}, {nil, 10, nil, nil}, {1, nil, nil, nil}, {1, 10, nil, nil}, {2, 20, 2, 20}, {4, 40, nil, nil}},
 		},
 		{
 			description:  "multi equality column (long runs on left) LEFT OUTER JOIN test with nulls",
 			joinType:     descpb.LeftOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
-			rightTuples:  tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
+			leftTuples:   colexectestutils.Tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
+			rightTuples:  colexectestutils.Tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected:     tuples{{1, 9, nil, nil}, {1, 10, nil, nil}, {1, 10, nil, nil}, {1, 11, 1, 11}, {1, 11, 1, 11}, {2, 20, nil, nil}, {2, 20, nil, nil}, {2, 21, 2, 21}, {2, 22, nil, nil}, {2, 22, nil, nil}},
+			expected:     colexectestutils.Tuples{{1, 9, nil, nil}, {1, 10, nil, nil}, {1, 10, nil, nil}, {1, 11, 1, 11}, {1, 11, 1, 11}, {2, 20, nil, nil}, {2, 20, nil, nil}, {2, 21, 2, 21}, {2, 22, nil, nil}, {2, 22, nil, nil}},
 		},
 		{
 			description:     "3 equality column LEFT OUTER JOIN test with nulls DESC ordering",
@@ -739,13 +737,13 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
-			rightTuples:     tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
+			leftTuples:      colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			rightTuples:     colexectestutils.Tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
 			leftOutCols:     []uint32{0, 1, 2},
 			rightOutCols:    []uint32{0, 1, 2},
 			leftEqCols:      []uint32{0, 1, 2},
 			rightEqCols:     []uint32{0, 1, 2},
-			expected:        tuples{{2, 3, 1, nil, nil, nil}, {2, nil, 1, nil, nil, nil}, {nil, 1, 3, nil, nil, nil}},
+			expected:        colexectestutils.Tuples{{2, 3, 1, nil, nil, nil}, {2, nil, 1, nil, nil, nil}, {nil, 1, 3, nil, nil, nil}},
 		},
 		{
 			description:     "3 equality column LEFT OUTER JOIN test with nulls mixed ordering",
@@ -754,13 +752,13 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
-			rightTuples:     tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
+			leftTuples:      colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			rightTuples:     colexectestutils.Tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
 			leftOutCols:     []uint32{0, 1, 2},
 			rightOutCols:    []uint32{0, 1, 2},
 			leftEqCols:      []uint32{0, 1, 2},
 			rightEqCols:     []uint32{1, 2, 0},
-			expected:        tuples{{2, 3, 1, nil, nil, nil}, {2, nil, 1, nil, nil, nil}, {nil, 1, 3, nil, nil, nil}},
+			expected:        colexectestutils.Tuples{{2, 3, 1, nil, nil, nil}, {2, nil, 1, nil, nil, nil}, {nil, 1, 3, nil, nil, nil}},
 		},
 		{
 			description:     "single column DESC with nulls on the left LEFT OUTER JOIN",
@@ -769,104 +767,104 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
-			rightTuples:     tuples{{1}},
+			leftTuples:      colexectestutils.Tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
+			rightTuples:     colexectestutils.Tuples{{1}},
 			leftOutCols:     []uint32{0},
 			rightOutCols:    []uint32{0},
 			leftEqCols:      []uint32{0},
 			rightEqCols:     []uint32{0},
-			expected:        tuples{{1, 1}, {1, 1}, {1, 1}, {nil, nil}, {nil, nil}, {nil, nil}},
+			expected:        colexectestutils.Tuples{{1, 1}, {1, 1}, {1, 1}, {nil, nil}, {nil, nil}, {nil, nil}},
 		},
 		{
 			description:  "basic RIGHT OUTER JOIN test, L and R exhausted at the same time",
 			joinType:     descpb.RightOuterJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{-1}, {2}, {3}, {4}, {4}},
-			rightTuples:  tuples{{1}, {2}, {3}, {4}, {4}},
+			leftTuples:   colexectestutils.Tuples{{-1}, {2}, {3}, {4}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {2}, {3}, {4}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil, 1}, {2, 2}, {3, 3}, {4, 4}, {4, 4}, {4, 4}, {4, 4}},
+			expected:     colexectestutils.Tuples{{nil, 1}, {2, 2}, {3, 3}, {4, 4}, {4, 4}, {4, 4}, {4, 4}},
 		},
 		{
 			description:  "basic RIGHT OUTER JOIN test, R exhausted first",
 			joinType:     descpb.RightOuterJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {1}, {3}, {5}, {6}, {7}},
-			rightTuples:  tuples{{2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {1}, {3}, {5}, {6}, {7}},
+			rightTuples:  colexectestutils.Tuples{{2}, {3}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil, 2}, {3, 3}, {nil, 4}},
+			expected:     colexectestutils.Tuples{{nil, 2}, {3, 3}, {nil, 4}},
 		},
 		{
 			description:  "basic RIGHT OUTER JOIN test, L exhausted first",
 			joinType:     descpb.RightOuterJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{3}, {5}, {6}, {7}},
-			rightTuples:  tuples{{2}, {3}, {4}, {6}, {8}, {9}},
+			leftTuples:   colexectestutils.Tuples{{3}, {5}, {6}, {7}},
+			rightTuples:  colexectestutils.Tuples{{2}, {3}, {4}, {6}, {8}, {9}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil, 2}, {3, 3}, {nil, 4}, {6, 6}, {nil, 8}, {nil, 9}},
+			expected:     colexectestutils.Tuples{{nil, 2}, {3, 3}, {nil, 4}, {6, 6}, {nil, 8}, {nil, 9}},
 		},
 		{
 			description:  "multi output column RIGHT OUTER JOIN test with nulls",
 			joinType:     descpb.RightOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, nil}, {3, 13}, {4, 14}},
-			rightTuples:  tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
+			leftTuples:   colexectestutils.Tuples{{1, nil}, {3, 13}, {4, 14}},
+			rightTuples:  colexectestutils.Tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, nil, 1, 10}, {nil, nil, 2, 20}, {3, 13, 3, nil}, {4, 14, 4, 40}},
+			expected:     colexectestutils.Tuples{{1, nil, 1, 10}, {nil, nil, 2, 20}, {3, 13, 3, nil}, {4, 14, 4, 40}},
 		},
 		{
 			description:  "null in equality column RIGHT OUTER JOIN",
 			joinType:     descpb.RightOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
-			rightTuples:  tuples{{nil}, {nil}, {1}, {3}},
+			leftTuples:   colexectestutils.Tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
+			rightTuples:  colexectestutils.Tuples{{nil}, {nil}, {1}, {3}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil, nil, nil}, {nil, nil, nil}, {1, 1, 1}, {3, 3, 3}},
+			expected:     colexectestutils.Tuples{{nil, nil, nil}, {nil, nil, nil}, {1, 1, 1}, {3, 3, 3}},
 		},
 		{
 			description:  "multi equality column RIGHT OUTER JOIN test with nulls",
 			joinType:     descpb.RightOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
-			rightTuples:  tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
+			leftTuples:   colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
+			rightTuples:  colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected:     tuples{{nil, nil, nil, nil}, {nil, nil, nil, 10}, {nil, nil, 1, nil}, {nil, nil, 1, 10}, {2, 20, 2, 20}, {nil, nil, 4, 40}},
+			expected:     colexectestutils.Tuples{{nil, nil, nil, nil}, {nil, nil, nil, 10}, {nil, nil, 1, nil}, {nil, nil, 1, 10}, {2, 20, 2, 20}, {nil, nil, 4, 40}},
 		},
 		{
 			description:  "multi equality column (long runs on right) RIGHT OUTER JOIN test with nulls",
 			joinType:     descpb.RightOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
-			rightTuples:  tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
+			leftTuples:   colexectestutils.Tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
+			rightTuples:  colexectestutils.Tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected:     tuples{{nil, nil, 1, 9}, {nil, nil, 1, 10}, {nil, nil, 1, 10}, {1, 11, 1, 11}, {1, 11, 1, 11}, {nil, nil, 2, 20}, {nil, nil, 2, 20}, {2, 21, 2, 21}, {nil, nil, 2, 22}, {nil, nil, 2, 22}},
+			expected:     colexectestutils.Tuples{{nil, nil, 1, 9}, {nil, nil, 1, 10}, {nil, nil, 1, 10}, {1, 11, 1, 11}, {1, 11, 1, 11}, {nil, nil, 2, 20}, {nil, nil, 2, 20}, {2, 21, 2, 21}, {nil, nil, 2, 22}, {nil, nil, 2, 22}},
 		},
 		{
 			description:     "3 equality column RIGHT OUTER JOIN test with nulls DESC ordering",
@@ -875,13 +873,13 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
-			rightTuples:     tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			leftTuples:      colexectestutils.Tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
+			rightTuples:     colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
 			leftOutCols:     []uint32{0, 1, 2},
 			rightOutCols:    []uint32{0, 1, 2},
 			leftEqCols:      []uint32{0, 1, 2},
 			rightEqCols:     []uint32{0, 1, 2},
-			expected:        tuples{{nil, nil, nil, 2, 3, 1}, {nil, nil, nil, 2, nil, 1}, {nil, nil, nil, nil, 1, 3}},
+			expected:        colexectestutils.Tuples{{nil, nil, nil, 2, 3, 1}, {nil, nil, nil, 2, nil, 1}, {nil, nil, nil, nil, 1, 3}},
 		},
 		{
 			description:     "3 equality column RIGHT OUTER JOIN test with nulls mixed ordering",
@@ -890,13 +888,13 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
-			rightTuples:     tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			leftTuples:      colexectestutils.Tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
+			rightTuples:     colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
 			leftOutCols:     []uint32{0, 1, 2},
 			rightOutCols:    []uint32{0, 1, 2},
 			leftEqCols:      []uint32{0, 1, 2},
 			rightEqCols:     []uint32{1, 2, 0},
-			expected:        tuples{{nil, nil, nil, 2, 3, 1}, {nil, nil, nil, 2, nil, 1}, {nil, nil, nil, nil, 1, 3}},
+			expected:        colexectestutils.Tuples{{nil, nil, nil, 2, 3, 1}, {nil, nil, nil, 2, nil, 1}, {nil, nil, nil, nil, 1, 3}},
 		},
 		{
 			description:     "single column DESC with nulls on the right RIGHT OUTER JOIN",
@@ -905,104 +903,104 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{1}},
-			rightTuples:     tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
+			leftTuples:      colexectestutils.Tuples{{1}},
+			rightTuples:     colexectestutils.Tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
 			leftOutCols:     []uint32{0},
 			rightOutCols:    []uint32{0},
 			leftEqCols:      []uint32{0},
 			rightEqCols:     []uint32{0},
-			expected:        tuples{{1, 1}, {1, 1}, {1, 1}, {nil, nil}, {nil, nil}, {nil, nil}},
+			expected:        colexectestutils.Tuples{{1, 1}, {1, 1}, {1, 1}, {nil, nil}, {nil, nil}, {nil, nil}},
 		},
 		{
 			description:  "basic FULL OUTER JOIN test, L and R exhausted at the same time",
 			joinType:     descpb.FullOuterJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{-1}, {2}, {3}, {4}, {4}},
-			rightTuples:  tuples{{1}, {2}, {3}, {4}, {4}},
+			leftTuples:   colexectestutils.Tuples{{-1}, {2}, {3}, {4}, {4}},
+			rightTuples:  colexectestutils.Tuples{{1}, {2}, {3}, {4}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{-1, nil}, {nil, 1}, {2, 2}, {3, 3}, {4, 4}, {4, 4}, {4, 4}, {4, 4}},
+			expected:     colexectestutils.Tuples{{-1, nil}, {nil, 1}, {2, 2}, {3, 3}, {4, 4}, {4, 4}, {4, 4}, {4, 4}},
 		},
 		{
 			description:  "basic FULL OUTER JOIN test, R exhausted first",
 			joinType:     descpb.FullOuterJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {1}, {3}, {5}, {6}, {7}},
-			rightTuples:  tuples{{2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {1}, {3}, {5}, {6}, {7}},
+			rightTuples:  colexectestutils.Tuples{{2}, {3}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, nil}, {1, nil}, {nil, 2}, {3, 3}, {nil, 4}, {5, nil}, {6, nil}, {7, nil}},
+			expected:     colexectestutils.Tuples{{1, nil}, {1, nil}, {nil, 2}, {3, 3}, {nil, 4}, {5, nil}, {6, nil}, {7, nil}},
 		},
 		{
 			description:  "basic FULL OUTER JOIN test, L exhausted first",
 			joinType:     descpb.FullOuterJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{3}, {5}, {6}, {7}},
-			rightTuples:  tuples{{2}, {3}, {4}, {6}, {8}, {9}},
+			leftTuples:   colexectestutils.Tuples{{3}, {5}, {6}, {7}},
+			rightTuples:  colexectestutils.Tuples{{2}, {3}, {4}, {6}, {8}, {9}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil, 2}, {3, 3}, {nil, 4}, {5, nil}, {6, 6}, {7, nil}, {nil, 8}, {nil, 9}},
+			expected:     colexectestutils.Tuples{{nil, 2}, {3, 3}, {nil, 4}, {5, nil}, {6, 6}, {7, nil}, {nil, 8}, {nil, 9}},
 		},
 		{
 			description:  "multi output column FULL OUTER JOIN test with nulls",
 			joinType:     descpb.FullOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, nil}, {3, 13}, {4, 14}},
-			rightTuples:  tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
+			leftTuples:   colexectestutils.Tuples{{1, nil}, {3, 13}, {4, 14}},
+			rightTuples:  colexectestutils.Tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, nil, 1, 10}, {nil, nil, 2, 20}, {3, 13, 3, nil}, {4, 14, 4, 40}},
+			expected:     colexectestutils.Tuples{{1, nil, 1, 10}, {nil, nil, 2, 20}, {3, 13, 3, nil}, {4, 14, 4, 40}},
 		},
 		{
 			description:  "null in equality column FULL OUTER JOIN",
 			joinType:     descpb.FullOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
-			rightTuples:  tuples{{nil}, {nil}, {1}, {3}},
+			leftTuples:   colexectestutils.Tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
+			rightTuples:  colexectestutils.Tuples{{nil}, {nil}, {1}, {3}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil, 1, nil}, {nil, nil, nil}, {nil, nil, nil}, {1, 1, 1}, {2, 2, nil}, {3, 3, 3}},
+			expected:     colexectestutils.Tuples{{nil, 1, nil}, {nil, nil, nil}, {nil, nil, nil}, {1, 1, 1}, {2, 2, nil}, {3, 3, 3}},
 		},
 		{
 			description:  "multi equality column FULL OUTER JOIN test with nulls",
 			joinType:     descpb.FullOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
-			rightTuples:  tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
+			leftTuples:   colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
+			rightTuples:  colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected:     tuples{{nil, nil, nil, nil}, {nil, nil, nil, nil}, {nil, 10, nil, nil}, {nil, nil, nil, 10}, {1, nil, nil, nil}, {1, nil, nil, nil}, {nil, nil, 1, nil}, {nil, nil, 1, 10}, {2, 20, 2, 20}, {3, 30, nil, nil}, {nil, nil, 4, 40}},
+			expected:     colexectestutils.Tuples{{nil, nil, nil, nil}, {nil, nil, nil, nil}, {nil, 10, nil, nil}, {nil, nil, nil, 10}, {1, nil, nil, nil}, {1, nil, nil, nil}, {nil, nil, 1, nil}, {nil, nil, 1, 10}, {2, 20, 2, 20}, {3, 30, nil, nil}, {nil, nil, 4, 40}},
 		},
 		{
 			description:  "multi equality column (long runs on right) FULL OUTER JOIN test with nulls",
 			joinType:     descpb.FullOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
-			rightTuples:  tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
+			leftTuples:   colexectestutils.Tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
+			rightTuples:  colexectestutils.Tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{0, 1},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected:     tuples{{1, 8, nil, nil}, {nil, nil, 1, 9}, {nil, nil, 1, 10}, {nil, nil, 1, 10}, {1, 11, 1, 11}, {1, 11, 1, 11}, {nil, nil, 2, 20}, {nil, nil, 2, 20}, {2, 21, 2, 21}, {nil, nil, 2, 22}, {nil, nil, 2, 22}, {2, 23, nil, nil}},
+			expected:     colexectestutils.Tuples{{1, 8, nil, nil}, {nil, nil, 1, 9}, {nil, nil, 1, 10}, {nil, nil, 1, 10}, {1, 11, 1, 11}, {1, 11, 1, 11}, {nil, nil, 2, 20}, {nil, nil, 2, 20}, {2, 21, 2, 21}, {nil, nil, 2, 22}, {nil, nil, 2, 22}, {2, 23, nil, nil}},
 		},
 		{
 			description:     "3 equality column FULL OUTER JOIN test with nulls DESC ordering",
@@ -1011,13 +1009,13 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
-			rightTuples:     tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			leftTuples:      colexectestutils.Tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
+			rightTuples:     colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
 			leftOutCols:     []uint32{0, 1, 2},
 			rightOutCols:    []uint32{0, 1, 2},
 			leftEqCols:      []uint32{0, 1, 2},
 			rightEqCols:     []uint32{0, 1, 2},
-			expected:        tuples{{4, 3, 3, nil, nil, nil}, {nil, nil, nil, 2, 3, 1}, {nil, nil, nil, 2, nil, 1}, {nil, 2, nil, nil, nil, nil}, {nil, 1, 3, nil, nil, nil}, {nil, nil, nil, nil, 1, 3}},
+			expected:        colexectestutils.Tuples{{4, 3, 3, nil, nil, nil}, {nil, nil, nil, 2, 3, 1}, {nil, nil, nil, 2, nil, 1}, {nil, 2, nil, nil, nil, nil}, {nil, 1, 3, nil, nil, nil}, {nil, nil, nil, nil, 1, 3}},
 		},
 		{
 			description:     "3 equality column FULL OUTER JOIN test with nulls mixed ordering",
@@ -1026,13 +1024,13 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
-			rightTuples:     tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			leftTuples:      colexectestutils.Tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
+			rightTuples:     colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
 			leftOutCols:     []uint32{0, 1, 2},
 			rightOutCols:    []uint32{0, 1, 2},
 			leftEqCols:      []uint32{0, 1, 2},
 			rightEqCols:     []uint32{1, 2, 0},
-			expected:        tuples{{4, 3, 3, nil, nil, nil}, {nil, nil, nil, 2, 3, 1}, {nil, nil, nil, 2, nil, 1}, {nil, 2, nil, nil, nil, nil}, {nil, 1, 3, nil, nil, nil}, {nil, nil, nil, nil, 1, 3}},
+			expected:        colexectestutils.Tuples{{4, 3, 3, nil, nil, nil}, {nil, nil, nil, 2, 3, 1}, {nil, nil, nil, 2, nil, 1}, {nil, 2, nil, nil, nil, nil}, {nil, 1, 3, nil, nil, nil}, {nil, nil, nil, nil, 1, 3}},
 		},
 		{
 			description:     "single column DESC with nulls on the right FULL OUTER JOIN",
@@ -1041,117 +1039,117 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{1}},
-			rightTuples:     tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
+			leftTuples:      colexectestutils.Tuples{{1}},
+			rightTuples:     colexectestutils.Tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
 			leftOutCols:     []uint32{0},
 			rightOutCols:    []uint32{0},
 			leftEqCols:      []uint32{0},
 			rightEqCols:     []uint32{0},
-			expected:        tuples{{1, 1}, {1, 1}, {1, 1}, {nil, nil}, {nil, nil}, {nil, nil}},
+			expected:        colexectestutils.Tuples{{1, 1}, {1, 1}, {1, 1}, {nil, nil}, {nil, nil}, {nil, nil}},
 		},
 		{
 			description:  "FULL OUTER JOIN test with nulls and Bytes",
 			joinType:     descpb.FullOuterJoin,
 			leftTypes:    []*types.T{types.Int, types.Bytes},
 			rightTypes:   []*types.T{types.Int, types.Bytes},
-			leftTuples:   tuples{{nil, "0"}, {1, "10"}, {2, "20"}, {3, nil}, {4, "40"}},
-			rightTuples:  tuples{{1, nil}, {3, "13"}, {4, nil}},
+			leftTuples:   colexectestutils.Tuples{{nil, "0"}, {1, "10"}, {2, "20"}, {3, nil}, {4, "40"}},
+			rightTuples:  colexectestutils.Tuples{{1, nil}, {3, "13"}, {4, nil}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{1},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil, "0", nil}, {1, "10", nil}, {2, "20", nil}, {3, nil, "13"}, {4, "40", nil}},
+			expected:     colexectestutils.Tuples{{nil, "0", nil}, {1, "10", nil}, {2, "20", nil}, {3, nil, "13"}, {4, "40", nil}},
 		},
 		{
 			description:  "basic LEFT SEMI JOIN test, L and R exhausted at the same time",
 			joinType:     descpb.LeftSemiJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}, {3}, {4}, {4}},
-			rightTuples:  tuples{{-1}, {2}, {3}, {4}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}, {3}, {4}, {4}},
+			rightTuples:  colexectestutils.Tuples{{-1}, {2}, {3}, {4}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{2}, {3}, {4}, {4}},
+			expected:     colexectestutils.Tuples{{2}, {3}, {4}, {4}},
 		},
 		{
 			description:  "basic LEFT SEMI JOIN test, R exhausted first",
 			joinType:     descpb.LeftSemiJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {1}, {3}, {5}, {6}, {7}},
-			rightTuples:  tuples{{2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {1}, {3}, {5}, {6}, {7}},
+			rightTuples:  colexectestutils.Tuples{{2}, {3}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{3}},
+			expected:     colexectestutils.Tuples{{3}},
 		},
 		{
 			description:  "basic LEFT SEMI JOIN test, L exhausted first",
 			joinType:     descpb.LeftSemiJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{3}, {5}, {6}, {7}},
-			rightTuples:  tuples{{2}, {3}, {3}, {3}, {4}, {6}, {8}, {9}},
+			leftTuples:   colexectestutils.Tuples{{3}, {5}, {6}, {7}},
+			rightTuples:  colexectestutils.Tuples{{2}, {3}, {3}, {3}, {4}, {6}, {8}, {9}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{3}, {6}},
+			expected:     colexectestutils.Tuples{{3}, {6}},
 		},
 		{
 			description:  "multi output column LEFT SEMI JOIN test with nulls",
 			joinType:     descpb.LeftSemiJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
-			rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, nil}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1, 10}, {3, nil}, {4, 40}},
+			expected:     colexectestutils.Tuples{{1, 10}, {3, nil}, {4, 40}},
 		},
 		{
 			description:  "null in equality column LEFT SEMI JOIN",
 			joinType:     descpb.LeftSemiJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil}, {nil}, {1}, {3}},
-			rightTuples:  tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
+			leftTuples:   colexectestutils.Tuples{{nil}, {nil}, {1}, {3}},
+			rightTuples:  colexectestutils.Tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {3}},
+			expected:     colexectestutils.Tuples{{1}, {3}},
 		},
 		{
 			description:  "multi equality column LEFT SEMI JOIN test with nulls",
 			joinType:     descpb.LeftSemiJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
-			rightTuples:  tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
+			leftTuples:   colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected:     tuples{{2, 20}},
+			expected:     colexectestutils.Tuples{{2, 20}},
 		},
 		{
 			description:  "multi equality column (long runs on left) LEFT SEMI JOIN test with nulls",
 			joinType:     descpb.LeftSemiJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {1, 11}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
-			rightTuples:  tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
+			leftTuples:   colexectestutils.Tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {1, 11}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
+			rightTuples:  colexectestutils.Tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected:     tuples{{1, 11}, {1, 11}, {1, 11}, {2, 21}},
+			expected:     colexectestutils.Tuples{{1, 11}, {1, 11}, {1, 11}, {2, 21}},
 		},
 		{
 			description:     "3 equality column LEFT SEMI JOIN test with nulls DESC ordering",
@@ -1160,13 +1158,13 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
-			rightTuples:     tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
+			leftTuples:      colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			rightTuples:     colexectestutils.Tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
 			leftOutCols:     []uint32{0, 1, 2},
 			rightOutCols:    []uint32{},
 			leftEqCols:      []uint32{0, 1, 2},
 			rightEqCols:     []uint32{0, 1, 2},
-			expected:        tuples{},
+			expected:        colexectestutils.Tuples{},
 			// The expected output here is empty, so will it be during the all nulls
 			// injection, so we want to skip that.
 			skipAllNullsInjection: true,
@@ -1178,13 +1176,13 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
-			rightTuples:     tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
+			leftTuples:      colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			rightTuples:     colexectestutils.Tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
 			leftOutCols:     []uint32{0, 1, 2},
 			rightOutCols:    []uint32{},
 			leftEqCols:      []uint32{0, 1, 2},
 			rightEqCols:     []uint32{1, 2, 0},
-			expected:        tuples{},
+			expected:        colexectestutils.Tuples{},
 			// The expected output here is empty, so will it be during the all nulls
 			// injection, so we want to skip that.
 			skipAllNullsInjection: true,
@@ -1196,104 +1194,104 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
-			rightTuples:     tuples{{1}},
+			leftTuples:      colexectestutils.Tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
+			rightTuples:     colexectestutils.Tuples{{1}},
 			leftOutCols:     []uint32{0},
 			rightOutCols:    []uint32{},
 			leftEqCols:      []uint32{0},
 			rightEqCols:     []uint32{0},
-			expected:        tuples{{1}, {1}, {1}},
+			expected:        colexectestutils.Tuples{{1}, {1}, {1}},
 		},
 		{
 			description:  "basic LEFT ANTI JOIN test, L and R exhausted at the same time",
 			joinType:     descpb.LeftAntiJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {2}, {3}, {4}, {4}},
-			rightTuples:  tuples{{-1}, {2}, {4}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {2}, {3}, {4}, {4}},
+			rightTuples:  colexectestutils.Tuples{{-1}, {2}, {4}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {3}},
+			expected:     colexectestutils.Tuples{{1}, {3}},
 		},
 		{
 			description:  "basic LEFT ANTI JOIN test, R exhausted first",
 			joinType:     descpb.LeftAntiJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {1}, {3}, {5}, {6}, {7}},
-			rightTuples:  tuples{{2}, {3}, {4}},
+			leftTuples:   colexectestutils.Tuples{{1}, {1}, {3}, {5}, {6}, {7}},
+			rightTuples:  colexectestutils.Tuples{{2}, {3}, {4}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {1}, {5}, {6}, {7}},
+			expected:     colexectestutils.Tuples{{1}, {1}, {5}, {6}, {7}},
 		},
 		{
 			description:  "basic LEFT ANTI JOIN test, L exhausted first",
 			joinType:     descpb.LeftAntiJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{3}, {5}, {6}, {7}},
-			rightTuples:  tuples{{2}, {3}, {3}, {3}, {4}, {6}, {8}, {9}},
+			leftTuples:   colexectestutils.Tuples{{3}, {5}, {6}, {7}},
+			rightTuples:  colexectestutils.Tuples{{2}, {3}, {3}, {3}, {4}, {6}, {8}, {9}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{5}, {7}},
+			expected:     colexectestutils.Tuples{{5}, {7}},
 		},
 		{
 			description:  "multi output column LEFT ANTI JOIN test with nulls",
 			joinType:     descpb.LeftAntiJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
-			rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{1, 10}, {2, 20}, {3, nil}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, nil}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{2, 20}},
+			expected:     colexectestutils.Tuples{{2, 20}},
 		},
 		{
 			description:  "null in equality column LEFT ANTI JOIN",
 			joinType:     descpb.LeftAntiJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil}, {nil}, {1}, {3}},
-			rightTuples:  tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
+			leftTuples:   colexectestutils.Tuples{{nil}, {nil}, {1}, {3}},
+			rightTuples:  colexectestutils.Tuples{{nil, 1}, {1, 1}, {2, 2}, {3, 3}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil}, {nil}},
+			expected:     colexectestutils.Tuples{{nil}, {nil}},
 		},
 		{
 			description:  "multi equality column LEFT ANTI JOIN test with nulls",
 			joinType:     descpb.LeftAntiJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
-			rightTuples:  tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
+			leftTuples:   colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {2, 20}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, nil}, {2, 20}, {3, 30}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected:     tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {4, 40}},
+			expected:     colexectestutils.Tuples{{nil, nil}, {nil, 10}, {1, nil}, {1, 10}, {4, 40}},
 		},
 		{
 			description:  "multi equality column (long runs on left) LEFT ANTI JOIN test with nulls",
 			joinType:     descpb.LeftAntiJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {1, 11}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
-			rightTuples:  tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
+			leftTuples:   colexectestutils.Tuples{{1, 9}, {1, 10}, {1, 10}, {1, 11}, {1, 11}, {1, 11}, {2, 20}, {2, 20}, {2, 21}, {2, 22}, {2, 22}},
+			rightTuples:  colexectestutils.Tuples{{1, 8}, {1, 11}, {1, 11}, {2, 21}, {2, 23}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0, 1},
 			rightEqCols:  []uint32{0, 1},
-			expected:     tuples{{1, 9}, {1, 10}, {1, 10}, {2, 20}, {2, 20}, {2, 22}, {2, 22}},
+			expected:     colexectestutils.Tuples{{1, 9}, {1, 10}, {1, 10}, {2, 20}, {2, 20}, {2, 22}, {2, 22}},
 		},
 		{
 			description:     "3 equality column LEFT ANTI JOIN test with nulls DESC ordering",
@@ -1302,13 +1300,13 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
-			rightTuples:     tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
+			leftTuples:      colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			rightTuples:     colexectestutils.Tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
 			leftOutCols:     []uint32{0, 1, 2},
 			rightOutCols:    []uint32{},
 			leftEqCols:      []uint32{0, 1, 2},
 			rightEqCols:     []uint32{0, 1, 2},
-			expected:        tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			expected:        colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
 		},
 		{
 			description:     "3 equality column LEFT ANTI JOIN test with nulls mixed ordering",
@@ -1317,13 +1315,13 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int, types.Int, types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
-			rightTuples:     tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
+			leftTuples:      colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			rightTuples:     colexectestutils.Tuples{{4, 3, 3}, {nil, 2, nil}, {nil, 1, 3}},
 			leftOutCols:     []uint32{0, 1, 2},
 			rightOutCols:    []uint32{},
 			leftEqCols:      []uint32{0, 1, 2},
 			rightEqCols:     []uint32{1, 2, 0},
-			expected:        tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
+			expected:        colexectestutils.Tuples{{2, 3, 1}, {2, nil, 1}, {nil, 1, 3}},
 		},
 		{
 			description:     "single column DESC with nulls on the left LEFT ANTI JOIN",
@@ -1332,76 +1330,76 @@ func getMJTestCases() []*joinTestCase {
 			rightTypes:      []*types.T{types.Int},
 			leftDirections:  []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
 			rightDirections: []execinfrapb.Ordering_Column_Direction{execinfrapb.Ordering_Column_DESC},
-			leftTuples:      tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
-			rightTuples:     tuples{{1}, {nil}},
+			leftTuples:      colexectestutils.Tuples{{1}, {1}, {1}, {nil}, {nil}, {nil}},
+			rightTuples:     colexectestutils.Tuples{{1}, {nil}},
 			leftOutCols:     []uint32{0},
 			rightOutCols:    []uint32{},
 			leftEqCols:      []uint32{0},
 			rightEqCols:     []uint32{0},
-			expected:        tuples{{nil}, {nil}, {nil}},
+			expected:        colexectestutils.Tuples{{nil}, {nil}, {nil}},
 		},
 		{
 			description:  "INNER JOIN test with ON expression (filter only on left)",
 			joinType:     descpb.InnerJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, 0}, {1, 10}, {2, 20}, {3, nil}, {4, 40}},
-			rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{nil, 0}, {1, 10}, {2, 20}, {3, nil}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, nil}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
 			onExpr:       execinfrapb.Expression{Expr: "@1 < 4"},
-			expected:     tuples{{1, 10}, {3, nil}},
+			expected:     colexectestutils.Tuples{{1, 10}, {3, nil}},
 		},
 		{
 			description:  "INNER JOIN test with ON expression (filter only on right)",
 			joinType:     descpb.InnerJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, 0}, {1, 10}, {2, 20}, {3, nil}, {4, 40}},
-			rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{nil, 0}, {1, 10}, {2, 20}, {3, nil}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, nil}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
 			onExpr:       execinfrapb.Expression{Expr: "@4 < 14"},
-			expected:     tuples{{3, nil}},
+			expected:     colexectestutils.Tuples{{3, nil}},
 		},
 		{
 			description:  "INNER JOIN test with ON expression (filter on both)",
 			joinType:     descpb.InnerJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, 0}, {1, 10}, {2, 20}, {3, nil}, {4, 40}},
-			rightTuples:  tuples{{1, nil}, {3, 13}, {4, 14}},
+			leftTuples:   colexectestutils.Tuples{{nil, 0}, {1, 10}, {2, 20}, {3, nil}, {4, 40}},
+			rightTuples:  colexectestutils.Tuples{{1, nil}, {3, 13}, {4, 14}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
 			onExpr:       execinfrapb.Expression{Expr: "@2 + @3 < 50"},
-			expected:     tuples{{1, 10}, {4, 40}},
+			expected:     colexectestutils.Tuples{{1, 10}, {4, 40}},
 		},
 		{
 			description:  "INTERSECT ALL join basic",
 			joinType:     descpb.IntersectAllJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {1}, {2}, {2}, {3}},
-			rightTuples:  tuples{{1}, {2}, {2}, {3}, {3}, {3}},
+			leftTuples:   colexectestutils.Tuples{{1}, {1}, {2}, {2}, {3}},
+			rightTuples:  colexectestutils.Tuples{{1}, {2}, {2}, {3}, {3}, {3}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {2}, {2}, {3}},
+			expected:     colexectestutils.Tuples{{1}, {2}, {2}, {3}},
 		},
 		{
 			description:  "INTERSECT ALL join with mixed ordering with NULLs",
 			joinType:     descpb.IntersectAllJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{4, nil}, {4, 1}, {1, nil}, {1, 2}, {0, 2}, {0, 3}, {nil, 1}, {nil, 2}, {nil, 2}, {nil, 3}},
-			rightTuples:  tuples{{3, 2}, {2, 1}, {2, 2}, {2, 3}, {1, nil}, {1, 1}, {1, 1}, {0, 1}, {0, 2}, {nil, 2}},
+			leftTuples:   colexectestutils.Tuples{{4, nil}, {4, 1}, {1, nil}, {1, 2}, {0, 2}, {0, 3}, {nil, 1}, {nil, 2}, {nil, 2}, {nil, 3}},
+			rightTuples:  colexectestutils.Tuples{{3, 2}, {2, 1}, {2, 2}, {2, 3}, {1, nil}, {1, 1}, {1, 1}, {0, 1}, {0, 2}, {nil, 2}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0, 1},
@@ -1412,15 +1410,15 @@ func getMJTestCases() []*joinTestCase {
 			rightDirections: []execinfrapb.Ordering_Column_Direction{
 				execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC,
 			},
-			expected: tuples{{1, nil}, {0, 2}, {nil, 2}},
+			expected: colexectestutils.Tuples{{1, nil}, {0, 2}, {nil, 2}},
 		},
 		{
 			description:  "INTERSECT ALL join with mixed ordering with NULLs on the left",
 			joinType:     descpb.IntersectAllJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, 3}, {nil, nil}, {9, 6}, {9, 0}, {9, nil}},
-			rightTuples:  tuples{{0, 5}, {0, 4}, {8, 8}, {8, 6}, {9, 0}},
+			leftTuples:   colexectestutils.Tuples{{nil, 3}, {nil, nil}, {9, 6}, {9, 0}, {9, nil}},
+			rightTuples:  colexectestutils.Tuples{{0, 5}, {0, 4}, {8, 8}, {8, 6}, {9, 0}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0, 1},
@@ -1431,41 +1429,41 @@ func getMJTestCases() []*joinTestCase {
 			rightDirections: []execinfrapb.Ordering_Column_Direction{
 				execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC,
 			},
-			expected: tuples{{9, 0}},
+			expected: colexectestutils.Tuples{{9, 0}},
 		},
 		{
 			description:  "INTERSECT ALL join on booleans",
 			joinType:     descpb.IntersectAllJoin,
 			leftTypes:    []*types.T{types.Bool},
 			rightTypes:   []*types.T{types.Bool},
-			leftTuples:   tuples{{nil}, {nil}, {false}, {false}, {true}, {true}, {true}},
-			rightTuples:  tuples{{nil}, {false}, {false}, {false}, {false}, {true}},
+			leftTuples:   colexectestutils.Tuples{{nil}, {nil}, {false}, {false}, {true}, {true}, {true}},
+			rightTuples:  colexectestutils.Tuples{{nil}, {false}, {false}, {false}, {false}, {true}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil}, {false}, {false}, {true}},
+			expected:     colexectestutils.Tuples{{nil}, {false}, {false}, {true}},
 		},
 		{
 			description:  "EXCEPT ALL join basic",
 			joinType:     descpb.ExceptAllJoin,
 			leftTypes:    []*types.T{types.Int},
 			rightTypes:   []*types.T{types.Int},
-			leftTuples:   tuples{{1}, {1}, {2}, {2}, {2}, {3}, {3}},
-			rightTuples:  tuples{{1}, {2}, {3}, {3}, {3}},
+			leftTuples:   colexectestutils.Tuples{{1}, {1}, {2}, {2}, {2}, {3}, {3}},
+			rightTuples:  colexectestutils.Tuples{{1}, {2}, {3}, {3}, {3}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{1}, {2}, {2}},
+			expected:     colexectestutils.Tuples{{1}, {2}, {2}},
 		},
 		{
 			description:  "EXCEPT ALL join with mixed ordering with NULLs",
 			joinType:     descpb.ExceptAllJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{4, nil}, {4, 1}, {1, nil}, {1, 2}, {0, 2}, {0, 3}, {nil, 1}, {nil, 2}, {nil, 2}, {nil, 3}},
-			rightTuples:  tuples{{3, 2}, {2, 1}, {2, 2}, {2, 3}, {1, nil}, {1, 1}, {1, 1}, {0, 1}, {0, 2}, {nil, 2}},
+			leftTuples:   colexectestutils.Tuples{{4, nil}, {4, 1}, {1, nil}, {1, 2}, {0, 2}, {0, 3}, {nil, 1}, {nil, 2}, {nil, 2}, {nil, 3}},
+			rightTuples:  colexectestutils.Tuples{{3, 2}, {2, 1}, {2, 2}, {2, 3}, {1, nil}, {1, 1}, {1, 1}, {0, 1}, {0, 2}, {nil, 2}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0, 1},
@@ -1476,15 +1474,15 @@ func getMJTestCases() []*joinTestCase {
 			rightDirections: []execinfrapb.Ordering_Column_Direction{
 				execinfrapb.Ordering_Column_DESC, execinfrapb.Ordering_Column_ASC,
 			},
-			expected: tuples{{4, nil}, {4, 1}, {1, 2}, {0, 3}, {nil, 1}, {nil, 2}, {nil, 3}},
+			expected: colexectestutils.Tuples{{4, nil}, {4, 1}, {1, 2}, {0, 3}, {nil, 1}, {nil, 2}, {nil, 3}},
 		},
 		{
 			description:  "EXCEPT ALL join with mixed ordering with NULLs on the left",
 			joinType:     descpb.ExceptAllJoin,
 			leftTypes:    []*types.T{types.Int, types.Int},
 			rightTypes:   []*types.T{types.Int, types.Int},
-			leftTuples:   tuples{{nil, 3}, {nil, nil}, {9, 6}, {9, 0}, {9, nil}},
-			rightTuples:  tuples{{0, 5}, {0, 4}, {8, 8}, {8, 6}, {9, 0}},
+			leftTuples:   colexectestutils.Tuples{{nil, 3}, {nil, nil}, {9, 6}, {9, 0}, {9, nil}},
+			rightTuples:  colexectestutils.Tuples{{0, 5}, {0, 4}, {8, 8}, {8, 6}, {9, 0}},
 			leftOutCols:  []uint32{0, 1},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0, 1},
@@ -1495,39 +1493,39 @@ func getMJTestCases() []*joinTestCase {
 			rightDirections: []execinfrapb.Ordering_Column_Direction{
 				execinfrapb.Ordering_Column_ASC, execinfrapb.Ordering_Column_DESC,
 			},
-			expected: tuples{{nil, 3}, {nil, nil}, {9, 6}, {9, nil}},
+			expected: colexectestutils.Tuples{{nil, 3}, {nil, nil}, {9, 6}, {9, nil}},
 		},
 		{
 			description:  "EXCEPT ALL join on booleans",
 			joinType:     descpb.ExceptAllJoin,
 			leftTypes:    []*types.T{types.Bool},
 			rightTypes:   []*types.T{types.Bool},
-			leftTuples:   tuples{{nil}, {nil}, {false}, {false}, {true}, {true}, {true}},
-			rightTuples:  tuples{{nil}, {false}, {false}, {false}, {false}, {true}},
+			leftTuples:   colexectestutils.Tuples{{nil}, {nil}, {false}, {false}, {true}, {true}, {true}},
+			rightTuples:  colexectestutils.Tuples{{nil}, {false}, {false}, {false}, {false}, {true}},
 			leftOutCols:  []uint32{0},
 			rightOutCols: []uint32{},
 			leftEqCols:   []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected:     tuples{{nil}, {true}, {true}},
+			expected:     colexectestutils.Tuples{{nil}, {true}, {true}},
 		},
 		{
 			description: "FULL OUTER join on mixed-type equality columns",
 			joinType:    descpb.FullOuterJoin,
-			leftTuples: tuples{
+			leftTuples: colexectestutils.Tuples{
 				{8398534516657654136},
 				{932352552525192296},
 			},
 			leftTypes:   []*types.T{types.Int},
 			leftOutCols: []uint32{0},
 			leftEqCols:  []uint32{0},
-			rightTuples: tuples{
+			rightTuples: colexectestutils.Tuples{
 				{-20041},
 				{23918},
 			},
 			rightTypes:   []*types.T{types.Int2},
 			rightOutCols: []uint32{0},
 			rightEqCols:  []uint32{0},
-			expected: tuples{
+			expected: colexectestutils.Tuples{
 				{8398534516657654136, nil},
 				{932352552525192296, nil},
 				{nil, -20041},
@@ -1539,80 +1537,80 @@ func getMJTestCases() []*joinTestCase {
 			joinType:          descpb.LeftAntiJoin,
 			leftTypes:         []*types.T{types.Int},
 			rightTypes:        []*types.T{types.Int},
-			leftTuples:        tuples{{0}, {0}, {1}, {2}},
-			rightTuples:       tuples{{0}, {2}},
+			leftTuples:        colexectestutils.Tuples{{0}, {0}, {1}, {2}},
+			rightTuples:       colexectestutils.Tuples{{0}, {2}},
 			leftEqCols:        []uint32{0},
 			rightEqCols:       []uint32{0},
 			leftOutCols:       []uint32{0},
 			rightOutCols:      []uint32{},
 			rightEqColsAreKey: true,
-			expected:          tuples{{1}},
+			expected:          colexectestutils.Tuples{{1}},
 		},
 		{
 			description:       "INTERSECT ALL join when right eq cols are key",
 			joinType:          descpb.IntersectAllJoin,
 			leftTypes:         []*types.T{types.Int},
 			rightTypes:        []*types.T{types.Int},
-			leftTuples:        tuples{{1}, {1}, {2}, {2}, {2}, {4}, {4}},
-			rightTuples:       tuples{{1}, {2}, {3}},
+			leftTuples:        colexectestutils.Tuples{{1}, {1}, {2}, {2}, {2}, {4}, {4}},
+			rightTuples:       colexectestutils.Tuples{{1}, {2}, {3}},
 			leftEqCols:        []uint32{0},
 			rightEqCols:       []uint32{0},
 			leftOutCols:       []uint32{0},
 			rightEqColsAreKey: true,
-			expected:          tuples{{1}, {2}},
+			expected:          colexectestutils.Tuples{{1}, {2}},
 		},
 		{
 			description:       "EXCEPT ALL join when right eq cols are key",
 			joinType:          descpb.ExceptAllJoin,
 			leftTypes:         []*types.T{types.Int},
 			rightTypes:        []*types.T{types.Int},
-			leftTuples:        tuples{{1}, {1}, {2}, {2}, {2}, {3}, {3}},
-			rightTuples:       tuples{{1}, {2}, {3}},
+			leftTuples:        colexectestutils.Tuples{{1}, {1}, {2}, {2}, {2}, {3}, {3}},
+			rightTuples:       colexectestutils.Tuples{{1}, {2}, {3}},
 			leftEqCols:        []uint32{0},
 			rightEqCols:       []uint32{0},
 			leftOutCols:       []uint32{0},
 			rightEqColsAreKey: true,
-			expected:          tuples{{1}, {2}, {2}, {3}},
+			expected:          colexectestutils.Tuples{{1}, {2}, {2}, {3}},
 		},
 		{
 			description: "LEFT ANTI join with mixed types",
 			joinType:    descpb.LeftAntiJoin,
 			leftTypes:   []*types.T{types.Int, types.Int2},
 			rightTypes:  []*types.T{types.Int4, types.Int},
-			leftTuples:  tuples{{0, int16(0)}, {1, int16(0)}, {1, int16(1)}, {1, int16(2)}},
-			rightTuples: tuples{{int32(0), 0}, {int32(0), 1}, {int32(1), 1}},
+			leftTuples:  colexectestutils.Tuples{{0, int16(0)}, {1, int16(0)}, {1, int16(1)}, {1, int16(2)}},
+			rightTuples: colexectestutils.Tuples{{int32(0), 0}, {int32(0), 1}, {int32(1), 1}},
 			leftEqCols:  []uint32{0, 1},
 			rightEqCols: []uint32{0, 1},
 			leftOutCols: []uint32{0, 1},
-			expected:    tuples{{1, int16(0)}, {1, int16(2)}},
+			expected:    colexectestutils.Tuples{{1, int16(0)}, {1, int16(2)}},
 		},
 		{
 			description:       "LEFT SEMI join when eq cols are key on both sides",
 			joinType:          descpb.LeftSemiJoin,
 			leftTypes:         []*types.T{types.Int},
 			rightTypes:        []*types.T{types.Int},
-			leftTuples:        tuples{{1}, {2}, {4}},
-			rightTuples:       tuples{{0}, {2}, {3}, {4}},
+			leftTuples:        colexectestutils.Tuples{{1}, {2}, {4}},
+			rightTuples:       colexectestutils.Tuples{{0}, {2}, {3}, {4}},
 			leftEqCols:        []uint32{0},
 			rightEqCols:       []uint32{0},
 			leftOutCols:       []uint32{0},
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
-			expected:          tuples{{2}, {4}},
+			expected:          colexectestutils.Tuples{{2}, {4}},
 		},
 		{
 			description:       "LEFT ANTI join when eq cols are key on both sides",
 			joinType:          descpb.LeftAntiJoin,
 			leftTypes:         []*types.T{types.Int},
 			rightTypes:        []*types.T{types.Int},
-			leftTuples:        tuples{{1}, {2}, {4}},
-			rightTuples:       tuples{{0}, {2}, {3}, {4}},
+			leftTuples:        colexectestutils.Tuples{{1}, {2}, {4}},
+			rightTuples:       colexectestutils.Tuples{{0}, {2}, {3}, {4}},
 			leftEqCols:        []uint32{0},
 			rightEqCols:       []uint32{0},
 			leftOutCols:       []uint32{0},
 			leftEqColsAreKey:  true,
 			rightEqColsAreKey: true,
-			expected:          tuples{{1}},
+			expected:          colexectestutils.Tuples{{1}},
 		},
 	}
 	return withMirrors(mjTestCases)
@@ -1627,9 +1625,9 @@ func TestMergeJoiner(t *testing.T) {
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Cfg: &execinfra.ServerConfig{
-			Settings:    st,
-			DiskMonitor: testDiskMonitor,
+			Settings: st,
 		},
+		DiskMonitor: testDiskMonitor,
 	}
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
@@ -1640,39 +1638,39 @@ func TestMergeJoiner(t *testing.T) {
 	for _, tc := range getMJTestCases() {
 		for _, tc := range tc.mutateTypes() {
 			tc.init()
-			verifier := orderedVerifier
+			verifier := colexectestutils.OrderedVerifier
 			if tc.joinType == descpb.FullOuterJoin {
 				// FULL OUTER JOIN doesn't guarantee any ordering on its output
 				// (since it is ambiguous), so we're comparing the outputs as
 				// sets.
-				verifier = unorderedVerifier
+				verifier = colexectestutils.UnorderedVerifier
 			}
-			var runner testRunner
+			var runner colexectestutils.TestRunner
 			if tc.skipAllNullsInjection {
 				// We're omitting all nulls injection test. See comments for each such
 				// test case.
-				runner = runTestsWithoutAllNullsInjection
+				runner = colexectestutils.RunTestsWithoutAllNullsInjection
 			} else {
-				runner = runTestsWithTyps
+				runner = colexectestutils.RunTestsWithTyps
 			}
 			// We test all cases with the default memory limit (regular scenario) and a
 			// limit of 1 byte (to force the buffered groups to spill to disk).
-			for _, memoryLimit := range []int64{1, defaultMemoryLimit} {
+			for _, memoryLimit := range []int64{1, colexecop.DefaultMemoryLimit} {
 				log.Infof(context.Background(), "MemoryLimit=%s/%s", humanizeutil.IBytes(memoryLimit), tc.description)
-				runner(t, []tuples{tc.leftTuples, tc.rightTuples},
+				runner(t, testAllocator, []colexectestutils.Tuples{tc.leftTuples, tc.rightTuples},
 					[][]*types.T{tc.leftTypes, tc.rightTypes},
 					tc.expected, verifier,
-					func(input []colexecbase.Operator) (colexecbase.Operator, error) {
+					func(input []colexecop.Operator) (colexecop.Operator, error) {
 						spec := createSpecForMergeJoiner(tc)
-						args := &NewColOperatorArgs{
+						args := &colexecargs.NewColOperatorArgs{
 							Spec:                spec,
 							Inputs:              input,
 							StreamingMemAccount: testMemAcc,
 							DiskQueueCfg:        queueCfg,
-							FDSemaphore:         colexecbase.NewTestingSemaphore(mjFDLimit),
+							FDSemaphore:         colexecop.NewTestingSemaphore(mjFDLimit),
 						}
 						flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = memoryLimit
-						result, err := TestNewColOperator(ctx, flowCtx, args)
+						result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
 						if err != nil {
 							return nil, err
 						}
@@ -1716,11 +1714,11 @@ func TestFullOuterMergeJoinWithMaximumNumberOfGroups(t *testing.T) {
 		groupsLeft[i] = int64(i * 2)
 		groupsRight[i] = int64(i*2 + 1)
 	}
-	leftSource := newChunkingBatchSource(typs, colsLeft, nTuples)
-	rightSource := newChunkingBatchSource(typs, colsRight, nTuples)
-	a, err := NewMergeJoinOp(
-		testAllocator, defaultMemoryLimit, queueCfg,
-		colexecbase.NewTestingSemaphore(mjFDLimit), descpb.FullOuterJoin,
+	leftSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, colsLeft, nTuples)
+	rightSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, colsRight, nTuples)
+	a, err := colexecjoin.NewMergeJoinOp(
+		testAllocator, colexecop.DefaultMemoryLimit, queueCfg,
+		colexecop.NewTestingSemaphore(mjFDLimit), descpb.FullOuterJoin,
 		leftSource, rightSource, typs, typs,
 		[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 		[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -1768,105 +1766,6 @@ func TestFullOuterMergeJoinWithMaximumNumberOfGroups(t *testing.T) {
 	}
 }
 
-// TestMergeJoinCrossProduct verifies that the merge joiner produces the same
-// output as the hash joiner. The test aims at stressing randomly the building
-// of cross product (from the buffered groups) in the merge joiner and does it
-// by creating input sources such that they contain very big groups (each group
-// is about coldata.BatchSize() in size) which will force the merge joiner to
-// mostly build from the buffered groups. Join of such input sources results in
-// an output quadratic in size, so the test is skipped unless coldata.BatchSize
-// is set to relatively small number, but it is ok since we randomize this
-// value.
-func TestMergeJoinCrossProduct(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	if coldata.BatchSize() > 200 {
-		skip.IgnoreLintf(t, "this test is too slow with relatively big batch size")
-	}
-	ctx := context.Background()
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-	defer evalCtx.Stop(ctx)
-	nTuples := 2*coldata.BatchSize() + 1
-	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
-	defer cleanup()
-	rng, _ := randutil.NewPseudoRand()
-	typs := []*types.T{types.Int, types.Bytes, types.Decimal}
-	colsLeft := make([]coldata.Vec, len(typs))
-	colsRight := make([]coldata.Vec, len(typs))
-	for i, typ := range typs {
-		colsLeft[i] = testAllocator.NewMemColumn(typ, nTuples)
-		colsRight[i] = testAllocator.NewMemColumn(typ, nTuples)
-	}
-	groupsLeft := colsLeft[0].Int64()
-	groupsRight := colsRight[0].Int64()
-	leftGroupIdx, rightGroupIdx := 0, 0
-	for i := range groupsLeft {
-		if rng.Float64() < 1.0/float64(coldata.BatchSize()) {
-			leftGroupIdx++
-		}
-		if rng.Float64() < 1.0/float64(coldata.BatchSize()) {
-			rightGroupIdx++
-		}
-		groupsLeft[i] = int64(leftGroupIdx)
-		groupsRight[i] = int64(rightGroupIdx)
-	}
-	for i := range typs[1:] {
-		for _, vecs := range [][]coldata.Vec{colsLeft, colsRight} {
-			coldatatestutils.RandomVec(coldatatestutils.RandomVecArgs{
-				Rand:            rng,
-				Vec:             vecs[i+1],
-				N:               nTuples,
-				NullProbability: nullProbability,
-			})
-		}
-	}
-	leftMJSource := newChunkingBatchSource(typs, colsLeft, nTuples)
-	rightMJSource := newChunkingBatchSource(typs, colsRight, nTuples)
-	leftHJSource := newChunkingBatchSource(typs, colsLeft, nTuples)
-	rightHJSource := newChunkingBatchSource(typs, colsRight, nTuples)
-	mj, err := NewMergeJoinOp(
-		testAllocator, defaultMemoryLimit, queueCfg,
-		colexecbase.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
-		leftMJSource, rightMJSource, typs, typs,
-		[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-		[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-		testDiskAcc,
-	)
-	if err != nil {
-		t.Fatal("error in merge join op constructor", err)
-	}
-	mj.Init()
-	hj := NewHashJoiner(
-		testAllocator, testAllocator, HashJoinerSpec{
-			joinType: descpb.InnerJoin,
-			left: hashJoinerSourceSpec{
-				eqCols: []uint32{0}, sourceTypes: typs,
-			},
-			right: hashJoinerSourceSpec{
-				eqCols: []uint32{0}, sourceTypes: typs,
-			},
-		}, leftHJSource, rightHJSource, HashJoinerInitialNumBuckets)
-	hj.Init()
-
-	var mjOutputTuples, hjOutputTuples tuples
-	for b := mj.Next(ctx); b.Length() != 0; b = mj.Next(ctx) {
-		for i := 0; i < b.Length(); i++ {
-			mjOutputTuples = append(mjOutputTuples, getTupleFromBatch(b, i))
-		}
-	}
-	for b := hj.Next(ctx); b.Length() != 0; b = hj.Next(ctx) {
-		for i := 0; i < b.Length(); i++ {
-			hjOutputTuples = append(hjOutputTuples, getTupleFromBatch(b, i))
-		}
-	}
-	err = assertTuplesSetsEqual(hjOutputTuples, mjOutputTuples, evalCtx)
-	// Note that the error message can be extremely verbose (it
-	// might contain all output tuples), so we manually check that
-	// comparing err to nil returns true (if we were to use
-	// require.NoError, then the error message would be output).
-	require.True(t, err == nil)
-}
-
 // TestMergeJoinerMultiBatch creates one long input of a 1:1 join, and keeps
 // track of the expected output to make sure the join output is batched
 // correctly.
@@ -1886,11 +1785,11 @@ func TestMergeJoinerMultiBatch(t *testing.T) {
 				for i := range groups {
 					groups[i] = int64(i)
 				}
-				leftSource := newChunkingBatchSource(typs, cols, nTuples)
-				rightSource := newChunkingBatchSource(typs, cols, nTuples)
-				a, err := NewMergeJoinOp(
-					testAllocator, defaultMemoryLimit,
-					queueCfg, colexecbase.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
+				leftSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, cols, nTuples)
+				rightSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, cols, nTuples)
+				a, err := colexecjoin.NewMergeJoinOp(
+					testAllocator, colexecop.DefaultMemoryLimit,
+					queueCfg, colexecop.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
 					leftSource, rightSource, typs, typs,
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -1962,11 +1861,11 @@ func TestMergeJoinerMultiBatchRuns(t *testing.T) {
 						cols[0].Int64()[i] = int64(i / groupSize)
 						cols[1].Int64()[i] = int64(i / groupSize)
 					}
-					leftSource := newChunkingBatchSource(typs, cols, nTuples)
-					rightSource := newChunkingBatchSource(typs, cols, nTuples)
-					a, err := NewMergeJoinOp(
-						testAllocator, defaultMemoryLimit,
-						queueCfg, colexecbase.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
+					leftSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, cols, nTuples)
+					rightSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, cols, nTuples)
+					a, err := colexecjoin.NewMergeJoinOp(
+						testAllocator, colexecop.DefaultMemoryLimit,
+						queueCfg, colexecop.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
 						leftSource, rightSource, typs, typs,
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}, {ColIdx: 1, Direction: execinfrapb.Ordering_Column_ASC}},
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}, {ColIdx: 1, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -2089,12 +1988,12 @@ func TestMergeJoinerRandomized(t *testing.T) {
 					nTuples := coldata.BatchSize() * numInputBatches
 					typs := []*types.T{types.Int}
 					lCols, rCols, exp := newBatchesOfRandIntRows(nTuples, maxRunLength, skipValues, randomIncrement)
-					leftSource := newChunkingBatchSource(typs, lCols, nTuples)
-					rightSource := newChunkingBatchSource(typs, rCols, nTuples)
+					leftSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, lCols, nTuples)
+					rightSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, rCols, nTuples)
 
-					a, err := NewMergeJoinOp(
-						testAllocator, defaultMemoryLimit,
-						queueCfg, colexecbase.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
+					a, err := colexecjoin.NewMergeJoinOp(
+						testAllocator, colexecop.DefaultMemoryLimit,
+						queueCfg, colexecop.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
 						leftSource, rightSource, typs, typs,
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
@@ -2127,141 +2026,6 @@ func TestMergeJoinerRandomized(t *testing.T) {
 					}
 				}
 			}
-		}
-	}
-}
-
-func newBatchOfIntRows(nCols int, batch coldata.Batch, length int) coldata.Batch {
-	for colIdx := 0; colIdx < nCols; colIdx++ {
-		col := batch.ColVec(colIdx).Int64()
-		for i := 0; i < length; i++ {
-			col[i] = int64(i)
-		}
-	}
-
-	batch.SetLength(length)
-
-	for colIdx := 0; colIdx < nCols; colIdx++ {
-		vec := batch.ColVec(colIdx)
-		vec.Nulls().UnsetNulls()
-	}
-	return batch
-}
-
-func newBatchOfRepeatedIntRows(
-	nCols int, batch coldata.Batch, length int, numRepeats int,
-) coldata.Batch {
-	for colIdx := 0; colIdx < nCols; colIdx++ {
-		col := batch.ColVec(colIdx).Int64()
-		for i := 0; i < length; i++ {
-			col[i] = int64((i + 1) / numRepeats)
-		}
-	}
-
-	batch.SetLength(length)
-
-	for colIdx := 0; colIdx < nCols; colIdx++ {
-		vec := batch.ColVec(colIdx)
-		vec.Nulls().UnsetNulls()
-	}
-	return batch
-}
-
-func BenchmarkMergeJoiner(b *testing.B) {
-	ctx := context.Background()
-	const nCols = 1
-	sourceTypes := []*types.T{types.Int}
-
-	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(b, false /* inMem */)
-	defer cleanup()
-	benchMemAccount := testMemMonitor.MakeBoundAccount()
-	defer benchMemAccount.Close(ctx)
-
-	getNewMergeJoiner := func(leftSource, rightSource colexecbase.Operator) colexecbase.Operator {
-		benchMemAccount.Clear(ctx)
-		base, err := newMergeJoinBase(
-			colmem.NewAllocator(ctx, &benchMemAccount, testColumnFactory), defaultMemoryLimit, queueCfg, colexecbase.NewTestingSemaphore(mjFDLimit),
-			descpb.InnerJoin, leftSource, rightSource, sourceTypes, sourceTypes,
-			[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-			[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-			testDiskAcc,
-		)
-		require.NoError(b, err)
-		return &mergeJoinInnerOp{mergeJoinBase: base}
-	}
-
-	regularBatchCreator := func(batchLength, _ int) coldata.Batch {
-		return newBatchOfIntRows(nCols, testAllocator.NewMemBatchWithMaxCapacity(sourceTypes), batchLength)
-	}
-	repeatedBatchCreator := func(batchLength, numRepeats int) coldata.Batch {
-		return newBatchOfRepeatedIntRows(nCols, testAllocator.NewMemBatchWithMaxCapacity(sourceTypes), batchLength, numRepeats)
-	}
-
-	for _, c := range []struct {
-		namePrefix        string
-		numRepeatsGetter  func(nRows int) int
-		leftBatchCreator  func(batchLength, numRepeats int) coldata.Batch
-		rightBatchCreator func(batchLength, numRepeats int) coldata.Batch
-	}{
-		// 1:1 join.
-		{
-			namePrefix: "",
-			numRepeatsGetter: func(nRows int) int {
-				// This value will be ignored.
-				return 0
-			},
-			leftBatchCreator:  regularBatchCreator,
-			rightBatchCreator: regularBatchCreator,
-		},
-		// Groups on the right side.
-		{
-			namePrefix: "oneSideRepeat-",
-			numRepeatsGetter: func(nRows int) int {
-				return nRows
-			},
-			leftBatchCreator:  regularBatchCreator,
-			rightBatchCreator: repeatedBatchCreator,
-		},
-		// Groups on both sides.
-		{
-			namePrefix: "bothSidesRepeat-",
-			numRepeatsGetter: func(nRows int) int {
-				return int(math.Sqrt(float64(nRows)))
-			},
-			leftBatchCreator:  repeatedBatchCreator,
-			rightBatchCreator: repeatedBatchCreator,
-		},
-	} {
-		rowsOptions := []int{1, 16, 128, coldata.BatchSize(), 8 * coldata.BatchSize(), 64 * coldata.BatchSize()}
-		if testing.Short() {
-			rowsOptions = []int{16, coldata.BatchSize(), 64 * coldata.BatchSize()}
-		}
-		for _, nRows := range rowsOptions {
-			b.Run(fmt.Sprintf("%srows=%d", c.namePrefix, nRows), func(b *testing.B) {
-				batchLength := nRows
-				nBatches := 1
-				if nRows >= coldata.BatchSize() {
-					batchLength = coldata.BatchSize()
-					nBatches = nRows / coldata.BatchSize()
-				}
-				numRepeats := c.numRepeatsGetter(nRows)
-				leftBatch := c.leftBatchCreator(batchLength, numRepeats)
-				rightBatch := c.rightBatchCreator(batchLength, numRepeats)
-				// 8 (bytes / int64) * nRows * nCols (number of columns / row) * 2 (number of sources).
-				b.SetBytes(int64(8 * nRows * nCols * 2))
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					leftSource := newFiniteChunksSource(leftBatch, sourceTypes, nBatches, 1)
-					rightSource := newFiniteChunksSource(rightBatch, sourceTypes, nBatches, 1)
-					s := getNewMergeJoiner(leftSource, rightSource)
-					s.Init()
-
-					b.StartTimer()
-					for b := s.Next(ctx); b.Length() != 0; b = s.Next(ctx) {
-					}
-					b.StopTimer()
-				}
-			})
 		}
 	}
 }

@@ -14,13 +14,13 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 )
 
 // limitOp is an operator that implements limit, returning only the first n
 // tuples from its input.
 type limitOp struct {
-	oneInputCloserHelper
+	colexecop.OneInputCloserHelper
 
 	limit uint64
 
@@ -30,27 +30,27 @@ type limitOp struct {
 	done bool
 }
 
-var _ colexecbase.Operator = &limitOp{}
-var _ closableOperator = &limitOp{}
+var _ colexecop.Operator = &limitOp{}
+var _ colexecop.ClosableOperator = &limitOp{}
 
 // NewLimitOp returns a new limit operator with the given limit.
-func NewLimitOp(input colexecbase.Operator, limit uint64) colexecbase.Operator {
+func NewLimitOp(input colexecop.Operator, limit uint64) colexecop.Operator {
 	c := &limitOp{
-		oneInputCloserHelper: makeOneInputCloserHelper(input),
+		OneInputCloserHelper: colexecop.MakeOneInputCloserHelper(input),
 		limit:                limit,
 	}
 	return c
 }
 
 func (c *limitOp) Init() {
-	c.input.Init()
+	c.Input.Init()
 }
 
 func (c *limitOp) Next(ctx context.Context) coldata.Batch {
 	if c.done {
 		return coldata.ZeroBatch
 	}
-	bat := c.input.Next(ctx)
+	bat := c.Input.Next(ctx)
 	length := bat.Length()
 	if length == 0 {
 		return bat

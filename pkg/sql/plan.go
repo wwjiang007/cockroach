@@ -140,6 +140,7 @@ var _ planNode = &alterIndexNode{}
 var _ planNode = &alterSchemaNode{}
 var _ planNode = &alterSequenceNode{}
 var _ planNode = &alterTableNode{}
+var _ planNode = &alterTableOwnerNode{}
 var _ planNode = &alterTableSetSchemaNode{}
 var _ planNode = &alterTypeNode{}
 var _ planNode = &bufferNode{}
@@ -266,8 +267,13 @@ var _ planNodeSpooled = &spoolNode{}
 type flowInfo struct {
 	typ     planComponentType
 	diagram execinfrapb.FlowDiagram
-	// FlowMetadata stores metadata from flows that will be used by TraceAnalyzer.
-	flowMetadata *execstats.FlowMetadata
+	// explainVec and explainVecVerbose are only populated when collecting a
+	// statement bundle when the plan was vectorized.
+	explainVec        []string
+	explainVecVerbose []string
+	// flowsMetadata stores metadata from flows that will be used by
+	// execstats.TraceAnalyzer.
+	flowsMetadata *execstats.FlowsMetadata
 }
 
 // planTop is the struct that collects the properties
@@ -283,7 +289,7 @@ type planTop struct {
 	planComponents
 
 	// mem/catalog retains the memo and catalog that were used to create the
-	// plan.
+	// plan. Only set if needed by instrumentation (see ShouldSaveMemo).
 	mem     *memo.Memo
 	catalog *optCatalog
 
@@ -479,7 +485,7 @@ func startExec(params runParams, plan planNode) error {
 	o := planObserver{
 		enterNode: func(ctx context.Context, _ string, p planNode) (bool, error) {
 			switch p.(type) {
-			case *explainVecNode:
+			case *explainVecNode, *explainDDLNode:
 				// Do not recurse: we're not starting the plan if we just show its structure with EXPLAIN.
 				return false, nil
 			case *showTraceNode:
@@ -515,14 +521,6 @@ func (p *planner) maybePlanHook(ctx context.Context, stmt tree.Statement) (planN
 			return &hookFnNode{f: fn, header: header, subplans: subplans}, nil
 		}
 	}
-	for _, planHook := range wrappedPlanHooks {
-		if node, err := planHook(ctx, stmt, p); err != nil {
-			return nil, err
-		} else if node != nil {
-			return node, err
-		}
-	}
-
 	return nil, nil
 }
 

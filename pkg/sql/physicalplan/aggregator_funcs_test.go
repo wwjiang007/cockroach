@@ -20,8 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -92,7 +92,7 @@ func runTestFlow(
 	for {
 		row, meta := rowBuf.Next()
 		if meta != nil {
-			if meta.LeafTxnFinalState != nil || meta.Metrics != nil {
+			if meta.LeafTxnFinalState != nil || meta.Metrics != nil || meta.TraceData != nil {
 				continue
 			}
 			t.Fatalf("unexpected metadata: %v", meta)
@@ -117,13 +117,13 @@ func checkDistAggregationInfo(
 	ctx context.Context,
 	t *testing.T,
 	srv serverutils.TestServerInterface,
-	tableDesc *tabledesc.Immutable,
+	tableDesc catalog.TableDescriptor,
 	colIdx int,
 	numRows int,
 	fn execinfrapb.AggregatorSpec_Func,
 	info DistAggregationInfo,
 ) {
-	colType := tableDesc.Columns[colIdx].Type
+	colType := tableDesc.PublicColumns()[colIdx].GetType()
 
 	makeTableReader := func(startPK, endPK int, streamID int) execinfrapb.ProcessorSpec {
 		tr := execinfrapb.TableReaderSpec{
@@ -417,6 +417,7 @@ func TestDistAggregationTable(t *testing.T) {
 	// Create a table with a few columns:
 	//  - random integer values from 0 to numRows
 	//  - random integer values (with some NULLs)
+	//  - random integer values (with some NULLs) within int32 range
 	//  - random bool value (mostly false)
 	//  - random bool value (mostly true)
 	//  - random decimals
@@ -424,13 +425,17 @@ func TestDistAggregationTable(t *testing.T) {
 	rng, _ := randutil.NewPseudoRand()
 	sqlutils.CreateTable(
 		t, tc.ServerConn(0), "t",
-		"k INT PRIMARY KEY, int1 INT, int2 INT, bool1 BOOL, bool2 BOOL, dec1 DECIMAL, dec2 DECIMAL, float1 FLOAT, float2 FLOAT, b BYTES",
+		"k INT PRIMARY KEY, int1 INT, int2 INT, int3 INT, bool1 BOOL, bool2 BOOL, dec1 DECIMAL, dec2 DECIMAL, float1 FLOAT, float2 FLOAT, b BYTES",
 		numRows,
 		func(row int) []tree.Datum {
 			return []tree.Datum{
 				tree.NewDInt(tree.DInt(row)),
 				tree.NewDInt(tree.DInt(rng.Intn(numRows))),
 				rowenc.RandDatum(rng, types.Int, true),
+				// Note that we use INT4 here, yet the table schema uses INT8 -
+				// this is ok since we want to limit the range of values but use
+				// the default INT type.
+				rowenc.RandDatum(rng, types.Int4, true),
 				tree.MakeDBool(tree.DBool(rng.Intn(10) == 0)),
 				tree.MakeDBool(tree.DBool(rng.Intn(10) != 0)),
 				rowenc.RandDatum(rng, types.Decimal, false),
@@ -458,18 +463,27 @@ func TestDistAggregationTable(t *testing.T) {
 		// We're going to test each aggregation function on every column that can be
 		// used as input for it.
 		foundCol := false
-		for colIdx := 1; colIdx < len(desc.Columns); colIdx++ {
+		for _, col := range desc.PublicColumns() {
+			if col.Ordinal() == 0 {
+				continue
+			}
 			// See if this column works with this function.
-			_, _, err := execinfrapb.GetAggregateInfo(fn, desc.Columns[colIdx].Type)
+			_, _, err := execinfrapb.GetAggregateInfo(fn, col.GetType())
 			if err != nil {
+				continue
+			}
+			if fn == execinfrapb.AggregatorSpec_SUM_INT && col.Ordinal() == 2 {
+				// When using sum_int over int2 column we're likely to hit an
+				// integer out of range error since we insert random DInts into
+				// that column, so we'll skip such config.
 				continue
 			}
 			foundCol = true
 			for _, numRows := range []int{5, numRows / 10, numRows / 2, numRows} {
-				name := fmt.Sprintf("%s/%s/%d", fn, desc.Columns[colIdx].Name, numRows)
+				name := fmt.Sprintf("%s/%s/%d", fn, col.GetName(), numRows)
 				t.Run(name, func(t *testing.T) {
 					checkDistAggregationInfo(
-						context.Background(), t, tc.Server(0), desc, colIdx, numRows, fn, info)
+						context.Background(), t, tc.Server(0), desc, col.Ordinal(), numRows, fn, info)
 				})
 			}
 		}

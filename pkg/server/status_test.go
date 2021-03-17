@@ -39,7 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
-	"github.com/cockroachdb/cockroach/pkg/server/diagnosticspb"
+	"github.com/cockroachdb/cockroach/pkg/server/diagnostics/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -560,7 +560,7 @@ func TestStatusLocalLogs(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, entry := range wrapper.Entries {
-			switch entry.Message {
+			switch strings.TrimSpace(entry.Message) {
 			case "TestStatusLocalLogFile test message-Error":
 				foundError = true
 			case "TestStatusLocalLogFile test message-Warning":
@@ -639,7 +639,7 @@ func TestStatusLocalLogs(t *testing.T) {
 			for _, entry := range wrapper.Entries {
 				fmt.Fprintln(&logsBuf, entry.Message)
 
-				switch entry.Message {
+				switch strings.TrimSpace(entry.Message) {
 				case "TestStatusLocalLogFile test message-Error":
 					actual.Error = true
 				case "TestStatusLocalLogFile test message-Warning":
@@ -672,16 +672,16 @@ func TestStatusLogRedaction(t *testing.T) {
 		// If there were no markers to start with (redactableLogs=false), we
 		// introduce markers around the entire message to indicate it's not known to
 		// be safe.
-		{false, false, `‹THISISSAFE THISISUNSAFE›`, true},
+		{false, false, `‹ THISISSAFE THISISUNSAFE›`, true},
 		// redact=true must be conservative and redact everything out if
 		// there were no markers to start with (redactableLogs=false).
 		{false, true, `‹×›`, false},
 		// redact=false keeps whatever was in the log file.
-		{true, false, `THISISSAFE ‹THISISUNSAFE›`, true},
+		{true, false, ` THISISSAFE ‹THISISUNSAFE›`, true},
 		// Whether or not to keep the redactable markers has no influence
 		// on the output of redaction, just on the presence of the
 		// "redactable" marker. In any case no information is leaked.
-		{true, true, `THISISSAFE ‹×›`, true},
+		{true, true, ` THISISSAFE ‹×›`, true},
 	}
 
 	testutils.RunTrueAndFalse(t, "redactableLogs",
@@ -1158,6 +1158,44 @@ func TestStatusVars(t *testing.T) {
 	}
 }
 
+// TestStatusVarsTxnMetrics verifies that the metrics from the /_status/vars
+// endpoint for txns and the special cockroach_restart savepoint are correct.
+func TestStatusVarsTxnMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer db.Close()
+	defer s.Stopper().Stop(context.Background())
+
+	if _, err := db.Exec("BEGIN;" +
+		"SAVEPOINT cockroach_restart;" +
+		"SELECT 1;" +
+		"RELEASE SAVEPOINT cockroach_restart;" +
+		"ROLLBACK;"); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := getText(s, s.AdminURL()+statusPrefix+"vars")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte("sql_txn_begin_count 1")) {
+		t.Errorf("expected `sql_txn_begin_count 1`, got: %s", body)
+	}
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_count 1")) {
+		t.Errorf("expected `sql_restart_savepoint_count 1`, got: %s", body)
+	}
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count 1")) {
+		t.Errorf("expected `sql_restart_savepoint_release_count 1`, got: %s", body)
+	}
+	if !bytes.Contains(body, []byte("sql_txn_commit_count 1")) {
+		t.Errorf("expected `sql_txn_commit_count 1`, got: %s", body)
+	}
+	if !bytes.Contains(body, []byte("sql_txn_rollback_count 0")) {
+		t.Errorf("expected `sql_txn_rollback_count 0`, got: %s", body)
+	}
+}
+
 func TestSpanStatsResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1464,6 +1502,12 @@ func TestRemoteDebugModeSetting(t *testing.T) {
 		t.Error(err)
 	}
 	if _, err := client.ListSessions(ctx, &serverpb.ListSessionsRequest{}); err != nil {
+		t.Error(err)
+	}
+	if _, err := client.ListLocalContentionEvents(ctx, &serverpb.ListContentionEventsRequest{}); err != nil {
+		t.Error(err)
+	}
+	if _, err := client.ListContentionEvents(ctx, &serverpb.ListContentionEventsRequest{}); err != nil {
 		t.Error(err)
 	}
 
@@ -1883,6 +1927,85 @@ func TestListSessionsSecurity(t *testing.T) {
 	}
 }
 
+func TestListContentionEventsSecurity(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	ts := s.(*TestServer)
+	defer ts.Stopper().Stop(ctx)
+
+	expectedErrNoPermission := "does not have permission to view contention events"
+
+	// HTTP requests respect the authenticated username from the HTTP session.
+	testCases := []struct {
+		endpoint                       string
+		expectedErr                    string
+		requestWithAdmin               bool
+		requestWithViewActivityGranted bool
+	}{
+		{"local_contention_events", expectedErrNoPermission, false, false},
+		{"contention_events", expectedErrNoPermission, false, false},
+		{"local_contention_events", "", true, false},
+		{"contention_events", "", true, false},
+		{"local_contention_events", "", false, true},
+		{"contention_events", "", false, true},
+	}
+	myUser := authenticatedUserNameNoAdmin().Normalized()
+	for _, tc := range testCases {
+		if tc.requestWithViewActivityGranted {
+			// Note that for this query to work, it is crucial that
+			// getStatusJSONProtoWithAdminOption below is called at least once,
+			// on the previous test case, so that the user exists.
+			_, err := db.Exec("ALTER USER $1 VIEWACTIVITY", myUser)
+			require.NoError(t, err)
+		}
+		var response serverpb.ListContentionEventsResponse
+		err := getStatusJSONProtoWithAdminOption(s, tc.endpoint, &response, tc.requestWithAdmin)
+		if tc.expectedErr == "" {
+			if err != nil || len(response.Errors) > 0 {
+				t.Errorf("unexpected failure listing contention events; error: %v; response errors: %v",
+					err, response.Errors)
+			}
+		} else {
+			respErr := "<no error>"
+			if len(response.Errors) > 0 {
+				respErr = response.Errors[0].Message
+			}
+			if !testutils.IsError(err, tc.expectedErr) &&
+				!strings.Contains(respErr, tc.expectedErr) {
+				t.Errorf("did not get expected error %q when listing contention events from %s: %v",
+					tc.expectedErr, tc.endpoint, err)
+			}
+		}
+		if tc.requestWithViewActivityGranted {
+			_, err := db.Exec("ALTER USER $1 NOVIEWACTIVITY", myUser)
+			require.NoError(t, err)
+		}
+	}
+
+	// gRPC requests behave as root and thus are always allowed.
+	rootConfig := testutils.NewTestBaseContext(security.RootUserName())
+	rpcContext := newRPCTestContext(ts, rootConfig)
+	url := ts.ServingRPCAddr()
+	nodeID := ts.NodeID()
+	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := serverpb.NewStatusClient(conn)
+	request := &serverpb.ListContentionEventsRequest{}
+	if resp, err := client.ListLocalContentionEvents(ctx, request); err != nil || len(resp.Errors) > 0 {
+		t.Errorf("unexpected failure listing local contention events; error: %v; response errors: %v",
+			err, resp.Errors)
+	}
+	if resp, err := client.ListContentionEvents(ctx, request); err != nil || len(resp.Errors) > 0 {
+		t.Errorf("unexpected failure listing contention events; error: %v; response errors: %v",
+			err, resp.Errors)
+	}
+}
+
 func TestCreateStatementDiagnosticsReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1947,13 +2070,6 @@ func TestStatementDiagnosticsCompleted(t *testing.T) {
 	if err := getStatusJSONProto(s, diagPath, &diagRespGet); err != nil {
 		t.Fatal(err)
 	}
-
-	json := diagRespGet.Diagnostics.Trace
-	if json == "" ||
-		!strings.Contains(json, "traced statement") ||
-		!strings.Contains(json, "statement execution committed the txn") {
-		t.Fatal("statement diagnostics did not capture a trace")
-	}
 }
 
 func TestJobStatusResponse(t *testing.T) {
@@ -1979,7 +2095,8 @@ func TestJobStatusResponse(t *testing.T) {
 	require.Nil(t, response)
 
 	ctx := context.Background()
-	job, err := ts.JobRegistry().(*jobs.Registry).CreateJobWithTxn(
+	jr := ts.JobRegistry().(*jobs.Registry)
+	job, err := jr.CreateJobWithTxn(
 		ctx,
 		jobs.Record{
 			Description: "testing",
@@ -2003,16 +2120,17 @@ func TestJobStatusResponse(t *testing.T) {
 			Progress:      jobspb.ImportProgress{},
 			DescriptorIDs: []descpb.ID{1, 2, 3},
 		},
+		jr.MakeJobID(),
 		nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.JobId = *job.ID()
+	request.JobId = int64(job.ID())
 	response, err = client.JobStatus(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	require.Equal(t, *job.ID(), response.Job.Id)
+	require.Equal(t, job.ID(), response.Job.Id)
 	require.Equal(t, job.Payload(), *response.Job.Payload)
 	require.Equal(t, job.Progress(), *response.Job.Progress)
 }

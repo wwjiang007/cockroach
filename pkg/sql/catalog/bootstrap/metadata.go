@@ -271,7 +271,7 @@ func LookupSystemTableDescriptorID(
 	if settings != nil &&
 		!settings.Version.IsActive(ctx, clusterversion.NamespaceTableWithSchemas) &&
 		tableName == systemschema.NamespaceTableName {
-		return systemschema.DeprecatedNamespaceTable.ID
+		return systemschema.DeprecatedNamespaceTable.GetID()
 	}
 	systemTenant := boolToInt(codec.ForSystemTenant())
 	dbID, ok := systemTableIDCache[systemTenant][tableName]
@@ -342,6 +342,7 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 
 	target.AddDescriptor(keys.SystemDatabaseID, systemschema.ScheduledJobsTable)
 	target.AddDescriptor(keys.SystemDatabaseID, systemschema.SqllivenessTable)
+	target.AddDescriptor(keys.SystemDatabaseID, systemschema.MigrationsTable)
 }
 
 // addSplitIDs adds a split point for each of the PseudoTableIDs to the supplied

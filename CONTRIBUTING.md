@@ -9,7 +9,7 @@ For tech writers and docs enthusiasts | Help improve CockroachDB docs: [List of 
 
 ## Contributor Guidelines
 
-Our contributor guidelines are available on [the public wiki at **wiki.crdb.io**(https://wiki.crdb.io/wiki/spaces/CRDB/pages/73204033/Contributing+to+CockroachDB).
+Our contributor guidelines are available on [the public wiki at **wiki.crdb.io**](https://wiki.crdb.io/wiki/spaces/CRDB/pages/73204033/Contributing+to+CockroachDB).
 
 At this location, we share our team guidelines and knowledge base
 regarding:
@@ -29,7 +29,7 @@ regarding:
 as well as many other practical topics. 
 
 ## Don’t Forget to Join our Community
-Join our [Community Slack](https://cockroa.ch/slack) (there's a dedicated #contributors channel!) to ask questions, discuss your ideas, or connect with other contributors.
+Join our [Community Slack](https://go.crdb.dev/p/slack) (there's a dedicated #contributors channel!) to ask questions, discuss your ideas, or connect with other contributors.
 
 Please follow the guidelines outlined in our [Code of Conduct](https://docs.google.com/document/d/1_BB3IrsAVglDNPy37Z6KQlii_c3fYETFlWMMBUpbY1M/edit#) to help us make the CockroachDB community a welcoming and helpful place for everyone.
 

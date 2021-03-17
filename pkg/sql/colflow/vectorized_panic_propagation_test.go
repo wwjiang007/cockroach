@@ -17,8 +17,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -62,7 +62,7 @@ func TestVectorizedInternalPanic(t *testing.T) {
 		nil, /* output */
 		nil, /* metadataSourceQueue */
 		nil, /* toClose */
-		nil, /* execStatsForTrace */
+		nil, /* getStats */
 		nil, /* cancelFlow */
 	)
 	if err != nil {
@@ -109,7 +109,7 @@ func TestNonVectorizedPanicPropagation(t *testing.T) {
 		nil, /* output */
 		nil, /* metadataSourceQueue */
 		nil, /* toClose */
-		nil, /* execStatsForTrace */
+		nil, /* getStats */
 		nil, /* cancelFlow */
 	)
 	if err != nil {
@@ -125,21 +125,21 @@ func TestNonVectorizedPanicPropagation(t *testing.T) {
 // and returns the next batch from the input on every even-numbered (i.e. it
 // becomes a noop for those iterations). Used for tests only.
 type testVectorizedInternalPanicEmitter struct {
-	colexec.OneInputNode
+	colexecop.OneInputNode
 	emitBatch bool
 }
 
-var _ colexecbase.Operator = &testVectorizedInternalPanicEmitter{}
+var _ colexecop.Operator = &testVectorizedInternalPanicEmitter{}
 
-func newTestVectorizedInternalPanicEmitter(input colexecbase.Operator) colexecbase.Operator {
+func newTestVectorizedInternalPanicEmitter(input colexecop.Operator) colexecop.Operator {
 	return &testVectorizedInternalPanicEmitter{
-		OneInputNode: colexec.NewOneInputNode(input),
+		OneInputNode: colexecop.NewOneInputNode(input),
 	}
 }
 
 // Init is part of exec.Operator interface.
 func (e *testVectorizedInternalPanicEmitter) Init() {
-	e.Input().Init()
+	e.Input.Init()
 }
 
 // Next is part of exec.Operator interface.
@@ -150,7 +150,7 @@ func (e *testVectorizedInternalPanicEmitter) Next(ctx context.Context) coldata.B
 	}
 
 	e.emitBatch = false
-	return e.Input().Next(ctx)
+	return e.Input.Next(ctx)
 }
 
 // testNonVectorizedPanicEmitter is the same as
@@ -158,30 +158,30 @@ func (e *testVectorizedInternalPanicEmitter) Next(ctx context.Context) coldata.B
 // function. Used for tests only. It is the only colexec.Operator panics from
 // which are not caught.
 type testNonVectorizedPanicEmitter struct {
-	colexec.OneInputNode
+	colexecop.OneInputNode
 	emitBatch bool
 }
 
-var _ colexecbase.Operator = &testVectorizedInternalPanicEmitter{}
+var _ colexecop.Operator = &testVectorizedInternalPanicEmitter{}
 
-func newTestNonVectorizedPanicEmitter(input colexecbase.Operator) colexecbase.Operator {
+func newTestNonVectorizedPanicEmitter(input colexecop.Operator) colexecop.Operator {
 	return &testNonVectorizedPanicEmitter{
-		OneInputNode: colexec.NewOneInputNode(input),
+		OneInputNode: colexecop.NewOneInputNode(input),
 	}
 }
 
 // Init is part of exec.Operator interface.
 func (e *testNonVectorizedPanicEmitter) Init() {
-	e.Input().Init()
+	e.Input.Init()
 }
 
 // Next is part of exec.Operator interface.
 func (e *testNonVectorizedPanicEmitter) Next(ctx context.Context) coldata.Batch {
 	if !e.emitBatch {
 		e.emitBatch = true
-		panic("")
+		colexecerror.NonVectorizedTestPanic("")
 	}
 
 	e.emitBatch = false
-	return e.Input().Next(ctx)
+	return e.Input.Next(ctx)
 }

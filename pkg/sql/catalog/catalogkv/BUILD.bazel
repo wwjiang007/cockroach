@@ -1,10 +1,11 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//build:STRINGER.bzl", "stringer")
 
 go_library(
     name = "catalogkv",
     srcs = [
         "catalogkv.go",
-        "descriptorkind_string.go",
+        "desc_getter.go",
         "namespace.go",
         "test_utils.go",
     ],
@@ -35,10 +36,14 @@ go_library(
 
 go_test(
     name = "catalogkv_test",
+    size = "small",
     srcs = ["unwrap_validation_test.go"],
     data = glob(["testdata/**"]),
     embed = [":catalogkv"],
     deps = [
+        "//pkg/keys",
+        "//pkg/kv",
+        "//pkg/roachpb",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/descpb",
         "//pkg/testutils",
@@ -48,4 +53,10 @@ go_test(
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",
     ],
+)
+
+stringer(
+    name = "gen-descriptorkind-stringer",
+    src = "catalogkv.go",
+    typ = "DescriptorKind",
 )

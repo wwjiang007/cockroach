@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
@@ -87,10 +88,36 @@ type TestClusterInterface interface {
 		startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
 	) (roachpb.RangeDescriptor, error)
 
-	// RemoveNonVoters removes one or more learners from a range.
+	// AddNonVotersOrFatal is the same as AddNonVoters but will fatal if it fails.
+	AddNonVotersOrFatal(
+		t testing.TB, startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
+	) roachpb.RangeDescriptor
+
+	// RemoveNonVoters removes one or more non-voters from a range.
 	RemoveNonVoters(
 		startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
 	) (roachpb.RangeDescriptor, error)
+
+	// RemoveNonVotersOrFatal is the same as RemoveNonVoters but will fatal if it
+	// fails.
+	RemoveNonVotersOrFatal(
+		t testing.TB, startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
+	) roachpb.RangeDescriptor
+
+	// SwapVoterWithNonVoter atomically "swaps" the voting replica located on
+	// `voterTarget` with the non-voting replica located on `nonVoterTarget`. A
+	// sequence of ReplicationChanges is considered to have "swapped" a voter on
+	// s1 with a non-voter on s2 iff the resulting state after the execution of
+	// these changes is such that s1 has a non-voter and s2 has a voter.
+	SwapVoterWithNonVoter(
+		startKey roachpb.Key, voterTarget, nonVoterTarget roachpb.ReplicationTarget,
+	) (*roachpb.RangeDescriptor, error)
+
+	// SwapVoterWithNonVoterOrFatal is the same as SwapVoterWithNonVoter but will
+	// fatal if it fails.
+	SwapVoterWithNonVoterOrFatal(
+		t *testing.T, startKey roachpb.Key, voterTarget, nonVoterTarget roachpb.ReplicationTarget,
+	) *roachpb.RangeDescriptor
 
 	// FindRangeLeaseHolder returns the current lease holder for the given range.
 	// In particular, it returns one particular node's (the hint, if specified) view
@@ -118,6 +145,21 @@ type TestClusterInterface interface {
 		rangeDesc roachpb.RangeDescriptor, dest roachpb.ReplicationTarget,
 	) error
 
+	// MoveRangeLeaseNonCooperatively performs a non-cooperative transfer of the
+	// lease for a range from whoever has it to a particular store. That store
+	// must already have a replica of the range. If that replica already has the
+	// (active) lease, this method is a no-op.
+	//
+	// The transfer is non-cooperative in that the lease is made to expire by
+	// advancing the manual clock. The target is then instructed to acquire the
+	// ownerless lease. Most tests should use the cooperative version of this
+	// method, TransferRangeLease.
+	MoveRangeLeaseNonCooperatively(
+		rangeDesc roachpb.RangeDescriptor,
+		dest roachpb.ReplicationTarget,
+		manual *hlc.HybridManualClock,
+	) error
+
 	// LookupRange returns the descriptor of the range containing key.
 	LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, error)
 
@@ -136,6 +178,10 @@ type TestClusterInterface interface {
 	// as kv scratch space (it doesn't overlap system spans or SQL tables). The
 	// range is lazily split off on the first call to ScratchRange.
 	ScratchRange(t testing.TB) roachpb.Key
+
+	// WaitForFullReplication waits until all stores in the cluster
+	// have no ranges with replication pending.
+	WaitForFullReplication() error
 }
 
 // TestClusterFactory encompasses the actual implementation of the shim

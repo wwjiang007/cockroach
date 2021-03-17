@@ -7,12 +7,14 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/util/log",
+        "//pkg/util/system",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
 go_test(
     name = "cgroups_test",
+    size = "small",
     srcs = ["cgroups_test.go"],
     embed = [":cgroups"],
     deps = [

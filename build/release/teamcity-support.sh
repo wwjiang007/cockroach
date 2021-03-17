@@ -3,6 +3,7 @@
 remove_files_on_exit() {
   rm -f .google-credentials.json
   rm -f .cockroach-teamcity-key
+  rm -rf ~/.docker
 }
 trap remove_files_on_exit EXIT
 
@@ -46,6 +47,10 @@ configure_docker_creds() {
   }
 }
 EOF
+}
+
+docker_login_with_redhat() {
+  echo "${REDHAT_REGISTRY_KEY}" | docker login --username unused --password-stdin $rhel_registry
 }
 
 configure_git_ssh_key() {

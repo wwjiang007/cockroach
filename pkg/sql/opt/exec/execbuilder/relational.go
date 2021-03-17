@@ -329,9 +329,9 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 		return execPlan{}, err
 	}
 
-	// In race builds, assert that the exec plan output columns match the opt
+	// In test builds, assert that the exec plan output columns match the opt
 	// plan output columns.
-	if util.RaceEnabled {
+	if util.CrdbTestBuild {
 		optCols := e.Relational().OutputCols
 		var execCols opt.ColSet
 		ep.outputCols.ForEach(func(key, val int) {
@@ -339,7 +339,7 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 		})
 		if !execCols.Equals(optCols) {
 			return execPlan{}, errors.AssertionFailedf(
-				"exec columns do not match opt columns: expected %v, got %v", optCols, execCols)
+				"exec columns do not match opt columns: expected %v, got %v. op: %T", optCols, execCols, e)
 		}
 	}
 
@@ -347,11 +347,24 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	// information.
 	if ef, ok := b.factory.(exec.ExplainFactory); ok {
 		stats := &e.Relational().Stats
-		ef.AnnotateNode(ep.root, exec.EstimatedStatsID, &exec.EstimatedStats{
+		val := exec.EstimatedStats{
 			TableStatsAvailable: stats.Available,
 			RowCount:            stats.RowCount,
 			Cost:                float64(e.Cost()),
-		})
+		}
+		if scan, ok := e.(*memo.ScanExpr); ok {
+			tab := b.mem.Metadata().Table(scan.Table)
+			if tab.StatisticCount() > 0 {
+				// The first stat is the most recent one.
+				stat := tab.Statistic(0)
+				val.TableStatsRowCount = stat.RowCount()
+				if val.TableStatsRowCount == 0 {
+					val.TableStatsRowCount = 1
+				}
+				val.TableStatsCreatedAt = stat.CreatedAt()
+			}
+		}
+		ef.AnnotateNode(ep.root, exec.EstimatedStatsID, &val)
 	}
 
 	if saveTableName != "" {
@@ -558,6 +571,7 @@ func (b *Builder) scanParams(
 		Parallelize:       parallelize,
 		Locking:           locking,
 		EstimatedRowCount: rowCount,
+		LocalityOptimized: scan.LocalityOptimized,
 	}, outputMap, nil
 }
 
@@ -586,7 +600,7 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 
 	// Save if we planned a full table/index scan on the builder so that the
 	// planner can be made aware later. We only do this for non-virtual tables.
-	if !tab.IsVirtualTable() && scan.Constraint == nil && scan.InvertedConstraint == nil {
+	if !tab.IsVirtualTable() && scan.Constraint == nil && scan.InvertedConstraint == nil && !scan.HardLimit.IsSet() {
 		if scan.Index == cat.PrimaryIndex {
 			b.ContainsFullTableScan = true
 		} else {
@@ -1303,7 +1317,7 @@ func (b *Builder) buildSetOp(set memo.RelExpr) (execPlan, error) {
 	switch set.Op() {
 	case opt.UnionOp:
 		typ, all = tree.UnionOp, false
-	case opt.UnionAllOp:
+	case opt.UnionAllOp, opt.LocalityOptimizedSearchOp:
 		typ, all = tree.UnionOp, true
 	case opt.IntersectOp:
 		typ, all = tree.IntersectOp, false
@@ -1317,7 +1331,21 @@ func (b *Builder) buildSetOp(set memo.RelExpr) (execPlan, error) {
 		panic(errors.AssertionFailedf("invalid operator %s", log.Safe(set.Op())))
 	}
 
-	node, err := b.factory.ConstructSetOp(typ, all, left.root, right.root)
+	hardLimit := uint64(0)
+	if set.Op() == opt.LocalityOptimizedSearchOp {
+		// If we are performing locality optimized search, set a limit equal to
+		// the maximum possible number of rows. This will tell the execution engine
+		// not to execute the right child if the limit is reached by the left
+		// child.
+		// TODO(rytaft): Store the limit in the expression.
+		hardLimit = uint64(set.Relational().Cardinality.Max)
+		if hardLimit > 1 {
+			panic(errors.AssertionFailedf(
+				"locality optimized search is not yet supported for more than one row at a time",
+			))
+		}
+	}
+	node, err := b.factory.ConstructSetOp(typ, all, left.root, right.root, hardLimit)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1471,6 +1499,14 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 		ivh:     tree.MakeIndexedVarHelper(nil /* container */, allCols.Len()),
 		ivarMap: allCols,
 	}
+	var lookupExpr tree.TypedExpr
+	if len(join.LookupExpr) > 0 {
+		var err error
+		lookupExpr, err = b.buildScalar(&ctx, &join.LookupExpr)
+		if err != nil {
+			return execPlan{}, err
+		}
+	}
 	var onExpr tree.TypedExpr
 	if len(join.On) > 0 {
 		var err error
@@ -1495,6 +1531,7 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 		idx,
 		keyCols,
 		join.LookupColsAreTableKey,
+		lookupExpr,
 		lookupOrdinals,
 		onExpr,
 		join.IsSecondJoinInPairedJoiner,
@@ -1507,11 +1544,9 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 
 	// Apply a post-projection if Cols doesn't contain all input columns.
 	//
-	// NB: For left outer paired-joins, this is where the continuation column and
-	// the PK columns for the right side, which were part of the inputCols, are
-	// projected away. (The GenerateInvertedJoins exploration rule has already
-	// done this for semi and anti paired-joins by adding a Project operator
-	// after the join).
+	// NB: For paired-joins, this is where the continuation column and the PK
+	// columns for the right side, which were part of the inputCols, are projected
+	// away.
 	if !inputCols.SubsetOf(join.Cols) {
 		outCols := join.Cols
 		if join.JoinType == opt.SemiJoinOp || join.JoinType == opt.AntiJoinOp {
@@ -1529,6 +1564,13 @@ func (b *Builder) buildInvertedJoin(join *memo.InvertedJoinExpr) (execPlan, erro
 	}
 
 	md := b.mem.Metadata()
+	tab := md.Table(join.Table)
+	idx := tab.Index(join.Index)
+
+	prefixEqCols := make([]exec.NodeColumnOrdinal, len(join.PrefixKeyCols))
+	for i, c := range join.PrefixKeyCols {
+		prefixEqCols[i] = input.getNodeColumnOrdinal(c)
+	}
 
 	inputCols := join.Input.Relational().OutputCols
 	lookupCols := join.Cols.Difference(inputCols)
@@ -1536,10 +1578,12 @@ func (b *Builder) buildInvertedJoin(join *memo.InvertedJoinExpr) (execPlan, erro
 		lookupCols.Remove(join.ContinuationCol)
 	}
 
-	// Add the inverted column since it will be referenced in the inverted
-	// expression and needs a corresponding indexed var. It will be projected
-	// away below.
-	lookupCols.Add(join.InvertedCol)
+	// Add the virtual inverted column. Its source column will be referenced in
+	// the inverted expression and needs a corresponding indexed var. It will be
+	// projected away below.
+	virtualInvertedCol := idx.VirtualInvertedColumn()
+	virtualInvertedColID := join.Table.ColumnID(virtualInvertedCol.Ordinal())
+	lookupCols.Add(virtualInvertedColID)
 
 	lookupOrdinals, lookupColMap := b.getColumns(lookupCols, join.Table)
 	// allExprCols are the columns used in expressions evaluated by this join.
@@ -1571,19 +1615,17 @@ func (b *Builder) buildInvertedJoin(join *memo.InvertedJoinExpr) (execPlan, erro
 	if err != nil {
 		return execPlan{}, err
 	}
-	tab := md.Table(join.Table)
-	idx := tab.Index(join.Index)
 
-	// The inverted filter refers to the original column, but it is actually
-	// evaluated implicitly using the inverted column; the original column is not
-	// even accessible here.
+	// The inverted filter refers to the inverted source column, but it is
+	// actually evaluated implicitly using the virtual inverted column; the
+	// inverted source column is not even accessible here.
 	//
 	// TODO(radu): this is sketchy. The inverted column should not even have the
 	// geospatial type (which would make the expression invalid in terms of
 	// typing). Perhaps we need to pass this information in a more specific way
 	// and not as a generic expression?
-	ord, _ := ctx.ivarMap.Get(int(join.InvertedCol))
-	ctx.ivarMap.Set(int(join.Table.ColumnID(idx.VirtualInvertedColumn().InvertedSourceColumnOrdinal())), ord)
+	ord, _ := ctx.ivarMap.Get(int(virtualInvertedColID))
+	ctx.ivarMap.Set(int(join.Table.ColumnID(virtualInvertedCol.InvertedSourceColumnOrdinal())), ord)
 	invertedExpr, err := b.buildScalar(&ctx, join.InvertedExpr)
 	if err != nil {
 		return execPlan{}, err
@@ -1595,6 +1637,7 @@ func (b *Builder) buildInvertedJoin(join *memo.InvertedJoinExpr) (execPlan, erro
 		input.root,
 		tab,
 		idx,
+		prefixEqCols,
 		lookupOrdinals,
 		onExpr,
 		join.IsFirstJoinInPairedJoiner,
@@ -2170,7 +2213,7 @@ func (b *Builder) buildSequenceSelect(seqSel *memo.SequenceSelectExpr) (execPlan
 func (b *Builder) applySaveTable(
 	input execPlan, e memo.RelExpr, saveTableName string,
 ) (execPlan, error) {
-	name := tree.NewTableName(tree.Name(opt.SaveTablesDatabase), tree.Name(saveTableName))
+	name := tree.NewTableNameWithSchema(tree.Name(opt.SaveTablesDatabase), tree.PublicSchemaName, tree.Name(saveTableName))
 
 	// Ensure that the column names are unique and match the names used by the
 	// opttester.

@@ -179,8 +179,9 @@ func (n *DropRoleNode) startExec(params runParams) error {
 				if f.Len() > 0 {
 					f.WriteString(", ")
 				}
-				parentName := lCtx.getParentName(table)
-				tn := tree.MakeTableName(tree.Name(parentName), tree.Name(table.GetName()))
+				parentName := lCtx.getDatabaseName(table)
+				schemaName := lCtx.getSchemaName(table)
+				tn := tree.MakeTableNameWithSchema(tree.Name(parentName), tree.Name(schemaName), tree.Name(table.GetName()))
 				f.FormatNode(&tn)
 				break
 			}
@@ -278,6 +279,9 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		)
 		if err != nil {
 			return err
+		}
+		if numSchedulesRow == nil {
+			return errors.New("failed to check user schedules")
 		}
 		numSchedules := int64(tree.MustBeDInt(numSchedulesRow[0]))
 		if numSchedules > 0 {

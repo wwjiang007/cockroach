@@ -53,11 +53,22 @@ func (ex *connExecutor) execPrepare(
 	// type OIDs into types.T's.
 	if parseCmd.TypeHints != nil {
 		for i := range parseCmd.TypeHints {
-			if parseCmd.TypeHints[i] == nil && types.IsOIDUserDefinedType(parseCmd.RawTypeHints[i]) {
-				var err error
-				parseCmd.TypeHints[i], err = ex.planner.ResolveTypeByOID(ctx, parseCmd.RawTypeHints[i])
-				if err != nil {
-					return retErr(err)
+			if parseCmd.TypeHints[i] == nil {
+				if i >= len(parseCmd.RawTypeHints) {
+					return retErr(
+						pgwirebase.NewProtocolViolationErrorf(
+							"expected %d arguments, got %d",
+							len(parseCmd.TypeHints),
+							len(parseCmd.RawTypeHints),
+						),
+					)
+				}
+				if types.IsOIDUserDefinedType(parseCmd.RawTypeHints[i]) {
+					var err error
+					parseCmd.TypeHints[i], err = ex.planner.ResolveTypeByOID(ctx, parseCmd.RawTypeHints[i])
+					if err != nil {
+						return retErr(err)
+					}
 				}
 			}
 		}
@@ -190,7 +201,15 @@ func (ex *connExecutor) prepare(
 	prepare := func(ctx context.Context, txn *kv.Txn) (err error) {
 		ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
 		p := &ex.planner
-		ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */)
+		if origin != PreparedStatementOriginSQL {
+			// If the PREPARE command was issued as a SQL statement, then we
+			// have already reset the planner at the very beginning of the
+			// execution (in execStmtInOpenState). We might have also
+			// instrumented the planner to collect execution statistics, and
+			// resetting the planner here would break the assumptions of the
+			// instrumentation.
+			ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */)
+		}
 		p.stmt = stmt
 		p.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
 		flags, err = ex.populatePrepared(ctx, txn, placeholderHints, p)

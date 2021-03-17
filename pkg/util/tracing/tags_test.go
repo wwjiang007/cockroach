@@ -14,13 +14,22 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/logtags"
+	"github.com/opentracing/opentracing-go"
+	zipkin "github.com/openzipkin-contrib/zipkin-go-opentracing"
 	"github.com/stretchr/testify/require"
 )
 
+type mockTracerManager struct{}
+
+func (*mockTracerManager) Name() string             { return "mock " }
+func (*mockTracerManager) Close(opentracing.Tracer) {}
+
 func TestLogTags(t *testing.T) {
 	tr := NewTracer()
-	shadowTracer := mockTracer{}
-	tr.setShadowTracer(&mockTracerManager{}, &shadowTracer)
+	rec := zipkin.NewInMemoryRecorder()
+	shadowTracer, err := zipkin.NewTracer(rec)
+	require.NoError(t, err)
+	tr.setShadowTracer(&mockTracerManager{}, shadowTracer)
 
 	l := logtags.SingleTagBuffer("tag1", "val1")
 	l = l.Add("tag2", "val2")
@@ -28,11 +37,17 @@ func TestLogTags(t *testing.T) {
 	sp1.SetVerbose(true)
 	sp1.Finish()
 	require.NoError(t, TestingCheckRecordedSpans(sp1.GetRecording(), `
-		Span foo:
-		  tags: _verbose=1 tag1=val1 tag2=val2
+		span: foo
+			tags: _verbose=1 tag1=val1 tag2=val2
 	`))
-	require.NoError(t, shadowTracer.expectSingleSpanWithTags("tag1", "tag2"))
-	shadowTracer.clear()
+	{
+		exp := opentracing.Tags(map[string]interface{}{"tag1": "val1", "tag2": "val2"})
+		require.Equal(t,
+			exp,
+			rec.GetSpans()[0].Tags,
+		)
+		rec.Reset()
+	}
 
 	RegisterTagRemapping("tag1", "one")
 	RegisterTagRemapping("tag2", "two")
@@ -41,18 +56,33 @@ func TestLogTags(t *testing.T) {
 	sp2.SetVerbose(true)
 	sp2.Finish()
 	require.NoError(t, TestingCheckRecordedSpans(sp2.GetRecording(), `
-		Span bar:
+		span: bar
 			tags: _verbose=1 one=val1 two=val2
 	`))
-	require.NoError(t, shadowTracer.expectSingleSpanWithTags("one", "two"))
-	shadowTracer.clear()
+
+	{
+		exp := opentracing.Tags(map[string]interface{}{"one": "val1", "two": "val2"})
+		require.Equal(t,
+			exp,
+			rec.GetSpans()[0].Tags,
+		)
+		rec.Reset()
+	}
 
 	sp3 := tr.StartSpan("baz", WithLogTags(l), WithForceRealSpan())
 	sp3.SetVerbose(true)
 	sp3.Finish()
 	require.NoError(t, TestingCheckRecordedSpans(sp3.GetRecording(), `
-		Span baz:
+		span: baz
 			tags: _verbose=1 one=val1 two=val2
 	`))
-	require.NoError(t, shadowTracer.expectSingleSpanWithTags("one", "two"))
+	{
+		exp := opentracing.Tags(map[string]interface{}{"one": "val1", "two": "val2"})
+		require.Equal(t,
+			exp,
+			rec.GetSpans()[0].Tags,
+		)
+		rec.Reset()
+	}
+
 }

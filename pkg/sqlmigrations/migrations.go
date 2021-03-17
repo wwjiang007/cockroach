@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -43,7 +42,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/logtags"
 )
 
 var (
@@ -334,14 +332,14 @@ var backwardCompatibleMigrations = []migrationDescriptor{
 
 func staticIDs(
 	ids ...descpb.ID,
-) func(ctx context.Context, db db, codec keys.SQLCodec) ([]descpb.ID, error) {
-	return func(ctx context.Context, db db, codec keys.SQLCodec) ([]descpb.ID, error) { return ids, nil }
+) func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) {
+	return func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) { return ids, nil }
 }
 
 func databaseIDs(
 	names ...string,
-) func(ctx context.Context, db db, codec keys.SQLCodec) ([]descpb.ID, error) {
-	return func(ctx context.Context, db db, codec keys.SQLCodec) ([]descpb.ID, error) {
+) func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) {
+	return func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error) {
 		var ids []descpb.ID
 		for _, name := range names {
 			// This runs as part of an older migration (introduced in 2.1). We use
@@ -392,7 +390,7 @@ type migrationDescriptor struct {
 	// descriptors that were added by this migration. This is needed to automate
 	// certain tests, which check the number of ranges/descriptors present on
 	// server bootup.
-	newDescriptorIDs func(ctx context.Context, db db, codec keys.SQLCodec) ([]descpb.ID, error)
+	newDescriptorIDs func(ctx context.Context, db DB, codec keys.SQLCodec) ([]descpb.ID, error)
 }
 
 func init() {
@@ -408,7 +406,7 @@ func init() {
 }
 
 type runner struct {
-	db          db
+	db          DB
 	codec       keys.SQLCodec
 	sqlExecutor *sql.InternalExecutor
 	settings    *cluster.Settings
@@ -449,9 +447,9 @@ type leaseManager interface {
 	TimeRemaining(l *leasemanager.Lease) time.Duration
 }
 
-// db is defined just to allow us to use a fake client.DB when testing this
+// DB is defined just to allow us to use a fake client.DB when testing this
 // package.
-type db interface {
+type DB interface {
 	Scan(ctx context.Context, begin, end interface{}, maxRows int64) ([]kv.KeyValue, error)
 	Get(ctx context.Context, key interface{}) (kv.KeyValue, error)
 	Put(ctx context.Context, key, value interface{}) error
@@ -463,7 +461,7 @@ type db interface {
 type Manager struct {
 	stopper      *stop.Stopper
 	leaseManager leaseManager
-	db           db
+	db           DB
 	codec        keys.SQLCodec
 	sqlExecutor  *sql.InternalExecutor
 	testingKnobs MigrationManagerTestingKnobs
@@ -508,7 +506,7 @@ func NewManager(
 // lifecycle is tightly controlled.
 func ExpectedDescriptorIDs(
 	ctx context.Context,
-	db db,
+	db DB,
 	codec keys.SQLCodec,
 	defaultZoneConfig *zonepb.ZoneConfig,
 	defaultSystemZoneConfig *zonepb.ZoneConfig,
@@ -696,202 +694,8 @@ func (m *Manager) shouldRunMigration(
 	return true
 }
 
-var systemNamespaceMigrationName = "upgrade system.namespace post-20.1-finalization"
-
-func systemNamespaceMigrationKey(codec keys.SQLCodec) roachpb.Key {
-	return append(codec.MigrationKeyPrefix(), roachpb.RKey(systemNamespaceMigrationName)...)
-}
-
-var systemNamespaceMigrationEnabled = settings.RegisterBoolSetting(
-	"testing.system_namespace_migration.enabled",
-	"internal testing only: disable the system namespace migration",
-	true,
-)
-
-// StartSystemNamespaceMigration starts an async task to run the migration that
-// migrates entries from system.namespace (descriptor 2) to system.namespace2
-// (descriptor 30). The task first waits until the upgrade to 20.1 is finalized
-// before running the migration. The migration is retried until it succeeds (on
-// any node).
-func (m *Manager) StartSystemNamespaceMigration(
-	ctx context.Context, bootstrapVersion roachpb.Version,
-) error {
-	if !bootstrapVersion.Less(clusterversion.ByKey(clusterversion.NamespaceTableWithSchemas)) {
-		// Our bootstrap version is equal to or greater than 20.1, where no old
-		// namespace table is created: we can skip this migration.
-		return nil
-	}
-	return m.stopper.RunAsyncTask(ctx, "run-system-namespace-migration", func(ctx context.Context) {
-		log.Info(ctx, "starting wait for upgrade finalization before system.namespace migration")
-		// First wait for the cluster to finalize the upgrade to 20.1. These values
-		// were chosen to be similar to the retry loop for finalizing the cluster
-		// upgrade.
-		waitRetryOpts := retry.Options{
-			InitialBackoff: 10 * time.Second,
-			MaxBackoff:     10 * time.Second,
-			Closer:         m.stopper.ShouldQuiesce(),
-		}
-		for retry := retry.StartWithCtx(ctx, waitRetryOpts); retry.Next(); {
-			if !systemNamespaceMigrationEnabled.Get(&m.settings.SV) {
-				continue
-			}
-			if m.settings.Version.IsActive(ctx, clusterversion.NamespaceTableWithSchemas) {
-				break
-			}
-		}
-		select {
-		case <-m.stopper.ShouldQuiesce():
-			return
-		default:
-		}
-		log.VEventf(ctx, 2, "detected upgrade finalization for system.namespace migration")
-
-		migrationKey := systemNamespaceMigrationKey(m.codec)
-		// Check whether this migration has already been completed.
-		if kv, err := m.db.Get(ctx, migrationKey); err != nil {
-			log.Infof(ctx, "error getting record of system.namespace migration: %s", err.Error())
-		} else if kv.Exists() {
-			log.Infof(ctx, "system.namespace migration already complete")
-			return
-		}
-
-		// Now run the migration. This is retried indefinitely until it finishes.
-		log.Infof(ctx, "starting system.namespace migration")
-		r := runner{
-			db:          m.db,
-			codec:       m.codec,
-			sqlExecutor: m.sqlExecutor,
-			settings:    m.settings,
-		}
-		migrationRetryOpts := retry.Options{
-			InitialBackoff: 1 * time.Minute,
-			MaxBackoff:     10 * time.Minute,
-			Closer:         m.stopper.ShouldQuiesce(),
-		}
-		startTime := timeutil.Now().String()
-		for migRetry := retry.Start(migrationRetryOpts); migRetry.Next(); {
-			if err := m.migrateSystemNamespace(ctx, migrationKey, r, startTime); err != nil {
-				log.Errorf(ctx, "error attempting running system.namespace migration, will retry: %s %s", err.Error(),
-					startTime)
-				continue
-			}
-			break
-		}
-	})
-}
-
-// migrateSystemNamespace migrates entries from the deprecated system.namespace
-// table to the new one, which includes a parentSchemaID column. Each database
-// entry is copied to the new table along with a corresponding entry for the
-// 'public' schema. Each table entry is copied over with the public schema as
-// as its parentSchemaID.
-//
-// Only entries that do not exist in the new table are copied.
-//
-// New database and table entries continue to be written to the deprecated
-// namespace table until NamespaceTableWithSchemas is active. This means
-// that an additional migration will be necessary in 20.2 to catch any new
-// entries which may have been missed by this one. In the meantime, namespace
-// lookups fall back to the deprecated table if a name is not found in the new
-// one.
-func (m *Manager) migrateSystemNamespace(
-	ctx context.Context, migrationKey roachpb.Key, r runner, startTime string,
-) error {
-	migrateCtx, cancel := m.stopper.WithCancelOnQuiesce(ctx)
-	defer cancel()
-	migrateCtx = logtags.AddTag(migrateCtx, "system-namespace-migration", nil)
-	// Loop until there's no more work to be done.
-	workLeft := true
-	for workLeft {
-		if err := m.db.Txn(migrateCtx, func(ctx context.Context, txn *kv.Txn) error {
-			// Check again to see if someone else wrote the migration key.
-			if kv, err := txn.Get(ctx, migrationKey); err != nil {
-				log.Infof(ctx, "error getting record of system.namespace migration: %s", err.Error())
-				// Retry the migration.
-				return err
-			} else if kv.Exists() {
-				// Give up, no work to be done.
-				log.Infof(ctx, "system.namespace migration already complete")
-				return nil
-			}
-			// Fetch all entries that are not present in the new namespace table. Each
-			// of these entries will be copied to the new table.
-			//
-			// Note that we are very careful to always delete from both namespace tables
-			// in 20.1, so there's no possibility that we'll be overwriting a deleted
-			// table that existed in the old table and the new table but was deleted
-			// from only the new table.
-			const batchSize = 1000
-			q := fmt.Sprintf(
-				`SELECT "parentID", name, id FROM [%d AS namespace_deprecated]
-              WHERE id NOT IN (SELECT id FROM [%d AS namespace]) LIMIT %d`,
-				systemschema.DeprecatedNamespaceTable.ID, systemschema.NamespaceTable.ID, batchSize+1)
-			rows, err := r.sqlExecutor.QueryEx(
-				ctx, "read-deprecated-namespace-table", txn,
-				sessiondata.InternalExecutorOverride{
-					User: security.RootUserName(),
-				},
-				q)
-			if err != nil {
-				return err
-			}
-			log.Infof(ctx, "migrating system.namespace chunk with %d rows", len(rows))
-			for i, row := range rows {
-				workLeft = false
-				// We found some rows from the query, which means that we can't quit
-				// just yet.
-				if i >= batchSize {
-					workLeft = true
-					// Just process 1000 rows at a time.
-					break
-				}
-				parentID := descpb.ID(tree.MustBeDInt(row[0]))
-				name := string(tree.MustBeDString(row[1]))
-				id := descpb.ID(tree.MustBeDInt(row[2]))
-				if parentID == keys.RootNamespaceID {
-					// This row represents a database. Add it to the new namespace table.
-					databaseKey := catalogkeys.NewDatabaseKey(name)
-					if err := txn.Put(ctx, databaseKey.Key(r.codec), id); err != nil {
-						return err
-					}
-					// Also create a 'public' schema for this database.
-					schemaKey := catalogkeys.NewSchemaKey(id, "public")
-					log.VEventf(ctx, 2, "migrating system.namespace entry for database %s", name)
-					if err := txn.Put(ctx, schemaKey.Key(r.codec), keys.PublicSchemaID); err != nil {
-						return err
-					}
-				} else {
-					// This row represents a table. Add it to the new namespace table with the
-					// schema set to 'public'.
-					if id == keys.DeprecatedNamespaceTableID {
-						// The namespace table itself was already handled in
-						// createNewSystemNamespaceDescriptor. Do not overwrite it with the
-						// deprecated ID.
-						continue
-					}
-					tableKey := catalogkeys.NewTableKey(parentID, keys.PublicSchemaID, name)
-					log.VEventf(ctx, 2, "migrating system.namespace entry for table %s", name)
-					if err := txn.Put(ctx, tableKey.Key(r.codec), id); err != nil {
-						return err
-					}
-				}
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	// No more work to be done.
-	log.Infof(migrateCtx, "system.namespace migration completed")
-	if err := m.db.Put(migrateCtx, migrationKey, startTime); err != nil {
-		log.Warningf(migrateCtx, "error persisting record of system.namespace migration, will retry: %s", err.Error())
-		return err
-	}
-	return nil
-}
-
 func getCompletedMigrations(
-	ctx context.Context, db db, codec keys.SQLCodec,
+	ctx context.Context, db DB, codec keys.SQLCodec,
 ) (map[string]struct{}, error) {
 	if log.V(1) {
 		log.Info(ctx, "trying to get the list of completed migrations")
@@ -913,14 +717,26 @@ func migrationKey(codec keys.SQLCodec, migration migrationDescriptor) roachpb.Ke
 }
 
 func createSystemTable(ctx context.Context, r runner, desc catalog.TableDescriptor) error {
+	return CreateSystemTable(ctx, r.db, r.codec, r.settings, desc)
+}
+
+// CreateSystemTable is a function to inject a new system table. If the table
+// already exists, ths function is a no-op.
+func CreateSystemTable(
+	ctx context.Context,
+	db DB,
+	codec keys.SQLCodec,
+	settings *cluster.Settings,
+	desc catalog.TableDescriptor,
+) error {
 	// We install the table at the KV layer so that we can choose a known ID in
 	// the reserved ID space. (The SQL layer doesn't allow this.)
-	err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		b := txn.NewBatch()
-		tKey := catalogkv.MakePublicTableNameKey(ctx, r.settings, desc.GetParentID(), desc.GetName())
-		b.CPut(tKey.Key(r.codec), desc.GetID(), nil)
-		b.CPut(catalogkeys.MakeDescMetadataKey(r.codec, desc.GetID()), desc.DescriptorProto(), nil)
-		if err := txn.SetSystemConfigTrigger(r.codec.ForSystemTenant()); err != nil {
+		tKey := catalogkv.MakePublicTableNameKey(ctx, settings, desc.GetParentID(), desc.GetName())
+		b.CPut(tKey.Key(codec), desc.GetID(), nil)
+		b.CPut(catalogkeys.MakeDescMetadataKey(codec, desc.GetID()), desc.DescriptorProto(), nil)
+		if err := txn.SetSystemConfigTrigger(codec.ForSystemTenant()); err != nil {
 			return err
 		}
 		return txn.Run(ctx, b)
@@ -947,7 +763,8 @@ func createNewSystemNamespaceDescriptor(ctx context.Context, r runner) error {
 		if err != nil {
 			return err
 		}
-		descpb.TableFromDescriptor(deprecatedDesc, ts).Name = systemschema.DeprecatedNamespaceTable.Name
+		deprecatedTable, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(deprecatedDesc, ts)
+		deprecatedTable.Name = systemschema.DeprecatedNamespaceTable.GetName()
 		b.Put(deprecatedKey, deprecatedDesc)
 
 		// The 19.2 namespace table contains an entry for "namespace" which maps to
@@ -1137,7 +954,7 @@ func createDefaultDbs(ctx context.Context, r runner) error {
 	for retry := retry.Start(retry.Options{MaxRetries: 5}); retry.Next(); {
 		for _, dbName := range []string{catalogkeys.DefaultDatabaseName, catalogkeys.PgDatabaseName} {
 			stmt := fmt.Sprintf(createDbStmt, dbName)
-			err = r.execAsRoot(ctx, "create-default-db", stmt)
+			err = r.execAsRoot(ctx, "create-default-DB", stmt)
 			if err != nil {
 				log.Warningf(ctx, "failed attempt to add database %q: %s", dbName, err)
 				break
@@ -1195,6 +1012,9 @@ func updateSystemLocationData(ctx context.Context, r runner) error {
 		`SELECT count(*) FROM system.locations`)
 	if err != nil {
 		return err
+	}
+	if row == nil {
+		return errors.New("failed to update system locations")
 	}
 	count := int(tree.MustBeDInt(row[0]))
 	if count != 0 {

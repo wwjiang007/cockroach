@@ -225,6 +225,9 @@ func (r *Registry) insertRequestInternal(ctx context.Context, fprint string) (Re
 		if err != nil {
 			return err
 		}
+		if row == nil {
+			return errors.New("failed to check pending statement diagnostics")
+		}
 		count := int(*row[0].(*tree.DInt))
 		if count != 0 {
 			return errors.New("a pending request for the requested fingerprint already exists")
@@ -239,6 +242,9 @@ func (r *Registry) insertRequestInternal(ctx context.Context, fprint string) (Re
 			fprint, timeutil.Now())
 		if err != nil {
 			return err
+		}
+		if row == nil {
+			return errors.New("failed to insert statement diagnostics request")
 		}
 		reqID = RequestID(*row[0].(*tree.DInt))
 		return nil
@@ -341,6 +347,9 @@ func (r *Registry) InsertStatementDiagnostics(
 			if err != nil {
 				return err
 			}
+			if row == nil {
+				return errors.New("failed to check completed statement diagnostics")
+			}
 			cnt := int(*row[0].(*tree.DInt))
 			if cnt == 0 {
 				// Someone else already marked the request as completed. We've traced for nothing.
@@ -376,6 +385,9 @@ func (r *Registry) InsertStatementDiagnostics(
 			if err != nil {
 				return err
 			}
+			if row == nil {
+				return errors.New("failed to check statement bundle chunk")
+			}
 			chunkID := row[0].(*tree.DInt)
 			if err := bundleChunksVal.Append(chunkID); err != nil {
 				return err
@@ -389,12 +401,15 @@ func (r *Registry) InsertStatementDiagnostics(
 			ctx, "stmt-diag-insert", txn,
 			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
 			"INSERT INTO system.statement_diagnostics "+
-				"(statement_fingerprint, statement, collected_at, trace, bundle_chunks, error) "+
-				"VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-			stmtFingerprint, stmt, collectionTime, traceJSON, bundleChunksVal, errorVal,
+				"(statement_fingerprint, statement, collected_at, bundle_chunks, error) "+
+				"VALUES ($1, $2, $3, $4, $5) RETURNING id",
+			stmtFingerprint, stmt, collectionTime, bundleChunksVal, errorVal,
 		)
 		if err != nil {
 			return err
+		}
+		if row == nil {
+			return errors.New("failed to insert statement diagnostics")
 		}
 		diagID = CollectedInstanceID(*row[0].(*tree.DInt))
 
@@ -440,13 +455,20 @@ func (r *Registry) pollRequests(ctx context.Context) error {
 		epoch := r.mu.epoch
 		r.mu.Unlock()
 
-		var err error
-		rows, err = r.ie.QueryEx(ctx, "stmt-diag-poll", nil, /* txn */
+		it, err := r.ie.QueryIteratorEx(ctx, "stmt-diag-poll", nil, /* txn */
 			sessiondata.InternalExecutorOverride{
 				User: security.RootUserName(),
 			},
 			"SELECT id, statement_fingerprint FROM system.statement_diagnostics_requests "+
 				"WHERE completed = false")
+		if err != nil {
+			return err
+		}
+		rows = rows[:0]
+		var ok bool
+		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
+			rows = append(rows, it.Cur())
+		}
 		if err != nil {
 			return err
 		}

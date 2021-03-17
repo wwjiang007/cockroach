@@ -97,6 +97,16 @@ var testCases = []testCase{
 		ops: []op{
 			protectOp{spans: tableSpans(42)},
 			funcOp(func(ctx context.Context, t *testing.T, tCtx *testContext) {
+				// When max_bytes or max_spans is set to 0 (i.e. unlimited), and a
+				// protect op fails because the record already exists, we should report
+				// that the record already exists, and not erroneously report that the
+				// max_bytes or max_spans has been exceeded.
+				_, err := tCtx.tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.protectedts.max_bytes = $1", 0)
+				require.NoError(t, err)
+				_, err = tCtx.tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.protectedts.max_spans = $1", 0)
+				require.NoError(t, err)
+			}),
+			funcOp(func(ctx context.Context, t *testing.T, tCtx *testContext) {
 				rec := newRecord(tCtx.tc.Server(0).Clock().Now(), "", nil, tableSpan(42))
 				rec.ID = pickOneRecord(tCtx)
 				err := tCtx.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -653,34 +663,12 @@ func (ie *wrappedInternalExecutor) ExecEx(
 	stmt string,
 	qargs ...interface{},
 ) (int, error) {
-	panic("unimplemented")
-}
-
-func (ie *wrappedInternalExecutor) QueryEx(
-	ctx context.Context,
-	opName string,
-	txn *kv.Txn,
-	session sessiondata.InternalExecutorOverride,
-	stmt string,
-	qargs ...interface{},
-) ([]tree.Datums, error) {
 	if f := ie.getErrFunc(); f != nil {
 		if err := f(stmt); err != nil {
-			return nil, err
+			return 0, err
 		}
 	}
-	return ie.wrapped.QueryEx(ctx, opName, txn, session, stmt, qargs...)
-}
-
-func (ie *wrappedInternalExecutor) QueryWithCols(
-	ctx context.Context,
-	opName string,
-	txn *kv.Txn,
-	o sessiondata.InternalExecutorOverride,
-	statement string,
-	qargs ...interface{},
-) ([]tree.Datums, colinfo.ResultColumns, error) {
-	panic("unimplemented")
+	return ie.wrapped.ExecEx(ctx, opName, txn, o, stmt, qargs...)
 }
 
 func (ie *wrappedInternalExecutor) QueryRowEx(
@@ -699,16 +687,60 @@ func (ie *wrappedInternalExecutor) QueryRowEx(
 	return ie.wrapped.QueryRowEx(ctx, opName, txn, session, stmt, qargs...)
 }
 
-func (ie *wrappedInternalExecutor) Query(
-	ctx context.Context, opName string, txn *kv.Txn, statement string, params ...interface{},
-) ([]tree.Datums, error) {
-	panic("not implemented")
-}
-
 func (ie *wrappedInternalExecutor) QueryRow(
 	ctx context.Context, opName string, txn *kv.Txn, statement string, qargs ...interface{},
 ) (tree.Datums, error) {
 	panic("not implemented")
+}
+
+func (ie *wrappedInternalExecutor) QueryRowExWithCols(
+	ctx context.Context,
+	opName string,
+	txn *kv.Txn,
+	session sessiondata.InternalExecutorOverride,
+	stmt string,
+	qargs ...interface{},
+) (tree.Datums, colinfo.ResultColumns, error) {
+	panic("not implemented")
+}
+
+func (ie *wrappedInternalExecutor) QueryBuffered(
+	ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
+) ([]tree.Datums, error) {
+	panic("not implemented")
+}
+
+func (ie *wrappedInternalExecutor) QueryBufferedEx(
+	ctx context.Context,
+	opName string,
+	txn *kv.Txn,
+	session sessiondata.InternalExecutorOverride,
+	stmt string,
+	qargs ...interface{},
+) ([]tree.Datums, error) {
+	panic("not implemented")
+}
+
+func (ie *wrappedInternalExecutor) QueryIterator(
+	ctx context.Context, opName string, txn *kv.Txn, stmt string, qargs ...interface{},
+) (sqlutil.InternalRows, error) {
+	panic("not implemented")
+}
+
+func (ie *wrappedInternalExecutor) QueryIteratorEx(
+	ctx context.Context,
+	opName string,
+	txn *kv.Txn,
+	session sessiondata.InternalExecutorOverride,
+	stmt string,
+	qargs ...interface{},
+) (sqlutil.InternalRows, error) {
+	if f := ie.getErrFunc(); f != nil {
+		if err := f(stmt); err != nil {
+			return nil, err
+		}
+	}
+	return ie.wrapped.QueryIteratorEx(ctx, opName, txn, session, stmt, qargs...)
 }
 
 func (ie *wrappedInternalExecutor) getErrFunc() func(statement string) error {

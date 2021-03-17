@@ -41,8 +41,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -189,7 +190,11 @@ func runDebugKeys(cmd *cobra.Command, args []string) error {
 		if err := protoutil.Unmarshal(bytes, &desc); err != nil {
 			return err
 		}
-		table := tabledesc.NewImmutable(*descpb.TableFromDescriptor(&desc, hlc.Timestamp{}))
+		b := catalogkv.NewBuilder(&desc)
+		if b == nil || b.DescriptorType() != catalog.Table {
+			return errors.Newf("expected a table descriptor")
+		}
+		table := b.BuildImmutable().(catalog.TableDescriptor)
 
 		fn := func(kv storage.MVCCKeyValue) (string, error) {
 			var v roachpb.Value
@@ -279,8 +284,13 @@ func runDebugBallast(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 	ballastSize := targetUsage - used
+
+	// Note: CreateLargeFile fails if the target file already
+	// exists. This is a feature; we have seen users mistakenly applying
+	// the `ballast` command directly to block devices, thereby trashing
+	// their filesystem.
 	if err := sysutil.CreateLargeFile(ballastFile, ballastSize); err != nil {
-		return errors.Wrap(err, "failed to fallocate to ballast file")
+		return errors.Wrap(err, "error allocating ballast file")
 	}
 	return nil
 }
@@ -864,7 +874,8 @@ var debugUnsafeRemoveDeadReplicasCmd = &cobra.Command{
 This command is UNSAFE and should only be used with the supervision of
 a Cockroach Labs engineer. It is a last-resort option to recover data
 after multiple node failures. The recovered data is not guaranteed to
-be consistent.
+be consistent. If a suitable backup exists, restore it instead of
+using this tool.
 
 The --dead-store-ids flag takes a comma-separated list of dead store
 IDs and scans this store for any ranges whose only live replica is on
@@ -872,11 +883,34 @@ this store. These range descriptors will be edited to forcibly remove
 the dead stores, allowing the range to recover from this single
 replica.
 
+This command will prompt for confirmation before committing its changes.
+
+It is safest to run this command while all nodes are stopped. In some
+circumstances it may be possible to run it while some nodes are still
+running provided all nodes containing replicas of nodes that have lost
+quorum are stopped.
+
+It is recommended to take a filesystem-level backup or snapshot of the
+nodes to be affected before running this command (remember that it is
+not safe to take a filesystem-level backup of a running node, but it is
+possible while the node is stopped)
+
+WARNINGS
+
+This tool will cause previously committed data to be lost. It does not
+preserve atomicity of transactions, so further inconsistencies and
+undefined behavior may result. Before proceeding at the yes/no prompt,
+review the ranges that are affected to consider the possible impact
+of inconsistencies. Further remediation may be necessary after running
+this tool, including dropping and recreating affected indexes, or in the
+worst case creating a new backup or export of this cluster's data for
+restoration into a brand new cluster. Because of the latter possibilities,
+this tool is a slower means of disaster recovery than restoring from
+a backup.
+
 Must only be used when the dead stores are lost and unrecoverable. If
 the dead stores were to rejoin the cluster after this command was
 used, data may be corrupted.
-
-This command will prompt for confirmation before committing its changes.
 
 After this command is used, the node should not be restarted until at
 least 10 seconds have passed since it was stopped. Restarting it too
@@ -955,7 +989,7 @@ func removeDeadReplicas(
 	err = kvserver.IterateRangeDescriptors(ctx, db, func(desc roachpb.RangeDescriptor) error {
 		hasSelf := false
 		numDeadPeers := 0
-		allReplicas := desc.Replicas().All()
+		allReplicas := desc.Replicas().Descriptors()
 		maxLivePeer := roachpb.StoreID(-1)
 		for _, rep := range allReplicas {
 			if rep.StoreID == storeIdent.StoreID {
@@ -998,7 +1032,7 @@ func removeDeadReplicas(
 				StoreID:   storeIdent.StoreID,
 				ReplicaID: desc.NextReplicaID,
 			}}
-			newDesc.SetReplicas(roachpb.MakeReplicaDescriptors(replicas))
+			newDesc.SetReplicas(roachpb.MakeReplicaSet(replicas))
 			newDesc.NextReplicaID++
 			fmt.Printf("Replica %s -> %s\n", &desc, &newDesc)
 			newDescs = append(newDescs, newDesc)
@@ -1195,7 +1229,7 @@ process that has failed and cannot restart.
 	RunE: usageAndErr,
 }
 
-// mvccValueFormatter is an fmt.Formatter for MVCC values.
+// mvccValueFormatter is a fmt.Formatter for MVCC values.
 type mvccValueFormatter struct {
 	kv  storage.MVCCKeyValue
 	err error
@@ -1210,18 +1244,34 @@ func (m mvccValueFormatter) Format(f fmt.State, c rune) {
 	fmt.Fprint(f, kvserver.SprintKeyValue(m.kv, false /* printKey */))
 }
 
+// lockValueFormatter is a fmt.Formatter for lock values.
+type lockValueFormatter struct {
+	value []byte
+}
+
+// Format implements the fmt.Formatter interface.
+func (m lockValueFormatter) Format(f fmt.State, c rune) {
+	fmt.Fprint(f, kvserver.SprintIntent(m.value))
+}
+
 func init() {
 	DebugCmd.AddCommand(debugCmds...)
 
 	// Note: we hook up FormatValue here in order to avoid a circular dependency
 	// between kvserver and storage.
-	// TODO(sumeer): fix this to also format EngineKey KVs.
 	storage.EngineComparer.FormatValue = func(key, value []byte) fmt.Formatter {
-		decoded, err := storage.DecodeMVCCKey(key)
-		if err != nil {
-			return mvccValueFormatter{err: err}
+		decoded, ok := storage.DecodeEngineKey(key)
+		if !ok {
+			return mvccValueFormatter{err: errors.Errorf("invalid encoded engine key: %x", key)}
 		}
-		return mvccValueFormatter{kv: storage.MVCCKeyValue{Key: decoded, Value: value}}
+		if decoded.IsMVCCKey() {
+			mvccKey, err := decoded.ToMVCCKey()
+			if err != nil {
+				return mvccValueFormatter{err: err}
+			}
+			return mvccValueFormatter{kv: storage.MVCCKeyValue{Key: mvccKey, Value: value}}
+		}
+		return lockValueFormatter{value: value}
 	}
 
 	// To be able to read Cockroach-written RocksDB manifests/SSTables, comparator

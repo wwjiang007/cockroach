@@ -16,8 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -31,6 +31,7 @@ import (
 // stream are assumed to be ordered according to the same set of columns.
 type OrderedSynchronizer struct {
 	allocator             *colmem.Allocator
+	memoryLimit           int64
 	inputs                []SynchronizerInput
 	ordering              colinfo.ColumnOrdering
 	typs                  []*types.T
@@ -77,8 +78,8 @@ type OrderedSynchronizer struct {
 }
 
 var (
-	_ colexecbase.Operator = &OrderedSynchronizer{}
-	_ colexecbase.Closer   = &OrderedSynchronizer{}
+	_ colexecop.Operator = &OrderedSynchronizer{}
+	_ colexecop.Closer   = &OrderedSynchronizer{}
 )
 
 // ChildCount implements the execinfrapb.OpNode interface.
@@ -92,14 +93,17 @@ func (o *OrderedSynchronizer) Child(nth int, verbose bool) execinfra.OpNode {
 }
 
 // NewOrderedSynchronizer creates a new OrderedSynchronizer.
+// - memoryLimit will limit the size of batches produced by the synchronizer.
 func NewOrderedSynchronizer(
 	allocator *colmem.Allocator,
+	memoryLimit int64,
 	inputs []SynchronizerInput,
 	typs []*types.T,
 	ordering colinfo.ColumnOrdering,
 ) (*OrderedSynchronizer, error) {
 	return &OrderedSynchronizer{
 		allocator:             allocator,
+		memoryLimit:           memoryLimit,
 		inputs:                inputs,
 		ordering:              ordering,
 		typs:                  typs,
@@ -255,7 +259,9 @@ func (o *OrderedSynchronizer) Next(ctx context.Context) coldata.Batch {
 
 func (o *OrderedSynchronizer) resetOutput() {
 	var reallocated bool
-	o.output, reallocated = o.allocator.ResetMaybeReallocate(o.typs, o.output, 1 /* minCapacity */)
+	o.output, reallocated = o.allocator.ResetMaybeReallocate(
+		o.typs, o.output, 1 /* minCapacity */, o.memoryLimit,
+	)
 	if reallocated {
 		o.outBoolCols = o.outBoolCols[:0]
 		o.outBytesCols = o.outBytesCols[:0]

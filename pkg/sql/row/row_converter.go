@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
@@ -94,7 +93,7 @@ func GenerateInsertRow(
 	insertCols []descpb.ColumnDescriptor,
 	computedColsLookup []descpb.ColumnDescriptor,
 	evalCtx *tree.EvalContext,
-	tableDesc *tabledesc.Immutable,
+	tableDesc catalog.TableDescriptor,
 	rowVals tree.Datums,
 	rowContainerForComputedVals *schemaexpr.RowIndexedVarContainer,
 ) (tree.Datums, error) {
@@ -164,9 +163,9 @@ func GenerateInsertRow(
 
 	// Check to see if NULL is being inserted into any non-nullable column.
 	for _, col := range tableDesc.WritableColumns() {
-		if !col.Nullable {
-			if i, ok := rowContainerForComputedVals.Mapping.Get(col.ID); !ok || rowVals[i] == tree.DNull {
-				return nil, sqlerrors.NewNonNullViolationError(col.Name)
+		if !col.IsNullable() {
+			if i, ok := rowContainerForComputedVals.Mapping.Get(col.GetID()); !ok || rowVals[i] == tree.DNull {
+				return nil, sqlerrors.NewNonNullViolationError(col.GetName())
 			}
 		}
 	}
@@ -206,7 +205,7 @@ type DatumRowConverter struct {
 	KvBatch  KVBatch
 	BatchCap int
 
-	tableDesc *tabledesc.Immutable
+	tableDesc catalog.TableDescriptor
 
 	// Tracks which column indices in the set of visible columns are part of the
 	// user specified target columns. This can be used before populating Datums
@@ -229,6 +228,7 @@ type DatumRowConverter struct {
 }
 
 var kvDatumRowConverterBatchSize = util.ConstantWithMetamorphicTestValue(
+	"datum-row-converter-batch-size",
 	5000, /* defaultValue */
 	1,    /* metamorphicValue */
 )
@@ -248,7 +248,7 @@ func TestingSetDatumRowConverterBatchSize(newSize int) func() {
 // expression using the sequence.
 func (c *DatumRowConverter) getSequenceAnnotation(
 	evalCtx *tree.EvalContext, cols []descpb.ColumnDescriptor,
-) (map[string]*SequenceMetadata, error) {
+) (map[string]*SequenceMetadata, map[descpb.ID]*SequenceMetadata, error) {
 	// Identify the sequences used in all the columns.
 	sequenceIDs := make(map[descpb.ID]struct{})
 	for _, col := range cols {
@@ -258,12 +258,14 @@ func (c *DatumRowConverter) getSequenceAnnotation(
 	}
 
 	if len(sequenceIDs) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var seqNameToMetadata map[string]*SequenceMetadata
+	var seqIDToMetadata map[descpb.ID]*SequenceMetadata
 	err := evalCtx.DB.Txn(evalCtx.Context, func(ctx context.Context, txn *kv.Txn) error {
 		seqNameToMetadata = make(map[string]*SequenceMetadata)
+		seqIDToMetadata = make(map[descpb.ID]*SequenceMetadata)
 		txn.SetFixedTimestamp(ctx, hlc.Timestamp{WallTime: evalCtx.TxnTimestamp.UnixNano()})
 		for seqID := range sequenceIDs {
 			seqDesc, err := catalogkv.MustGetTableDescByID(ctx, txn, evalCtx.Codec, seqID)
@@ -271,25 +273,27 @@ func (c *DatumRowConverter) getSequenceAnnotation(
 				return err
 			}
 
-			seqOpts := seqDesc.SequenceOpts
+			seqOpts := seqDesc.GetSequenceOpts()
 			if seqOpts == nil {
-				return errors.Newf("descriptor %s is not a sequence", seqDesc.Name)
+				return errors.Newf("descriptor %s is not a sequence", seqDesc.GetName())
 			}
 
-			seqNameToMetadata[seqDesc.Name] = &SequenceMetadata{
+			seqMetadata := &SequenceMetadata{
 				id:      seqID,
 				seqDesc: seqDesc,
 			}
+			seqNameToMetadata[seqDesc.GetName()] = seqMetadata
+			seqIDToMetadata[seqDesc.GetID()] = seqMetadata
 		}
 		return nil
 	})
-	return seqNameToMetadata, err
+	return seqNameToMetadata, seqIDToMetadata, err
 }
 
 // NewDatumRowConverter returns an instance of a DatumRowConverter.
 func NewDatumRowConverter(
 	ctx context.Context,
-	tableDesc *tabledesc.Immutable,
+	tableDesc catalog.TableDescriptor,
 	targetColNames tree.NameList,
 	evalCtx *tree.EvalContext,
 	kvCh chan<- KVBatch,
@@ -301,24 +305,26 @@ func NewDatumRowConverter(
 		EvalCtx:   evalCtx.Copy(),
 	}
 
-	var targetColDescriptors []descpb.ColumnDescriptor
+	var targetCols []catalog.Column
 	var err error
 	// IMPORT INTO allows specifying target columns which could be a subset of
 	// immutDesc.VisibleColumns. If no target columns are specified we assume all
 	// columns of the table descriptor are to be inserted into.
 	if len(targetColNames) != 0 {
-		if targetColDescriptors, err = colinfo.ProcessTargetColumns(tableDesc, targetColNames,
+		if targetCols, err = colinfo.ProcessTargetColumns(tableDesc, targetColNames,
 			true /* ensureColumns */, false /* allowMutations */); err != nil {
 			return nil, err
 		}
 	} else {
-		targetColDescriptors = tableDesc.VisibleColumns()
+		targetCols = tableDesc.VisibleColumns()
 	}
 
+	targetColDescriptors := make([]descpb.ColumnDescriptor, len(targetCols))
 	var targetColIDs catalog.TableColSet
-	for i, col := range targetColDescriptors {
+	for i, col := range targetCols {
 		c.TargetColOrds.Add(i)
-		targetColIDs.Add(col.ID)
+		targetColIDs.Add(col.GetID())
+		targetColDescriptors[i] = *col.ColumnDesc()
 	}
 
 	var txCtx transform.ExprTransformContext
@@ -361,11 +367,12 @@ func NewDatumRowConverter(
 	var cellInfoAnnot CellInfoAnnotation
 	// Currently, this is only true for an IMPORT INTO CSV.
 	if seqChunkProvider != nil {
-		seqNameToMetadata, err := c.getSequenceAnnotation(evalCtx, c.cols)
+		seqNameToMetadata, seqIDToMetadata, err := c.getSequenceAnnotation(evalCtx, c.cols)
 		if err != nil {
 			return nil, err
 		}
 		cellInfoAnnot.seqNameToMetadata = seqNameToMetadata
+		cellInfoAnnot.seqIDToMetadata = seqIDToMetadata
 		cellInfoAnnot.seqChunkProvider = seqChunkProvider
 	}
 	cellInfoAnnot.uniqueRowIDInstance = 0
@@ -414,24 +421,27 @@ func NewDatumRowConverter(
 		return nil, errors.New("unexpected hidden column")
 	}
 
-	padding := 2 * (len(tableDesc.GetPublicNonPrimaryIndexes()) + len(tableDesc.Families))
+	padding := 2 * (len(tableDesc.PublicNonPrimaryIndexes()) + len(tableDesc.GetFamilies()))
 	c.BatchCap = kvDatumRowConverterBatchSize + padding
 	c.KvBatch.KVs = make([]roachpb.KeyValue, 0, c.BatchCap)
 
-	colsOrdered := make([]descpb.ColumnDescriptor, len(c.tableDesc.Columns))
-	for _, col := range c.tableDesc.Columns {
+	colDescs := make([]descpb.ColumnDescriptor, len(c.tableDesc.PublicColumns()))
+	colsOrdered := make([]descpb.ColumnDescriptor, len(cols))
+	for i, col := range c.tableDesc.PublicColumns() {
+		colDescs[i] = *col.ColumnDesc()
 		// We prefer to have the order of columns that will be sent into
 		// MakeComputedExprs to map that of Datums.
-		colsOrdered[ri.InsertColIDtoRowIndex.GetDefault(col.ID)] = col
+		colsOrdered[ri.InsertColIDtoRowIndex.GetDefault(col.GetID())] = colDescs[i]
 	}
 	// Here, computeExprs will be nil if there's no computed column, or
 	// the list of computed expressions (including nil, for those columns
 	// that are not computed) otherwise, according to colsOrdered.
-	c.computedExprs, err = schemaexpr.MakeComputedExprs(
+	c.computedExprs, _, err = schemaexpr.MakeComputedExprs(
 		ctx,
 		colsOrdered,
+		colDescs,
 		c.tableDesc,
-		tree.NewUnqualifiedTableName(tree.Name(c.tableDesc.Name)),
+		tree.NewUnqualifiedTableName(tree.Name(c.tableDesc.GetName())),
 		c.EvalCtx,
 		&semaCtx)
 	if err != nil {
@@ -440,7 +450,10 @@ func NewDatumRowConverter(
 
 	c.computedIVarContainer = schemaexpr.RowIndexedVarContainer{
 		Mapping: ri.InsertColIDtoRowIndex,
-		Cols:    tableDesc.Columns,
+		Cols:    make([]descpb.ColumnDescriptor, len(tableDesc.PublicColumns())),
+	}
+	for i, col := range tableDesc.PublicColumns() {
+		c.computedIVarContainer.Cols[i] = *col.ColumnDesc()
 	}
 	return c, nil
 }
@@ -473,7 +486,11 @@ func (c *DatumRowConverter) Row(ctx context.Context, sourceID int32, rowIndex in
 
 	var computedColsLookup []descpb.ColumnDescriptor
 	if len(c.computedExprs) > 0 {
-		computedColsLookup = c.tableDesc.Columns
+		cols := c.tableDesc.PublicColumns()
+		computedColsLookup = make([]descpb.ColumnDescriptor, len(cols))
+		for i, col := range cols {
+			computedColsLookup[i] = *col.ColumnDesc()
+		}
 	}
 
 	insertRow, err := GenerateInsertRow(

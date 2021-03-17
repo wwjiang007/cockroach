@@ -13,21 +13,20 @@ go_library(
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util",
-        "//pkg/util/json",
-        "//pkg/util/log",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
 go_test(
     name = "idxconstraint_test",
+    size = "small",
     srcs = ["index_constraints_test.go"],
     data = glob(["testdata/**"]),
     deps = [
+        ":idxconstraint",
         "//pkg/settings/cluster",
         "//pkg/sql/opt",
         "//pkg/sql/opt/exec/execbuilder",
-        "//pkg/sql/opt/idxconstraint",
         "//pkg/sql/opt/memo",
         "//pkg/sql/opt/norm",
         "//pkg/sql/opt/optbuilder",

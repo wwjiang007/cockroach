@@ -16,11 +16,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach-go/crdb"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -214,7 +216,13 @@ func TestEncoders(t *testing.T) {
 				t.Fatalf(`unknown format: %s`, o[changefeedbase.OptFormat])
 			}
 
-			e, err := getEncoder(o)
+			target := jobspb.ChangefeedTarget{
+				StatementTimeName: tableDesc.GetName(),
+			}
+			targets := jobspb.ChangefeedTargets{}
+			targets[tableDesc.GetID()] = target
+
+			e, err := getEncoder(o, targets)
 			if len(expected.err) > 0 {
 				require.EqualError(t, err, expected.err)
 				return
@@ -261,14 +269,16 @@ type testSchemaRegistry struct {
 	server *httptest.Server
 	mu     struct {
 		syncutil.Mutex
-		idAlloc int32
-		schemas map[int32]string
+		idAlloc  int32
+		schemas  map[int32]string
+		subjects map[string]int32
 	}
 }
 
 func makeTestSchemaRegistry() *testSchemaRegistry {
 	r := &testSchemaRegistry{}
 	r.mu.schemas = make(map[int32]string)
+	r.mu.subjects = make(map[string]int32)
 	r.server = httptest.NewServer(http.HandlerFunc(r.Register))
 	return r
 }
@@ -292,9 +302,11 @@ func (r *testSchemaRegistry) Register(hw http.ResponseWriter, hr *http.Request) 
 		}
 
 		r.mu.Lock()
+		subject := strings.Split(hr.URL.Path, "/")[2]
 		id := r.mu.idAlloc
 		r.mu.idAlloc++
 		r.mu.schemas[id] = req.Schema
+		r.mu.subjects[subject] = id
 		r.mu.Unlock()
 
 		res, err := gojson.Marshal(confluentSchemaVersionResponse{ID: id})
@@ -388,6 +400,195 @@ func TestAvroEncoder(t *testing.T) {
 	t.Run(`enterprise`, enterpriseTest(testFn))
 }
 
+func TestAvroSchemaNaming(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		reg := makeTestSchemaRegistry()
+		defer reg.Close()
+
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE DATABASE movr`)
+		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t,
+			`INSERT INTO movr.drivers VALUES (1, 'Alice')`,
+		)
+
+		movrFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers `+
+			`WITH format=$1, confluent_schema_registry=$2`,
+			changefeedbase.OptFormatAvro, reg.server.URL)
+		defer closeFeed(t, movrFeed)
+
+		assertPayloadsAvro(t, reg, movrFeed, []string{
+			`drivers: {"id":{"long":1}}->{"after":{"drivers":{"id":{"long":1},"name":{"string":"Alice"}}}}`,
+		})
+
+		assertRegisteredSubjects(t, reg, []string{
+			`drivers-key`,
+			`drivers-value`,
+		})
+
+		fqnFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers `+
+			`WITH format=$1, confluent_schema_registry=$2, full_table_name`,
+			changefeedbase.OptFormatAvro, reg.server.URL)
+		defer closeFeed(t, fqnFeed)
+
+		assertPayloadsAvro(t, reg, fqnFeed, []string{
+			`movr.public.drivers: {"id":{"long":1}}->{"after":{"drivers":{"id":{"long":1},"name":{"string":"Alice"}}}}`,
+		})
+
+		assertRegisteredSubjects(t, reg, []string{
+			`drivers-key`,
+			`drivers-value`,
+			`movr.public.drivers-key`,
+			`movr.public.drivers-value`,
+		})
+
+		prefixFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers `+
+			`WITH format=$1, confluent_schema_registry=$2, avro_schema_prefix=super`,
+			changefeedbase.OptFormatAvro, reg.server.URL)
+		defer closeFeed(t, prefixFeed)
+
+		assertPayloadsAvro(t, reg, prefixFeed, []string{
+			`drivers: {"id":{"long":1}}->{"after":{"super.drivers":{"id":{"long":1},"name":{"string":"Alice"}}}}`,
+		})
+
+		assertRegisteredSubjects(t, reg, []string{
+			`drivers-key`,
+			`drivers-value`,
+			`movr.public.drivers-key`,
+			`movr.public.drivers-value`,
+			`superdrivers-key`,
+			`superdrivers-value`,
+		})
+
+		prefixFQNFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers `+
+			`WITH format=$1, confluent_schema_registry=$2, avro_schema_prefix=super, full_table_name`,
+			changefeedbase.OptFormatAvro, reg.server.URL)
+		defer closeFeed(t, prefixFQNFeed)
+
+		assertPayloadsAvro(t, reg, prefixFQNFeed, []string{
+			`movr.public.drivers: {"id":{"long":1}}->{"after":{"super.drivers":{"id":{"long":1},"name":{"string":"Alice"}}}}`,
+		})
+
+		assertRegisteredSubjects(t, reg, []string{
+			`drivers-key`,
+			`drivers-value`,
+			`movr.public.drivers-key`,
+			`movr.public.drivers-value`,
+			`superdrivers-key`,
+			`superdrivers-value`,
+			`supermovr.public.drivers-key`,
+			`supermovr.public.drivers-value`,
+		})
+
+		//Both changes to the subject are also reflected in the schema name in the posted schemas
+		require.Contains(t, reg.mu.schemas[reg.mu.subjects[`supermovr.public.drivers-key`]], `supermovr`)
+		require.Contains(t, reg.mu.schemas[reg.mu.subjects[`supermovr.public.drivers-value`]], `supermovr`)
+	}
+
+	t.Run(`enterprise`, enterpriseTest(testFn))
+}
+
+func TestAvroSchemaNamespace(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		reg := makeTestSchemaRegistry()
+		defer reg.Close()
+
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE DATABASE movr`)
+		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t,
+			`INSERT INTO movr.drivers VALUES (1, 'Alice')`,
+		)
+
+		noNamespaceFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers `+
+			`WITH format=$1, confluent_schema_registry=$2`,
+			changefeedbase.OptFormatAvro, reg.server.URL)
+		defer closeFeed(t, noNamespaceFeed)
+
+		assertPayloadsAvro(t, reg, noNamespaceFeed, []string{
+			`drivers: {"id":{"long":1}}->{"after":{"drivers":{"id":{"long":1},"name":{"string":"Alice"}}}}`,
+		})
+
+		namespaceFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers `+
+			`WITH format=$1, confluent_schema_registry=$2, avro_schema_prefix=super`,
+			changefeedbase.OptFormatAvro, reg.server.URL)
+		defer closeFeed(t, namespaceFeed)
+
+		assertPayloadsAvro(t, reg, namespaceFeed, []string{
+			`drivers: {"id":{"long":1}}->{"after":{"super.drivers":{"id":{"long":1},"name":{"string":"Alice"}}}}`,
+		})
+
+		require.NotContains(t, reg.mu.schemas[reg.mu.subjects[`drivers-key`]], `namespace`)
+		require.NotContains(t, reg.mu.schemas[reg.mu.subjects[`drivers-value`]], `namespace`)
+		require.Contains(t, reg.mu.schemas[reg.mu.subjects[`superdrivers-key`]], `"namespace":"super"`)
+		require.Contains(t, reg.mu.schemas[reg.mu.subjects[`superdrivers-value`]], `"namespace":"super"`)
+	}
+
+	t.Run(`enterprise`, enterpriseTest(testFn))
+}
+
+func TestTableNameCollision(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+		reg := makeTestSchemaRegistry()
+		defer reg.Close()
+
+		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB.Exec(t, `CREATE DATABASE movr`)
+		sqlDB.Exec(t, `CREATE DATABASE printr`)
+		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t, `CREATE TABLE printr.drivers (id INT PRIMARY KEY, version INT)`)
+		sqlDB.Exec(t,
+			`INSERT INTO movr.drivers VALUES (1, 'Alice'), (2, NULL)`,
+		)
+		sqlDB.Exec(t,
+			`INSERT INTO printr.drivers VALUES (1, 100), (2, NULL)`,
+		)
+
+		movrFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers `+
+			`WITH format=$1, confluent_schema_registry=$2, diff, resolved`,
+			changefeedbase.OptFormatAvro, reg.server.URL)
+		defer closeFeed(t, movrFeed)
+
+		printrFeed := feed(t, f, `CREATE CHANGEFEED FOR printr.drivers `+
+			`WITH format=$1, confluent_schema_registry=$2, diff, resolved`,
+			changefeedbase.OptFormatAvro, reg.server.URL)
+		defer closeFeed(t, printrFeed)
+
+		comboFeed := feed(t, f, `CREATE CHANGEFEED FOR printr.drivers, movr.drivers `+
+			`WITH format=$1, confluent_schema_registry=$2, diff, resolved, full_table_name`,
+			changefeedbase.OptFormatAvro, reg.server.URL)
+		defer closeFeed(t, comboFeed)
+
+		assertPayloadsAvro(t, reg, movrFeed, []string{
+			`drivers: {"id":{"long":1}}->{"after":{"drivers":{"id":{"long":1},"name":{"string":"Alice"}}},"before":null}`,
+			`drivers: {"id":{"long":2}}->{"after":{"drivers":{"id":{"long":2},"name":null}},"before":null}`,
+		})
+
+		assertPayloadsAvro(t, reg, printrFeed, []string{
+			`drivers: {"id":{"long":1}}->{"after":{"drivers":{"id":{"long":1},"version":{"long":100}}},"before":null}`,
+			`drivers: {"id":{"long":2}}->{"after":{"drivers":{"id":{"long":2},"version":null}},"before":null}`,
+		})
+
+		assertPayloadsAvro(t, reg, comboFeed, []string{
+			`movr.public.drivers: {"id":{"long":1}}->{"after":{"drivers":{"id":{"long":1},"name":{"string":"Alice"}}},"before":null}`,
+			`movr.public.drivers: {"id":{"long":2}}->{"after":{"drivers":{"id":{"long":2},"name":null}},"before":null}`,
+			`printr.public.drivers: {"id":{"long":1}}->{"after":{"drivers":{"id":{"long":1},"version":{"long":100}}},"before":null}`,
+			`printr.public.drivers: {"id":{"long":2}}->{"after":{"drivers":{"id":{"long":2},"version":null}},"before":null}`,
+		})
+	}
+
+	t.Run(`enterprise`, enterpriseTest(testFn))
+}
+
 func TestAvroMigrateToUnsupportedColumn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -443,10 +644,10 @@ func TestAvroLedger(t *testing.T) {
 			`entry: {"id":{"long":1543039099823358511}}->{"after":{"entry":{"amount":{"bytes.decimal":"0"},"created_ts":{"long.timestamp-micros":"1990-12-09T23:47:23.811124Z"},"customer_id":{"long":0},"id":{"long":1543039099823358511},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"44061/500"},"transaction_id":{"string":"payment:a8c7f832-281a-39c5-8820-1fb960ff6465"}}}}`,
 			`entry: {"id":{"long":2244708090865615074}}->{"after":{"entry":{"amount":{"bytes.decimal":"1/50"},"created_ts":{"long.timestamp-micros":"2075-11-08T22:07:12.055686Z"},"customer_id":{"long":0},"id":{"long":2244708090865615074},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"44061/500"},"transaction_id":{"string":"payment:a8c7f832-281a-39c5-8820-1fb960ff6465"}}}}`,
 			`entry: {"id":{"long":3305628230121721621}}->{"after":{"entry":{"amount":{"bytes.decimal":"1/25"},"created_ts":{"long.timestamp-micros":"2185-01-30T21:38:15.06669Z"},"customer_id":{"long":0},"id":{"long":3305628230121721621},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"44061/500"},"transaction_id":{"string":"payment:e3757ca7-d646-66ea-2b8d-6116831cbb05"}}}}`,
-			`entry: {"id":{"long":4151935814835861840}}->{"after":{"entry":{"amount":{"bytes.decimal":"3/50"},"created_ts":{"long.timestamp-micros":"1684-10-05T17:51:40.795101Z"},"customer_id":{"long":0},"id":{"long":4151935814835861840},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"44061/500"},"transaction_id":{"string":"payment:e3757ca7-d646-66ea-2b8d-6116831cbb05"}}}}`,
+			`entry: {"id":{"long":4151935814835861840}}->{"after":{"entry":{"amount":{"bytes.decimal":"3/50"},"created_ts":{"long.timestamp-micros":"2269-04-26T17:26:14.504652Z"},"customer_id":{"long":0},"id":{"long":4151935814835861840},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"44061/500"},"transaction_id":{"string":"payment:e3757ca7-d646-66ea-2b8d-6116831cbb05"}}}}`,
 			`entry: {"id":{"long":5577006791947779410}}->{"after":{"entry":{"amount":{"bytes.decimal":"0"},"created_ts":{"long.timestamp-micros":"2185-11-07T09:42:42.666146Z"},"customer_id":{"long":0},"id":{"long":5577006791947779410},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"-88123/1000"},"transaction_id":{"string":"payment:a8c7f832-281a-39c5-8820-1fb960ff6465"}}}}`,
-			`entry: {"id":{"long":6640668014774057861}}->{"after":{"entry":{"amount":{"bytes.decimal":"-1/50"},"created_ts":{"long.timestamp-micros":"1690-05-19T13:29:46.145044Z"},"customer_id":{"long":0},"id":{"long":6640668014774057861},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"-88123/1000"},"transaction_id":{"string":"payment:a8c7f832-281a-39c5-8820-1fb960ff6465"}}}}`,
-			`entry: {"id":{"long":7414159922357799360}}->{"after":{"entry":{"amount":{"bytes.decimal":"-1/25"},"created_ts":{"long.timestamp-micros":"1706-02-05T02:38:08.15195Z"},"customer_id":{"long":0},"id":{"long":7414159922357799360},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"-88123/1000"},"transaction_id":{"string":"payment:e3757ca7-d646-66ea-2b8d-6116831cbb05"}}}}`,
+			`entry: {"id":{"long":6640668014774057861}}->{"after":{"entry":{"amount":{"bytes.decimal":"-1/50"},"created_ts":{"long.timestamp-micros":"2274-12-08T13:04:19.854595Z"},"customer_id":{"long":0},"id":{"long":6640668014774057861},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"-88123/1000"},"transaction_id":{"string":"payment:a8c7f832-281a-39c5-8820-1fb960ff6465"}}}}`,
+			`entry: {"id":{"long":7414159922357799360}}->{"after":{"entry":{"amount":{"bytes.decimal":"-1/25"},"created_ts":{"long.timestamp-micros":"2290-08-26T02:12:41.861501Z"},"customer_id":{"long":0},"id":{"long":7414159922357799360},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"-88123/1000"},"transaction_id":{"string":"payment:e3757ca7-d646-66ea-2b8d-6116831cbb05"}}}}`,
 			`entry: {"id":{"long":8475284246537043955}}->{"after":{"entry":{"amount":{"bytes.decimal":"-3/50"},"created_ts":{"long.timestamp-micros":"2048-07-21T10:02:40.114474Z"},"customer_id":{"long":0},"id":{"long":8475284246537043955},"money_type":{"string":"C"},"system_amount":{"bytes.decimal":"-88123/1000"},"transaction_id":{"string":"payment:e3757ca7-d646-66ea-2b8d-6116831cbb05"}}}}`,
 			`session: {"session_id":{"string":"pLnfgDsc3WD9F3qNfHK6a95jjJkwzDkh0h3fhfUVuS0jZ9uVbhV4vC6AWX40IV"}}->{"after":{"session":{"data":{"string":"SP3NcHciWvqZTa3N06RxRTZHWUsaD7HEdz1ThbXfQ7pYSQ4n378l2VQKGNbSuJE0fQbzONJAAwdCxmM9BIabKERsUhPNmMmdf3eSJyYtqwcFiUILzXv3fcNIrWO8sToFgoilA1U2WxNeW2gdgUVDsEWJ88aX8tLF"},"expiry_timestamp":{"long.timestamp-micros":"2052-05-14T04:02:49.264975Z"},"last_update":{"long.timestamp-micros":"2070-03-19T02:10:22.552438Z"},"session_id":{"string":"pLnfgDsc3WD9F3qNfHK6a95jjJkwzDkh0h3fhfUVuS0jZ9uVbhV4vC6AWX40IV"}}}}`,
 			`transaction: {"external_id":{"string":"payment:a8c7f832-281a-39c5-8820-1fb960ff6465"}}->{"after":{"transaction":{"context":{"string":"BpLnfgDsc3WD9F3qNfHK6a95jjJkwzDkh0h3fhfUVuS0jZ9uVbhV4vC6"},"created_ts":{"long.timestamp-micros":"2178-08-01T19:10:30.064819Z"},"external_id":{"string":"payment:a8c7f832-281a-39c5-8820-1fb960ff6465"},"response":{"bytes":"MDZSeFJUWkhXVXNhRDdIRWR6MVRoYlhmUTdwWVNRNG4zNzhsMlZRS0dOYlN1SkUwZlFiek9OSkFBd2RDeG1NOUJJYWJLRVJzVWhQTm1NbWRmM2VTSnlZdHF3Y0ZpVUlMelh2M2ZjTklyV084c1RvRmdvaWxBMVUyV3hOZVcyZ2RnVVZEc0VXSjg4YVg4dExGSjk1cVlVN1VyTjljdGVjd1p0NlM1empoRDF0WFJUbWtZS1FvTjAyRm1XblFTSzN3UkM2VUhLM0txQXR4alAzWm1EMmp0dDR6Z3I2TWVVam9BamNPMGF6TW10VTRZdHYxUDhPUG1tU05hOThkN3RzdGF4eTZuYWNuSkJTdUZwT2h5SVhFN1BKMURoVWtMWHFZWW5FTnVucWRzd3BUdzVVREdEUzM0bVNQWUs4dm11YjNYOXVYSXU3Rk5jSmpBUlFUM1JWaFZydDI0UDdpNnhDckw2RmM0R2N1SEMxNGthdW5BVFVQUkhqR211Vm14SHN5enpCYnlPb25xVlVTREsxVg=="},"reversed_by":null,"systimestamp":{"long.timestamp-micros":"2215-07-28T23:47:01.795499Z"},"tcomment":null,"transaction_type_reference":{"long":400},"username":{"string":"WX40IVUWSP3NcHciWvqZ"}}}}`,

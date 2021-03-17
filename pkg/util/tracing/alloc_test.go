@@ -30,7 +30,6 @@ func BenchmarkTracer_StartSpanCtx(b *testing.B) {
 
 	tr := NewTracer()
 	sv := settings.Values{}
-	tracingMode.Override(&sv, int64(modeBackground))
 	tr.Configure(&sv)
 
 	staticLogTags := logtags.Buffer{}
@@ -50,28 +49,37 @@ func BenchmarkTracer_StartSpanCtx(b *testing.B) {
 		opts []SpanOption
 	}{
 		{"none", nil},
-		{"logtag", []SpanOption{WithLogTags(&staticLogTags)}},
-		{"tag", []SpanOption{WithTags(staticTag)}},
-		{"autoparent", []SpanOption{WithParentAndAutoCollection(parSp)}},
-		{"manualparent", []SpanOption{WithParentAndManualCollection(parSp.Meta())}},
+		{"real", []SpanOption{
+			WithForceRealSpan(),
+		}},
+		{"real,logtag", []SpanOption{
+			WithForceRealSpan(), WithLogTags(&staticLogTags),
+		}},
+		{"real,tag", []SpanOption{
+			WithForceRealSpan(), WithTags(staticTag),
+		}},
+		{"real,autoparent", []SpanOption{
+			WithForceRealSpan(), WithParentAndAutoCollection(parSp),
+		}},
+		{"real,manualparent", []SpanOption{
+			WithForceRealSpan(), WithParentAndManualCollection(parSp.Meta()),
+		}},
 	} {
 		b.Run(fmt.Sprintf("opts=%s", tc.name), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				newCtx, sp := tr.StartSpanCtx(ctx, "benching", tc.opts...)
 				_ = newCtx
-				_ = sp
+				sp.Finish() // clean up
 			}
 		})
 	}
 
 }
 
-// BenchmarkSpan_GetRecording microbenchmarks GetRecording
-// when background tracing is enabled.
+// BenchmarkSpan_GetRecording microbenchmarks GetRecording.
 func BenchmarkSpan_GetRecording(b *testing.B) {
 	var sv settings.Values
-	tracingMode.Override(&sv, int64(modeBackground))
 	tr := NewTracer()
 	tr.Configure(&sv)
 

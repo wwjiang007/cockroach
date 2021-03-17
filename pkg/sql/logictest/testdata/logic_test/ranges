@@ -309,7 +309,8 @@ start_key                          start_pretty                   end_key       
 [172]                              /Table/36                      [173]                              /Table/37                      system         statement_diagnostics            ·           {1}       1
 [173]                              /Table/37                      [174]                              /Table/38                      system         scheduled_jobs                   ·           {1}       1
 [174]                              /Table/38                      [175]                              /Table/39                      ·              ·                                ·           {1}       1
-[175]                              /Table/39                      [189 137]                          /Table/53/1                    system         sqlliveness                      ·           {1}       1
+[175]                              /Table/39                      [176]                              /Table/40                      system         sqlliveness                      ·           {1}       1
+[176]                              /Table/40                      [189 137]                          /Table/53/1                    system         migrations                       ·           {1}       1
 [189 137]                          /Table/53/1                    [189 137 137]                      /Table/53/1/1                  test           t                                ·           {1}       1
 [189 137 137]                      /Table/53/1/1                  [189 137 141 137]                  /Table/53/1/5/1                test           t                                ·           {3,4}     3
 [189 137 141 137]                  /Table/53/1/5/1                [189 137 141 138]                  /Table/53/1/5/2                test           t                                ·           {1,2,3}   1
@@ -367,7 +368,8 @@ start_key                          start_pretty                   end_key       
 [172]                              /Table/36                      [173]                              /Table/37                      system         statement_diagnostics            ·           {1}       1
 [173]                              /Table/37                      [174]                              /Table/38                      system         scheduled_jobs                   ·           {1}       1
 [174]                              /Table/38                      [175]                              /Table/39                      ·              ·                                ·           {1}       1
-[175]                              /Table/39                      [189 137]                          /Table/53/1                    system         sqlliveness                      ·           {1}       1
+[175]                              /Table/39                      [176]                              /Table/40                      system         sqlliveness                      ·           {1}       1
+[176]                              /Table/40                      [189 137]                          /Table/53/1                    system         migrations                       ·           {1}       1
 [189 137]                          /Table/53/1                    [189 137 137]                      /Table/53/1/1                  test           t                                ·           {1}       1
 [189 137 137]                      /Table/53/1/1                  [189 137 141 137]                  /Table/53/1/5/1                test           t                                ·           {3,4}     3
 [189 137 141 137]                  /Table/53/1/5/1                [189 137 141 138]                  /Table/53/1/5/2                test           t                                ·           {1,2,3}   1
@@ -552,3 +554,15 @@ CREATE TABLE err_msg (x INT, y INT, z INT, PRIMARY KEY (x, y), INDEX i (z))
 
 statement error HINT: columns \[x y\] are implicitly part of index "i"'s key, include columns \[z x y\] in this order
 SHOW RANGE FROM INDEX err_msg@i FOR ROW (1)
+
+# Regression test for incorrectly handling an excessive number of values in
+# SPLIT/UNSPLIT AT statements (#59011).
+statement ok
+CREATE TABLE t59011 (id UUID NOT NULL DEFAULT gen_random_uuid(), level INT8 NULL DEFAULT 0:::INT8, CONSTRAINT "primary" PRIMARY KEY (id ASC), INDEX i59011 (level ASC));
+INSERT INTO t59011(level) SELECT 2 FROM generate_series(1, 10);
+
+statement error excessive number of values provided: expected 1, got 2
+ALTER INDEX i59011 SPLIT AT VALUES (2, '6cf22b39-a1eb-43ee-8edf-0da8543c5c38'::UUID);
+
+statement error excessive number of values provided: expected 1, got 2
+ALTER INDEX i59011 UNSPLIT AT VALUES (2, '6cf22b39-a1eb-43ee-8edf-0da8543c5c38'::UUID);

@@ -59,7 +59,7 @@ func makeRunControlTestCases(t *testing.T) ([]runControlTestCase, func()) {
 	testCases[0].conn1 = tc.ServerConn(0).Conn
 	testCases[0].conn2 = tc.ServerConn(1).Conn
 
-	tenantDB := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+	_, tenantDB := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
 	testCases[1].name = "Tenant"
 	testCases[1].conn1 = tenantDB.Conn
 	testCases[1].conn2 = tenantDB.Conn
@@ -140,7 +140,7 @@ func TestCancelDistSQLQuery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	const queryToCancel = "SELECT * FROM nums ORDER BY num"
-	cancelQuery := fmt.Sprintf("CANCEL QUERIES SELECT query_id FROM [SHOW CLUSTER QUERIES] WHERE query = '%s'", queryToCancel)
+	cancelQuery := fmt.Sprintf("CANCEL QUERIES SELECT query_id FROM [SHOW CLUSTER STATEMENTS] WHERE query = '%s'", queryToCancel)
 
 	// conn1 is used for the query above. conn2 is solely for the CANCEL statement.
 	var conn1 *gosql.DB
@@ -654,6 +654,7 @@ func isClientsideQueryCanceledErr(err error) bool {
 
 func TestIdleInSessionTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	numNodes := 1
@@ -714,6 +715,7 @@ func TestIdleInSessionTimeout(t *testing.T) {
 
 func TestIdleInTransactionSessionTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	numNodes := 1
@@ -774,6 +776,7 @@ func TestIdleInTransactionSessionTimeout(t *testing.T) {
 
 func TestIdleInTransactionSessionTimeoutAbortedState(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	numNodes := 1
@@ -838,6 +841,7 @@ func TestIdleInTransactionSessionTimeoutAbortedState(t *testing.T) {
 
 func TestIdleInTransactionSessionTimeoutCommitWaitState(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	numNodes := 1
@@ -905,6 +909,7 @@ func TestIdleInTransactionSessionTimeoutCommitWaitState(t *testing.T) {
 
 func TestStatementTimeoutRetryableErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
 	numNodes := 1

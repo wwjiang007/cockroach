@@ -128,7 +128,7 @@ func TestStoresGetReplicaForRangeID(t *testing.T) {
 		rangeID := roachpb.RangeID(i)
 		replicaID := roachpb.ReplicaID(1)
 
-		memEngine := storage.NewDefaultInMem()
+		memEngine := storage.NewDefaultInMemForTesting()
 		stopper.AddCloser(memEngine)
 
 		cfg := TestStoreConfig(clock)
@@ -165,7 +165,7 @@ func TestStoresGetReplicaForRangeID(t *testing.T) {
 
 	// Test the case where the replica we're looking for exists.
 	rangeID1 := roachpb.RangeID(5)
-	replica1, _, err1 := ls.GetReplicaForRangeID(rangeID1)
+	replica1, _, err1 := ls.GetReplicaForRangeID(ctx, rangeID1)
 	if replica1 == nil {
 		t.Fatal("expected replica to be found; was nil")
 	}
@@ -178,7 +178,7 @@ func TestStoresGetReplicaForRangeID(t *testing.T) {
 
 	// Test the case where the replica we're looking for doesn't exist.
 	rangeID2 := roachpb.RangeID(1000)
-	replica2, _, err2 := ls.GetReplicaForRangeID(rangeID2)
+	replica2, _, err2 := ls.GetReplicaForRangeID(ctx, rangeID2)
 	if replica2 != nil {
 		t.Fatalf("expected replica to be nil; was %v", replica2)
 	}
@@ -224,7 +224,7 @@ func createStores(count int, t *testing.T) (*hlc.ManualClock, []*Store, *Stores,
 	stores := []*Store{}
 	for i := 0; i < count; i++ {
 		cfg.Transport = NewDummyRaftTransport(cfg.Settings)
-		eng := storage.NewDefaultInMem()
+		eng := storage.NewDefaultInMemForTesting()
 		stopper.AddCloser(eng)
 		s := NewStore(context.Background(), cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 		storeIDAlloc++
@@ -513,7 +513,7 @@ func TestStoresClusterVersionIncompatible(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			engs := []storage.Engine{storage.NewDefaultInMem()}
+			engs := []storage.Engine{storage.NewDefaultInMemForTesting()}
 			defer engs[0].Close()
 			// Configure versions and write.
 			cv := clusterversion.ClusterVersion{Version: tc.engV}

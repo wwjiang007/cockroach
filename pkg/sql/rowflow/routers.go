@@ -274,7 +274,7 @@ func (rb *routerBase) init(ctx context.Context, flowCtx *execinfra.FlowCtx, type
 			fmt.Sprintf("router-limited-%d", rb.outputs[i].streamID),
 		)
 		rb.outputs[i].diskMonitor = execinfra.NewMonitor(
-			ctx, flowCtx.Cfg.DiskMonitor,
+			ctx, flowCtx.DiskMonitor,
 			fmt.Sprintf("router-disk-%d", rb.outputs[i].streamID),
 		)
 		// Note that the monitor is an unlimited one since we don't know how
@@ -372,7 +372,7 @@ func (rb *routerBase) Start(ctx context.Context, wg *sync.WaitGroup, ctxCancel c
 					if rb.statsCollectionEnabled {
 						ro.stats.Exec.MaxAllocatedMem.Set(uint64(ro.memoryMonitor.MaximumBytes()))
 						ro.stats.Exec.MaxAllocatedDisk.Set(uint64(ro.diskMonitor.MaximumBytes()))
-						span.SetSpanStats(&ro.stats)
+						span.RecordStructured(&ro.stats)
 						span.Finish()
 						if trace := execinfra.GetTraceData(ctx); trace != nil {
 							ro.mu.Unlock()

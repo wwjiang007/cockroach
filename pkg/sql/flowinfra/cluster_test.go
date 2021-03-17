@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -71,7 +70,7 @@ func TestClusterFlow(t *testing.T) {
 	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 	makeIndexSpan := func(start, end int) execinfrapb.TableReaderSpan {
 		var span roachpb.Span
-		prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.GetPublicNonPrimaryIndexes()[0].ID))
+		prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(keys.SystemSQLCodec, desc, desc.PublicNonPrimaryIndexes()[0].GetID()))
 		span.Key = append(prefix, encoding.EncodeVarintAscending(nil, int64(start))...)
 		span.EndKey = append(span.EndKey, prefix...)
 		span.EndKey = append(span.EndKey, encoding.EncodeVarintAscending(nil, int64(end))...)
@@ -90,12 +89,12 @@ func TestClusterFlow(t *testing.T) {
 	ctx := tracing.ContextWithSpan(context.Background(), sp)
 	defer sp.Finish()
 
-	now := tc.Server(0).Clock().Now()
+	now := tc.Server(0).Clock().NowAsClockTimestamp()
 	txnProto := roachpb.MakeTransaction(
 		"cluster-test",
 		nil, // baseKey
 		roachpb.NormalUserPriority,
-		now,
+		now.ToTimestamp(),
 		0, // maxOffset
 	)
 	txn := kv.NewTxnFromProto(ctx, kvDB, tc.Server(0).NodeID(), now, kv.RootTxn, &txnProto)
@@ -271,6 +270,7 @@ func TestClusterFlow(t *testing.T) {
 	metas = ignoreMisplannedRanges(metas)
 	metas = ignoreLeafTxnState(metas)
 	metas = ignoreMetricsMeta(metas)
+	metas = ignoreTraceData(metas)
 	if len(metas) != 0 {
 		t.Fatalf("unexpected metadata (%d): %+v", len(metas), metas)
 	}
@@ -321,6 +321,18 @@ func ignoreMetricsMeta(metas []execinfrapb.ProducerMetadata) []execinfrapb.Produ
 	res := make([]execinfrapb.ProducerMetadata, 0)
 	for _, m := range metas {
 		if m.Metrics == nil {
+			res = append(res, m)
+		}
+	}
+	return res
+}
+
+// ignoreTraceData takes a slice of metadata and returns the entries
+// excluding the ones with trace data.
+func ignoreTraceData(metas []execinfrapb.ProducerMetadata) []execinfrapb.ProducerMetadata {
+	res := make([]execinfrapb.ProducerMetadata, 0)
+	for _, m := range metas {
+		if m.TraceData == nil {
 			res = append(res, m)
 		}
 	}
@@ -416,12 +428,12 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		Type: descpb.InnerJoin,
 	}
 
-	now := tc.Server(0).Clock().Now()
+	now := tc.Server(0).Clock().NowAsClockTimestamp()
 	txnProto := roachpb.MakeTransaction(
 		"deadlock-test",
 		nil, // baseKey
 		roachpb.NormalUserPriority,
-		now,
+		now.ToTimestamp(),
 		0, // maxOffset
 	)
 	txn := kv.NewTxnFromProto(
@@ -545,6 +557,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	metas = ignoreMisplannedRanges(metas)
 	metas = ignoreLeafTxnState(metas)
 	metas = ignoreMetricsMeta(metas)
+	metas = ignoreTraceData(metas)
 	if len(metas) != 0 {
 		t.Errorf("unexpected metadata (%d): %+v", len(metas), metas)
 	}
@@ -638,14 +651,16 @@ func TestEvalCtxTxnOnRemoteNodes(t *testing.T) {
 		1, /* numRows */
 		sqlutils.ToRowFn(sqlutils.RowIdxFn))
 
-	// Relocate the table to a remote node.
-	_, err := db.Exec("ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1)")
-	require.NoError(t, err)
+	// Relocate the table to a remote node. We use SucceedsSoon since in very
+	// rare circumstances the relocation query can result in an error (e.g.
+	// "cannot up-replicate to s2; missing gossiped StoreDescriptor") which
+	// shouldn't fail the test.
+	testutils.SucceedsSoon(t, func() error {
+		_, err := db.Exec("ALTER TABLE t EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 1)")
+		return err
+	})
 
 	testutils.RunTrueAndFalse(t, "vectorize", func(t *testing.T, vectorize bool) {
-		if vectorize {
-			skip.IgnoreLint(t, "skipped because we can't yet vectorize queries using DECIMALs")
-		}
 		// We're going to use the first node as the gateway and expect everything to
 		// be planned remotely.
 		db := tc.ServerConn(0)
@@ -736,12 +751,12 @@ func BenchmarkInfrastructure(b *testing.B) {
 						}
 						return execinfrapb.StreamEndpointSpec_REMOTE
 					}
-					now := tc.Server(0).Clock().Now()
+					now := tc.Server(0).Clock().NowAsClockTimestamp()
 					txnProto := roachpb.MakeTransaction(
 						"cluster-test",
 						nil, // baseKey
 						roachpb.NormalUserPriority,
-						now,
+						now.ToTimestamp(),
 						0, // maxOffset
 					)
 					txn := kv.NewTxnFromProto(
@@ -852,6 +867,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 						metas = ignoreMisplannedRanges(metas)
 						metas = ignoreLeafTxnState(metas)
 						metas = ignoreMetricsMeta(metas)
+						metas = ignoreTraceData(metas)
 						if len(metas) != 0 {
 							b.Fatalf("unexpected metadata (%d): %+v", len(metas), metas)
 						}

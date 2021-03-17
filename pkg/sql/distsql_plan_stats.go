@@ -53,7 +53,7 @@ var maxTimestampAge = settings.RegisterDurationSetting(
 )
 
 func (dsp *DistSQLPlanner) createStatsPlan(
-	planCtx *PlanningCtx, desc *tabledesc.Immutable, reqStats []requestedStat, job *jobs.Job,
+	planCtx *PlanningCtx, desc catalog.TableDescriptor, reqStats []requestedStat, job *jobs.Job,
 ) (*PhysicalPlan, error) {
 	if len(reqStats) == 0 {
 		return nil, errors.New("no stats requested")
@@ -81,7 +81,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	}
 	var colIdxMap catalog.TableColMap
 	for i, c := range scan.cols {
-		colIdxMap.Set(c.ID, i)
+		colIdxMap.Set(c.GetID(), i)
 	}
 	sb := span.MakeBuilder(planCtx.EvalContext(), planCtx.ExtendedEvalCtx.Codec, desc, scan.index)
 	scan.spans, err = sb.UnconstrainedSpans()
@@ -130,9 +130,9 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 			// TODO(mjibson): allow multiple inverted indexes on the same column (i.e.,
 			// with different configurations). See #50655.
 			col := s.columns[0]
-			for _, indexDesc := range desc.GetPublicNonPrimaryIndexes() {
-				if indexDesc.Type == descpb.IndexDescriptor_INVERTED && indexDesc.ColumnIDs[0] == col {
-					spec.Index = &indexDesc
+			for _, index := range desc.PublicNonPrimaryIndexes() {
+				if index.GetType() == descpb.IndexDescriptor_INVERTED && index.InvertedColumnID() == col {
+					spec.Index = index.IndexDesc()
 					break
 				}
 			}
@@ -186,7 +186,7 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 	)
 
 	// Estimate the expected number of rows based on existing stats in the cache.
-	tableStats, err := planCtx.ExtendedEvalCtx.ExecCfg.TableStatsCache.GetTableStats(planCtx.ctx, desc.ID)
+	tableStats, err := planCtx.ExtendedEvalCtx.ExecCfg.TableStatsCache.GetTableStats(planCtx.ctx, desc.GetID())
 	if err != nil {
 		return nil, err
 	}
@@ -202,19 +202,14 @@ func (dsp *DistSQLPlanner) createStatsPlan(
 		))
 	}
 
-	var jobID int64
-	if job.ID() != nil {
-		jobID = *job.ID()
-	}
-
 	// Set up the final SampleAggregator stage.
 	agg := &execinfrapb.SampleAggregatorSpec{
 		Sketches:         sketchSpecs,
 		InvertedSketches: invSketchSpecs,
 		SampleSize:       sampler.SampleSize,
 		SampledColumnIDs: sampledColumnIDs,
-		TableID:          desc.ID,
-		JobID:            jobID,
+		TableID:          desc.GetID(),
+		JobID:            job.ID(),
 		RowsExpected:     rowsExpected,
 	}
 	// Plan the SampleAggregator on the gateway, unless we have a single Sampler.
@@ -254,7 +249,7 @@ func (dsp *DistSQLPlanner) createPlanForCreateStats(
 		}
 	}
 
-	tableDesc := tabledesc.NewImmutable(details.Table)
+	tableDesc := tabledesc.NewBuilder(&details.Table).BuildImmutableTable()
 	return dsp.createStatsPlan(planCtx, tableDesc, reqStats, job)
 }
 
@@ -283,6 +278,7 @@ func (dsp *DistSQLPlanner) planAndRunCreateStats(
 		txn,
 		evalCtx.ExecCfg.Clock,
 		evalCtx.Tracing,
+		evalCtx.ExecCfg.ContentionRegistry,
 	)
 	defer recv.Release()
 

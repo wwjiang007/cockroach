@@ -15,26 +15,33 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"strings"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -301,7 +308,6 @@ func makeMetrics(internal bool) Metrics {
 			SQLOptFallbackCount:   metric.NewCounter(getMetricMeta(MetaSQLOptFallback, internal)),
 			SQLOptPlanCacheHits:   metric.NewCounter(getMetricMeta(MetaSQLOptPlanCacheHits, internal)),
 			SQLOptPlanCacheMisses: metric.NewCounter(getMetricMeta(MetaSQLOptPlanCacheMisses, internal)),
-
 			// TODO(mrtracy): See HistogramWindowInterval in server/config.go for the 6x factor.
 			DistSQLExecLatency: metric.NewLatency(getMetricMeta(MetaDistSQLExecLatency, internal),
 				6*metricsSampleInterval),
@@ -313,9 +319,11 @@ func makeMetrics(internal bool) Metrics {
 				6*metricsSampleInterval),
 			SQLTxnLatency: metric.NewLatency(getMetricMeta(MetaSQLTxnLatency, internal),
 				6*metricsSampleInterval),
+			SQLTxnsOpen: metric.NewGauge(getMetricMeta(MetaSQLTxnsOpen, internal)),
 
-			TxnAbortCount: metric.NewCounter(getMetricMeta(MetaTxnAbort, internal)),
-			FailureCount:  metric.NewCounter(getMetricMeta(MetaFailure, internal)),
+			TxnAbortCount:             metric.NewCounter(getMetricMeta(MetaTxnAbort, internal)),
+			FailureCount:              metric.NewCounter(getMetricMeta(MetaFailure, internal)),
+			FullTableOrIndexScanCount: metric.NewCounter(getMetricMeta(MetaFullTableOrIndexScan, internal)),
 		},
 		StartedStatementCounters:  makeStartedStatementCounters(internal),
 		ExecutedStatementCounters: makeExecutedStatementCounters(internal),
@@ -362,9 +370,8 @@ func (s *Server) GetUnscrubbedStmtStats() []roachpb.CollectedStatementStatistics
 	return s.sqlStats.getUnscrubbedStmtStats(s.cfg.VirtualSchemas)
 }
 
-// GetUnscrubbedTxnStats returns the same transaction statistics by app, with
-// the queries scrubbed of their identifiers. Any statement which cannot be
-// scrubbed will be omitted from the returned map.
+// GetUnscrubbedTxnStats returns the same transaction statistics by app.
+// Identifiers (e.g. table and column names) aren't scrubbed from the statements.
 func (s *Server) GetUnscrubbedTxnStats() []roachpb.CollectedTransactionStatistics {
 	return s.sqlStats.getUnscrubbedTxnStats()
 }
@@ -373,12 +380,6 @@ func (s *Server) GetUnscrubbedTxnStats() []roachpb.CollectedTransactionStatistic
 // returns statistics from the reported stats pool.
 func (s *Server) GetScrubbedReportingStats() []roachpb.CollectedStatementStatistics {
 	return s.reportedStats.getScrubbedStmtStats(s.cfg.VirtualSchemas)
-}
-
-// GetUnscrubbedReportingStats does the same thing as GetUnscrubbedStmtStats but
-// returns statistics from the reported stats pool.
-func (s *Server) GetUnscrubbedReportingStats() []roachpb.CollectedStatementStatistics {
-	return s.reportedStats.getUnscrubbedStmtStats(s.cfg.VirtualSchemas)
 }
 
 // GetStmtStatsLastReset returns the time at which the statement statistics were
@@ -565,7 +566,6 @@ func (s *Server) newConnExecutor(
 	nodeIDOrZero, _ := s.cfg.NodeID.OptionalNodeID()
 	sdMutator := new(sessionDataMutator)
 	*sdMutator = s.makeSessionDataMutator(sd, sdDefaults)
-
 	ex := &connExecutor{
 		server:      s,
 		metrics:     srvMetrics,
@@ -584,9 +584,10 @@ func (s *Server) newConnExecutor(
 			nodeIDOrZero: nodeIDOrZero,
 			clock:        s.cfg.Clock,
 			// Future transaction's monitors will inherits from sessionRootMon.
-			connMon:  sessionRootMon,
-			tracer:   s.cfg.AmbientCtx.Tracer,
-			settings: s.cfg.Settings,
+			connMon:          sessionRootMon,
+			tracer:           s.cfg.AmbientCtx.Tracer,
+			settings:         s.cfg.Settings,
+			execTestingKnobs: s.GetExecutorConfig().TestingKnobs,
 		},
 		memMetrics: memMetrics,
 		planner:    planner{execCfg: s.cfg, alloc: &rowenc.DatumAlloc{}},
@@ -594,6 +595,7 @@ func (s *Server) newConnExecutor(
 		// ctxHolder will be reset at the start of run(). We only define
 		// it here so that an early call to close() doesn't panic.
 		ctxHolder:                 ctxHolder{connCtx: ctx},
+		rng:                       rand.New(rand.NewSource(timeutil.Now().UnixNano())),
 		executorType:              executorTypeExec,
 		hasCreatedTemporarySchema: false,
 		stmtDiagnosticsRecorder:   s.cfg.StmtDiagnosticsRecorder,
@@ -639,6 +641,8 @@ func (s *Server) newConnExecutor(
 	ex.transitionCtx.sessionTracing = &ex.sessionTracing
 	ex.statsCollector = ex.newStatsCollector()
 
+	ex.extraTxnState.hasAdminRoleCache = HasAdminRoleCache{}
+
 	ex.initPlanner(ctx, &ex.planner)
 
 	return ex
@@ -664,7 +668,7 @@ func (s *Server) newConnExecutorWithTxn(
 	memMetrics MemoryMetrics,
 	srvMetrics *Metrics,
 	txn *kv.Txn,
-	tcModifier descs.ModifiedCollectionCopier,
+	syntheticDescs []catalog.Descriptor,
 	appStats *appStats,
 ) *connExecutor {
 	ex := s.newConnExecutor(ctx, sd, sdDefaults, stmtBuf, clientComm, memMetrics, srvMetrics, appStats)
@@ -698,9 +702,7 @@ func (s *Server) newConnExecutorWithTxn(
 	// Modify the Collection to match the parent executor's Collection.
 	// This allows the InternalExecutor to see schema changes made by the
 	// parent executor.
-	if tcModifier != nil {
-		tcModifier.CopyModifiedObjects(&ex.extraTxnState.descCollection)
-	}
+	ex.extraTxnState.descCollection.SetSyntheticDescriptors(syntheticDescs)
 	return ex
 }
 
@@ -736,7 +738,7 @@ func (s *Server) PeriodicallyClearSQLStats(
 	stats *sqlStats,
 	reset func(ctx context.Context),
 ) {
-	stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = stopper.RunAsyncTask(ctx, "sql-stats-clearer", func(ctx context.Context) {
 		var timer timeutil.Timer
 		for {
 			s.sqlStats.Lock()
@@ -785,7 +787,8 @@ func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{})
 
 			// Embed the statement in the error object for the telemetry
 			// report below. The statement gets anonymized.
-			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST)
+			vt := ex.planner.extendedEvalCtx.VirtualSchemas
+			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST, vt)
 		}
 
 		// Report the panic to telemetry in any case.
@@ -818,6 +821,22 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 			"connExecutor closing")}
 		if err := ex.machine.ApplyWithPayload(ctx, ev, payload); err != nil {
 			log.Warningf(ctx, "error while cleaning up connExecutor: %s", err)
+		}
+		switch t := ex.machine.CurState().(type) {
+		case stateNoTxn:
+			// No txn to finish.
+		case stateAborted:
+			// A non-retriable error with IsCommit set to true causes the transaction
+			// to be cleaned up.
+		case stateCommitWait:
+			ex.state.finishSQLTxn()
+		default:
+			if util.CrdbTestBuild {
+				panic(errors.AssertionFailedf("unexpected state in conn executor after ApplyWithPayload %T", t))
+			}
+		}
+		if util.CrdbTestBuild && ex.state.Ctx != nil {
+			panic(errors.AssertionFailedf("txn span not closed in state %s", ex.machine.CurState()))
 		}
 	} else if closeType == externalTxnClose {
 		ex.state.finishExternalTxn()
@@ -884,6 +903,20 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 		ex.sessionMon.EmergencyStop(ctx)
 		ex.mon.EmergencyStop(ctx)
 	}
+}
+
+// HasAdminRoleCache is stored in extraTxnState and used to cache if the
+// user has admin role throughout a transaction.
+// This is used for admin audit logging to check if a transaction is being
+// executed with admin privileges.
+// HasAdminRoleCache does not have to be reset when a transaction restarts
+// or roles back as the user's admin status will not change throughout the
+// lifecycle of a single transaction.
+type HasAdminRoleCache struct {
+	HasAdminRole bool
+
+	// IsSet is used to determine if the value for caching is set or not.
+	IsSet bool
 }
 
 type connExecutor struct {
@@ -968,6 +1001,17 @@ type connExecutor struct {
 		// comprising statements.
 		numRows int
 
+		// txnCounter keeps track of how many SQL txns have been open since
+		// the start of the session. This is used for logging, to
+		// distinguish statements that belong to separate SQL transactions.
+		// A txn unique key can be obtained by grouping this counter with
+		// the session ID.
+		//
+		// Note that a single SQL txn can use multiple KV txns under the
+		// hood with multiple KV txn UUIDs, so the KV UUID is not a good
+		// txn identifier for SQL logging.
+		txnCounter int
+
 		// txnRewindPos is the position within stmtBuf to which we'll rewind when
 		// performing automatic retries. This is more or less the position where the
 		// current transaction started.
@@ -1033,6 +1077,24 @@ type connExecutor struct {
 		// still need the statementID hash to disambiguate beyond the capped
 		// statements.
 		transactionStatementsHash util.FNV64
+
+		schemaChangerState SchemaChangerState
+
+		// shouldCollectExecutionStats specifies whether the statements in this
+		// transaction should collect execution stats.
+		shouldCollectExecutionStats bool
+		// accumulatedStats are the accumulated stats of all statements.
+		accumulatedStats execstats.QueryLevelStats
+		// rowsRead and bytesRead are separate from QueryLevelStats because they are
+		// accumulated independently since they are always collected, as opposed to
+		// QueryLevelStats which are sampled.
+		rowsRead  int64
+		bytesRead int64
+
+		// hasAdminRole is used to cache if the user running the transaction
+		// has admin privilege. hasAdminRoleCache is set for the first statement
+		// in a transaction.
+		hasAdminRoleCache HasAdminRoleCache
 	}
 
 	// sessionData contains the user-configurable connection variables.
@@ -1075,6 +1137,10 @@ type connExecutor struct {
 	// statsCollector is used to collect statistics about SQL statements and
 	// transactions.
 	statsCollector *sqlStatsCollector
+
+	// rng is used to generate random numbers. An example usage is to determine
+	// whether to sample execution stats.
+	rng *rand.Rand
 
 	// mu contains of all elements of the struct that can be changed
 	// after initialization, and may be accessed from another thread.
@@ -1219,6 +1285,12 @@ func (ns *prepStmtNamespace) resetTo(
 // commits, rolls back or restarts.
 func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) error {
 	ex.extraTxnState.jobs = nil
+	ex.extraTxnState.hasAdminRoleCache = HasAdminRoleCache{}
+	if ex.server.cfg.Settings.Version.IsActive(ctx, clusterversion.NewSchemaChanger) {
+		ex.extraTxnState.schemaChangerState = SchemaChangerState{
+			mode: ex.sessionData.NewSchemaChangerMode,
+		}
+	}
 
 	for k := range ex.extraTxnState.schemaChangeJobsCache {
 		delete(ex.extraTxnState.schemaChangeJobsCache, k)
@@ -1265,13 +1337,6 @@ func (ex *connExecutor) Ctx() context.Context {
 	// stateInternalError is used by the InternalExecutor.
 	if _, ok := ex.machine.CurState().(stateInternalError); ok {
 		ctx = ex.ctxHolder.ctx()
-	}
-	return ex.DescriptorValidationContext(ctx)
-}
-
-func (ex *connExecutor) DescriptorValidationContext(ctx context.Context) context.Context {
-	if ex.server.cfg.TestingKnobs.TestingDescriptorValidation {
-		return context.WithValue(ctx, tabledesc.PerformTestingDescriptorValidation, true)
 	}
 	return ctx
 }
@@ -1398,12 +1463,16 @@ func (ex *connExecutor) execCmd(ctx context.Context) error {
 		return err // err could be io.EOF
 	}
 
+	// Ensure that every statement has a tracing span set up.
 	ctx, sp := tracing.EnsureChildSpan(
 		ctx, ex.server.cfg.AmbientCtx.Tracer,
 		// We print the type of command, not the String() which includes long
 		// statements.
 		cmd.command())
 	defer sp.Finish()
+	// We expect that the span is not used directly, so we'll overwrite the
+	// local variable.
+	sp = nil
 
 	if log.ExpensiveLogEnabled(ctx, 2) || ex.eventLog != nil {
 		ex.sessionEventf(ctx, "[%s pos:%d] executing %s",
@@ -2161,6 +2230,7 @@ func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, 
 	evalCtx.Mon = ex.state.mon
 	evalCtx.PrepareOnly = false
 	evalCtx.SkipNormalize = false
+	evalCtx.SchemaChangerState = &ex.extraTxnState.schemaChangerState
 }
 
 // getTransactionState retrieves a text representation of the given state.
@@ -2209,6 +2279,7 @@ func (ex *connExecutor) resetPlanner(
 	p.semaCtx.AsOfTimestamp = nil
 	p.semaCtx.Annotations = nil
 	p.semaCtx.TypeResolver = p
+	p.semaCtx.TableNameResolver = p
 
 	ex.resetEvalCtx(&p.extendedEvalCtx, txn, stmtTS)
 
@@ -2251,6 +2322,9 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 	case txnStart:
 		ex.extraTxnState.autoRetryCounter = 0
 		ex.extraTxnState.onTxnFinish, ex.extraTxnState.onTxnRestart = ex.recordTransactionStart()
+		// Bump the txn counter for logging.
+		ex.extraTxnState.txnCounter++
+
 	case txnCommit:
 		if res.Err() != nil {
 			err := errorutil.UnexpectedWithIssueErrorf(
@@ -2494,9 +2568,68 @@ func (ex *connExecutor) notifyStatsRefresherOfNewTables(ctx context.Context) {
 			// for rowsAffected because we want to make sure that stats always get
 			// created/refreshed here.
 			ex.planner.execCfg.StatsRefresher.
-				NotifyMutation(desc.ID, math.MaxInt32 /* rowsAffected */)
+				NotifyMutation(desc.GetID(), math.MaxInt32 /* rowsAffected */)
 		}
 	}
+}
+
+// runPreCommitStages is part of the new schema changer infrastructure to
+// mutate descriptors prior to committing a SQL transaction.
+func (ex *connExecutor) runPreCommitStages(ctx context.Context) error {
+	if len(ex.extraTxnState.schemaChangerState.nodes) == 0 {
+		return nil
+	}
+	executor := scexec.NewExecutor(
+		ex.planner.txn, &ex.extraTxnState.descCollection, ex.server.cfg.Codec,
+		nil /* backfiller */, nil, /* jobTracker */
+	)
+	after, err := runNewSchemaChanger(
+		ctx, scplan.PreCommitPhase,
+		ex.extraTxnState.schemaChangerState.nodes,
+		executor,
+	)
+	if err != nil {
+		return err
+	}
+	scs := &ex.extraTxnState.schemaChangerState
+	scs.nodes = after
+	targetSlice := make([]*scpb.Target, len(scs.nodes))
+	states := make([]scpb.State, len(scs.nodes))
+	for i := range scs.nodes {
+		targetSlice[i] = scs.nodes[i].Target
+		states[i] = scs.nodes[i].State
+	}
+	_, err = ex.planner.extendedEvalCtx.QueueJob(ctx, jobs.Record{
+		Description:   "Schema change job", // TODO(ajwerner): use const
+		Statement:     "",                  // TODO(ajwerner): combine all of the DDL statements together
+		Username:      ex.planner.User(),
+		DescriptorIDs: nil, // TODO(ajwerner): populate
+		Details:       jobspb.NewSchemaChangeDetails{Targets: targetSlice},
+		Progress:      jobspb.NewSchemaChangeProgress{States: states},
+		RunningStatus: "",
+		NonCancelable: false,
+	})
+	return err
+}
+
+func runNewSchemaChanger(
+	ctx context.Context, phase scplan.Phase, nodes []*scpb.Node, executor *scexec.Executor,
+) (after []*scpb.Node, _ error) {
+	sc, err := scplan.MakePlan(nodes, scplan.Params{
+		ExecutionPhase: phase,
+		// TODO(ajwerner): Populate the set of new descriptors
+	})
+	if err != nil {
+		return nil, err
+	}
+	after = nodes
+	for _, s := range sc.Stages {
+		if err := executor.ExecuteOps(ctx, s.Ops); err != nil {
+			return nil, err
+		}
+		after = s.After
+	}
+	return after, nil
 }
 
 // StatementCounters groups metrics for counting different types of
@@ -2624,7 +2757,13 @@ func (sc *StatementCounters) incrementCount(ex *connExecutor, stmt tree.Statemen
 	case *tree.CommitTransaction:
 		sc.TxnCommitCount.Inc()
 	case *tree.RollbackTransaction:
-		sc.TxnRollbackCount.Inc()
+		// The CommitWait state means that the transaction has already committed
+		// after a specially handled `RELEASE SAVEPOINT cockroach_restart` command.
+		if ex.getTransactionState() == CommitWaitStateStr {
+			sc.TxnCommitCount.Inc()
+		} else {
+			sc.TxnRollbackCount.Inc()
+		}
 	case *tree.Savepoint:
 		if ex.isCommitOnReleaseSavepoint(t.Name) {
 			sc.RestartSavepointCount.Inc()
@@ -2721,6 +2860,6 @@ func init() {
 			return ""
 		}
 		// Anonymize the statement for reporting.
-		return anonymizeStmtAndConstants(stmt)
+		return anonymizeStmtAndConstants(stmt, nil /* VirtualTabler */)
 	})
 }

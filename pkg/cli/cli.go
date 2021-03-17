@@ -11,6 +11,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -80,9 +81,24 @@ func Main() {
 func doMain(cmd *cobra.Command, cmdName string) error {
 	if cmd != nil && !cmdHasCustomLoggingSetup(cmd) {
 		// the customLoggingSetupCmds do their own calls to setupLogging().
-		if err := setupLogging(context.Background(), cmd,
-			false /* isServerCmd */, true /* applyConfig */); err != nil {
-			return err
+		//
+		// We use a PreRun function, to ensure setupLogging() is only
+		// called after the command line flags have been parsed.
+		//
+		// NB: we cannot use PersistentPreRunE,like in flags.go, because
+		// overriding that here will prevent the persistent pre-run from
+		// running on parent commands. (See the difference between PreRun
+		// and PersistentPreRun in `(*cobra.Command) execute()`.)
+		wrapped := cmd.PreRunE
+		cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
+			if wrapped != nil {
+				if err := wrapped(cmd, args); err != nil {
+					return err
+				}
+			}
+
+			return setupLogging(context.Background(), cmd,
+				false /* isServerCmd */, true /* applyConfig */)
 		}
 	}
 
@@ -162,22 +178,34 @@ Output build version information.
 `,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		info := build.GetInfo()
-		tw := tabwriter.NewWriter(os.Stdout, 2, 1, 2, ' ', 0)
-		fmt.Fprintf(tw, "Build Tag:        %s\n", info.Tag)
-		fmt.Fprintf(tw, "Build Time:       %s\n", info.Time)
-		fmt.Fprintf(tw, "Distribution:     %s\n", info.Distribution)
-		fmt.Fprintf(tw, "Platform:         %s", info.Platform)
-		if info.CgoTargetTriple != "" {
-			fmt.Fprintf(tw, " (%s)", info.CgoTargetTriple)
+		if cliCtx.showVersionUsingOnlyBuildTag {
+			info := build.GetInfo()
+			fmt.Println(info.Tag)
+		} else {
+			fmt.Println(fullVersionString())
 		}
-		fmt.Fprintln(tw)
-		fmt.Fprintf(tw, "Go Version:       %s\n", info.GoVersion)
-		fmt.Fprintf(tw, "C Compiler:       %s\n", info.CgoCompiler)
-		fmt.Fprintf(tw, "Build Commit ID:  %s\n", info.Revision)
-		fmt.Fprintf(tw, "Build Type:       %s\n", info.Type)
-		return tw.Flush()
+		return nil
 	},
+}
+
+func fullVersionString() string {
+	info := build.GetInfo()
+	var buf bytes.Buffer
+	tw := tabwriter.NewWriter(&buf, 2, 1, 2, ' ', 0)
+	fmt.Fprintf(tw, "Build Tag:        %s\n", info.Tag)
+	fmt.Fprintf(tw, "Build Time:       %s\n", info.Time)
+	fmt.Fprintf(tw, "Distribution:     %s\n", info.Distribution)
+	fmt.Fprintf(tw, "Platform:         %s", info.Platform)
+	if info.CgoTargetTriple != "" {
+		fmt.Fprintf(tw, " (%s)", info.CgoTargetTriple)
+	}
+	fmt.Fprintln(tw)
+	fmt.Fprintf(tw, "Go Version:       %s\n", info.GoVersion)
+	fmt.Fprintf(tw, "C Compiler:       %s\n", info.CgoCompiler)
+	fmt.Fprintf(tw, "Build Commit ID:  %s\n", info.Revision)
+	fmt.Fprintf(tw, "Build Type:       %s", info.Type) // No final newline: cobra prints one for us.
+	_ = tw.Flush()
+	return buf.String()
 }
 
 var cockroachCmd = &cobra.Command{
@@ -196,6 +224,10 @@ var cockroachCmd = &cobra.Command{
 	// details and hints, which cobra does not do for us. Instead
 	// we do the printing in Main().
 	SilenceErrors: true,
+	// Version causes cobra to automatically support a --version flag
+	// that reports this string.
+	Version: "details:\n" + fullVersionString() +
+		"\n(use '" + os.Args[0] + " version --build-tag' to display only the build tag)",
 }
 
 var workloadCmd = workloadcli.WorkloadCmd(true /* userFacing */)
@@ -218,8 +250,11 @@ func init() {
 	cockroachCmd.AddCommand(
 		startCmd,
 		startSingleNodeCmd,
+		connectCmd,
 		initCmd,
 		certCmd,
+		// TODO(bilal): Uncomment this when the connect command does something useful.
+		// connectCmd,
 		quitCmd,
 
 		sqlShellCmd,

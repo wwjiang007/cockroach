@@ -28,6 +28,10 @@ import (
 //
 // This function does not assume that the expression has been fully normalized.
 func (m *Memo) CheckExpr(e opt.Expr) {
+	if m.disableCheckExpr {
+		return
+	}
+
 	// Check properties.
 	switch t := e.(type) {
 	case RelExpr:
@@ -103,6 +107,30 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 	case *SelectExpr:
 		checkFilters(t.Filters)
 
+	case *UnionExpr, *UnionAllExpr, *LocalityOptimizedSearchExpr:
+		setPrivate := t.Private().(*SetPrivate)
+		outColSet := setPrivate.OutCols.ToSet()
+
+		// Check that columns on the left side of the union are not reused in
+		// the output.
+		leftColSet := setPrivate.LeftCols.ToSet()
+		if outColSet.Intersects(leftColSet) {
+			panic(errors.AssertionFailedf(
+				"union reuses columns in left input: %v",
+				outColSet.Intersection(leftColSet),
+			))
+		}
+
+		// Check that columns on the right side of the union are not reused in
+		// the output.
+		rightColSet := setPrivate.RightCols.ToSet()
+		if outColSet.Intersects(rightColSet) {
+			panic(errors.AssertionFailedf(
+				"union reuses columns in right input: %v",
+				outColSet.Intersection(rightColSet),
+			))
+		}
+
 	case *AggregationsExpr:
 		var checkAggs func(scalar opt.ScalarExpr)
 		checkAggs = func(scalar opt.ScalarExpr) {
@@ -163,8 +191,11 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 		}
 
 	case *LookupJoinExpr:
-		if len(t.KeyCols) == 0 {
-			panic(errors.AssertionFailedf("lookup join with no key columns"))
+		if len(t.KeyCols) == 0 && len(t.LookupExpr) == 0 {
+			panic(errors.AssertionFailedf("lookup join with no key columns or lookup filters"))
+		}
+		if len(t.KeyCols) != 0 && len(t.LookupExpr) != 0 {
+			panic(errors.AssertionFailedf("lookup join with both key columns and lookup filters"))
 		}
 		if t.Cols.Empty() {
 			panic(errors.AssertionFailedf("lookup join with no output columns"))
@@ -177,6 +208,7 @@ func (m *Memo) CheckExpr(e opt.Expr) {
 		requiredCols.UnionWith(t.ConstFilters.OuterCols())
 		requiredCols.UnionWith(t.On.OuterCols())
 		requiredCols.UnionWith(t.KeyCols.ToSet())
+		requiredCols.UnionWith(t.LookupExpr.OuterCols())
 		idx := m.Metadata().Table(t.Table).Index(t.Index)
 		for i := range t.KeyCols {
 			requiredCols.Add(t.Table.ColumnID(idx.Column(i).Ordinal()))

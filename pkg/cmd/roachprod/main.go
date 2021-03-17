@@ -41,8 +41,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/flagutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
-	"golang.org/x/crypto/ssh/terminal"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 var rootCmd = &cobra.Command{
@@ -185,7 +185,7 @@ Available clusters:
 		c.Tag = "/" + tag
 	}
 	c.UseTreeDist = useTreeDist
-	c.Quiet = quiet || !terminal.IsTerminal(int(os.Stdout.Fd()))
+	c.Quiet = quiet || !term.IsTerminal(int(os.Stdout.Fd()))
 	c.MaxConcurrency = maxConcurrency
 	return c, nil
 }
@@ -1796,6 +1796,8 @@ func main() {
 				&install.StartOpts.Encrypt, "encrypt", encrypt, "start nodes with encryption at rest turned on")
 			cmd.Flags().BoolVar(
 				&install.StartOpts.SkipInit, "skip-init", skipInit, "skip initializing the cluster")
+			cmd.Flags().IntVar(
+				&install.StartOpts.StoreCount, "store-count", 1, "number of stores to start each node with")
 			fallthrough
 		case sqlCmd:
 			cmd.Flags().StringVarP(

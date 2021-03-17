@@ -70,7 +70,7 @@ func (s *Server) gcSystemLog(
 	ctx context.Context, table string, timestampLowerBound, timestampUpperBound time.Time,
 ) (time.Time, int64, error) {
 	var totalRowsAffected int64
-	repl, _, err := s.node.stores.GetReplicaForRangeID(roachpb.RangeID(1))
+	repl, _, err := s.node.stores.GetReplicaForRangeID(ctx, roachpb.RangeID(1))
 	if roachpb.IsRangeNotFoundError(err) {
 		return timestampLowerBound, 0, nil
 	}
@@ -78,7 +78,7 @@ func (s *Server) gcSystemLog(
 		return timestampLowerBound, 0, err
 	}
 
-	if !repl.IsFirstRange() || !repl.OwnsValidLease(ctx, s.clock.Now()) {
+	if !repl.IsFirstRange() || !repl.OwnsValidLease(ctx, s.clock.NowAsClockTimestamp()) {
 		return timestampLowerBound, 0, nil
 	}
 
@@ -164,7 +164,7 @@ func (s *Server) startSystemLogsGC(ctx context.Context) {
 		},
 	}
 
-	s.stopper.RunWorker(ctx, func(ctx context.Context) {
+	_ = s.stopper.RunAsyncTask(ctx, "system-log-gc", func(ctx context.Context) {
 		period := systemLogGCPeriod
 		if storeKnobs, ok := s.cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs); ok && storeKnobs.SystemLogsGCPeriod != 0 {
 			period = storeKnobs.SystemLogsGCPeriod
@@ -205,12 +205,12 @@ func (s *Server) startSystemLogsGC(ctx context.Context) {
 				if storeKnobs, ok := s.cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs); ok && storeKnobs.SystemLogsGCGCDone != nil {
 					select {
 					case storeKnobs.SystemLogsGCGCDone <- struct{}{}:
-					case <-s.stopper.ShouldStop():
+					case <-s.stopper.ShouldQuiesce():
 						// Test has finished.
 						return
 					}
 				}
-			case <-s.stopper.ShouldStop():
+			case <-s.stopper.ShouldQuiesce():
 				return
 			}
 		}

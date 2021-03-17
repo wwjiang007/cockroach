@@ -69,7 +69,7 @@ func descForTable(
 		if err != nil {
 			t.Fatal(err)
 		}
-		fks.resolver[name] = desc
+		fks.resolver.tableNameToDesc[name] = desc
 	} else {
 		stmt = parsed[0].AST.(*tree.CreateTable)
 	}
@@ -253,6 +253,12 @@ func (es *generatorExternalStorage) ReadFile(
 	ctx context.Context, basename string,
 ) (io.ReadCloser, error) {
 	return es.gen.Open()
+}
+
+func (es *generatorExternalStorage) ReadFileAt(
+	ctx context.Context, basename string, offset int64,
+) (io.ReadCloser, int64, error) {
+	panic("unimplemented")
 }
 
 func (es *generatorExternalStorage) Close() error {

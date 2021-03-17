@@ -19,16 +19,26 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
 
+var numSteps int
+
+func init() {
+	numSteps = envutil.EnvOrDefaultInt("COCKROACH_KVNEMESIS_STEPS", 50)
+}
+
 func TestKVNemesisSingleNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderRace(t)
+
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -42,7 +52,7 @@ func TestKVNemesisSingleNode(t *testing.T) {
 	config.NumNodes, config.NumReplicas = 1, 1
 	rng, _ := randutil.NewPseudoRand()
 	ct := sqlClosedTimestampTargetInterval{sqlDBs: []*gosql.DB{sqlDB}}
-	failures, err := RunNemesis(ctx, rng, ct, config, db)
+	failures, err := RunNemesis(ctx, rng, ct, config, numSteps, db)
 	require.NoError(t, err, `%+v`, err)
 
 	for _, failure := range failures {
@@ -52,6 +62,8 @@ func TestKVNemesisSingleNode(t *testing.T) {
 
 func TestKVNemesisMultiNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderRace(t)
+
 	defer log.Scope(t).Close(t)
 
 	// 4 nodes so we have somewhere to move 3x replicated ranges to.
@@ -65,12 +77,15 @@ func TestKVNemesisMultiNode(t *testing.T) {
 		sqlDBs[i] = tc.ServerConn(i)
 	}
 	sqlutils.MakeSQLRunner(sqlDBs[0]).Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
+	// Turn net/trace on, which results in real trace spans created throughout.
+	// This gives kvnemesis a chance to hit NPEs related to tracing.
+	sqlutils.MakeSQLRunner(sqlDBs[0]).Exec(t, `SET CLUSTER SETTING trace.debug.enable = true`)
 
 	config := NewDefaultConfig()
 	config.NumNodes, config.NumReplicas = numNodes, 3
 	rng, _ := randutil.NewPseudoRand()
 	ct := sqlClosedTimestampTargetInterval{sqlDBs: sqlDBs}
-	failures, err := RunNemesis(ctx, rng, ct, config, dbs...)
+	failures, err := RunNemesis(ctx, rng, ct, config, numSteps, dbs...)
 	require.NoError(t, err, `%+v`, err)
 
 	for _, failure := range failures {

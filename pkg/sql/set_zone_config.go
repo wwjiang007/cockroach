@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -24,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -66,7 +66,9 @@ var supportedZoneConfigOptions = map[tree.Name]struct {
 }{
 	"range_min_bytes": {types.Int, func(c *zonepb.ZoneConfig, d tree.Datum) { c.RangeMinBytes = proto.Int64(int64(tree.MustBeDInt(d))) }},
 	"range_max_bytes": {types.Int, func(c *zonepb.ZoneConfig, d tree.Datum) { c.RangeMaxBytes = proto.Int64(int64(tree.MustBeDInt(d))) }},
+	"global_reads":    {types.Bool, func(c *zonepb.ZoneConfig, d tree.Datum) { c.GlobalReads = proto.Bool(bool(tree.MustBeDBool(d))) }},
 	"num_replicas":    {types.Int, func(c *zonepb.ZoneConfig, d tree.Datum) { c.NumReplicas = proto.Int32(int32(tree.MustBeDInt(d))) }},
+	"num_voters":      {types.Int, func(c *zonepb.ZoneConfig, d tree.Datum) { c.NumVoters = proto.Int32(int32(tree.MustBeDInt(d))) }},
 	"gc.ttlseconds": {types.Int, func(c *zonepb.ZoneConfig, d tree.Datum) {
 		c.GC = &zonepb.GCPolicy{TTLSeconds: int32(tree.MustBeDInt(d))}
 	}},
@@ -78,6 +80,15 @@ var supportedZoneConfigOptions = map[tree.Name]struct {
 		loadYAML(&constraintsList, string(tree.MustBeDString(d)))
 		c.Constraints = constraintsList.Constraints
 		c.InheritedConstraints = false
+	}},
+	"voter_constraints": {types.String, func(c *zonepb.ZoneConfig, d tree.Datum) {
+		voterConstraintsList := zonepb.ConstraintsList{
+			Constraints: c.VoterConstraints,
+			Inherited:   c.InheritedVoterConstraints,
+		}
+		loadYAML(&voterConstraintsList, string(tree.MustBeDString(d)))
+		c.VoterConstraints = voterConstraintsList.Constraints
+		c.InheritedVoterConstraints = false
 	}},
 	"lease_preferences": {types.String, func(c *zonepb.ZoneConfig, d tree.Datum) {
 		loadYAML(&c.LeasePreferences, string(tree.MustBeDString(d)))
@@ -117,6 +128,15 @@ func (p *planner) SetZoneConfig(ctx context.Context, n *tree.SetZoneConfig) (pla
 	}
 	if !p.ExecCfg().Codec.ForSystemTenant() {
 		return nil, errorutil.UnsupportedWithMultiTenancy(multitenancyZoneCfgIssueNo)
+	}
+
+	if err := p.CheckZoneConfigChangePermittedForMultiRegion(
+		ctx,
+		n.ZoneSpecifier,
+		n.Options,
+		p.SessionData().OverrideMultiRegionZoneConfigEnabled,
+	); err != nil {
+		return nil, err
 	}
 
 	var yamlConfig tree.TypedExpr
@@ -161,6 +181,11 @@ func (p *planner) SetZoneConfig(ctx context.Context, n *tree.SetZoneConfig) (pla
 			if !ok {
 				return nil, pgerror.Newf(pgcode.InvalidParameterValue,
 					"unsupported zone config parameter: %q", tree.ErrString(&opt.Key))
+			}
+			if (opt.Key == "num_voters" || opt.Key == "voter_constraints") &&
+				!p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.NonVotingReplicas) {
+				return nil, pgerror.Newf(pgcode.FeatureNotSupported,
+					"num_voters and voter_constraints cannot be used until cluster version is finalized")
 			}
 			telemetry.Inc(
 				sqltelemetry.SchemaSetZoneConfigCounter(
@@ -216,7 +241,7 @@ func checkPrivilegeForSetZoneConfig(ctx context.Context, p *planner, zs tree.Zon
 
 		return pgerror.Newf(pgcode.InsufficientPrivilege,
 			"user %s does not have %s or %s privilege on %s %s",
-			p.SessionData().User(), privilege.ZONECONFIG, privilege.CREATE, dbDesc.TypeName(), dbDesc.GetName())
+			p.SessionData().User(), privilege.ZONECONFIG, privilege.CREATE, dbDesc.DescriptorType(), dbDesc.GetName())
 	}
 	tableDesc, err := p.resolveTableForZone(ctx, &zs)
 	if err != nil {
@@ -239,7 +264,7 @@ func checkPrivilegeForSetZoneConfig(ctx context.Context, p *planner, zs tree.Zon
 
 	return pgerror.Newf(pgcode.InsufficientPrivilege,
 		"user %s does not have %s or %s privilege on %s %s",
-		p.SessionData().User(), privilege.ZONECONFIG, privilege.CREATE, tableDesc.TypeName(), tableDesc.GetName())
+		p.SessionData().User(), privilege.ZONECONFIG, privilege.CREATE, tableDesc.DescriptorType(), tableDesc.GetName())
 }
 
 // setZoneConfigRun contains the run-time state of setZoneConfigNode during local execution.
@@ -328,16 +353,29 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 		return err
 	}
 
+	// If the table descriptor is resolved but is not a
+	// physical table then return an error.
+	if table != nil && !table.IsPhysicalTable() {
+		return pgerror.Newf(pgcode.WrongObjectType, "cannot set a zone configuration on non-physical object %s", table.GetName())
+	}
+
 	if n.zoneSpecifier.TargetsPartition() && len(n.zoneSpecifier.TableOrIndex.Index) == 0 && !n.allIndexes {
 		// Backward compatibility for ALTER PARTITION ... OF TABLE. Determine which
 		// index has the specified partition.
 		partitionName := string(n.zoneSpecifier.Partition)
-		indexes := table.FindIndexesWithPartition(partitionName)
+
+		var indexes []catalog.Index
+		for _, idx := range table.NonDropIndexes() {
+			if tabledesc.FindIndexPartitionByName(idx.IndexDesc(), partitionName) != nil {
+				indexes = append(indexes, idx)
+			}
+		}
+
 		switch len(indexes) {
 		case 0:
 			return fmt.Errorf("partition %q does not exist on table %q", partitionName, table.GetName())
 		case 1:
-			n.zoneSpecifier.TableOrIndex.Index = tree.UnrestrictedName(indexes[0].Name)
+			n.zoneSpecifier.TableOrIndex.Index = tree.UnrestrictedName(indexes[0].GetName())
 		default:
 			err := fmt.Errorf(
 				"partition %q exists on multiple indexes of table %q", partitionName, table.GetName())
@@ -353,10 +391,10 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 	var specifiers []tree.ZoneSpecifier
 	if n.zoneSpecifier.TargetsPartition() && n.allIndexes {
 		sqltelemetry.IncrementPartitioningCounter(sqltelemetry.AlterAllPartitions)
-		for _, idx := range table.AllNonDropIndexes() {
-			if p := tabledesc.FindIndexPartitionByName(idx, string(n.zoneSpecifier.Partition)); p != nil {
+		for _, idx := range table.NonDropIndexes() {
+			if p := tabledesc.FindIndexPartitionByName(idx.IndexDesc(), string(n.zoneSpecifier.Partition)); p != nil {
 				zs := n.zoneSpecifier
-				zs.TableOrIndex.Index = tree.UnrestrictedName(idx.Name)
+				zs.TableOrIndex.Index = tree.UnrestrictedName(idx.GetName())
 				specifiers = append(specifiers, zs)
 			}
 		}
@@ -648,8 +686,11 @@ func (n *setZoneConfigNode) startExec(params runParams) error {
 			// require from changes made to parent zones. The extra protections are:
 			//
 			// RangeMinBytes and RangeMaxBytes must be set together
-			// LeasePreferences cannot be set unless Constraints are explicitly set
-			// Per-replica constraints cannot be set unless num_replicas is explicitly set
+			// LeasePreferences cannot be set unless Constraints/VoterConstraints are
+			// explicitly set
+			// Per-replica constraints cannot be set unless num_replicas is explicitly
+			// set
+			// Per-voter constraints cannot be set unless num_voters is explicitly set
 			if err := finalZone.ValidateTandemFields(); err != nil {
 				err = errors.Wrap(err, "could not validate zone config")
 				err = pgerror.WithCandidateCode(err, pgcode.InvalidParameterValue)
@@ -713,7 +754,14 @@ type nodeGetter func(context.Context, *serverpb.NodesRequest) (*serverpb.NodesRe
 // will be rejected. Additionally, invalid constraints such as
 // [+region=us-east1, -region=us-east1] will also be rejected.
 func validateNoRepeatKeysInZone(zone *zonepb.ZoneConfig) error {
-	for _, constraints := range zone.Constraints {
+	if err := validateNoRepeatKeysInConjunction(zone.Constraints); err != nil {
+		return err
+	}
+	return validateNoRepeatKeysInConjunction(zone.VoterConstraints)
+}
+
+func validateNoRepeatKeysInConjunction(conjunctions []zonepb.ConstraintsConjunction) error {
+	for _, constraints := range conjunctions {
 		// Because we expect to have a small number of constraints, a nested
 		// loop is probably better than allocating a map.
 		for i, curr := range constraints.Constraints {
@@ -761,7 +809,7 @@ func validateNoRepeatKeysInZone(zone *zonepb.ZoneConfig) error {
 func validateZoneAttrsAndLocalities(
 	ctx context.Context, getNodes nodeGetter, zone *zonepb.ZoneConfig,
 ) error {
-	if len(zone.Constraints) == 0 && len(zone.LeasePreferences) == 0 {
+	if len(zone.Constraints) == 0 && len(zone.VoterConstraints) == 0 && len(zone.LeasePreferences) == 0 {
 		return nil
 	}
 
@@ -787,6 +835,11 @@ func validateZoneAttrsAndLocalities(
 		}
 	}
 	for _, constraints := range zone.Constraints {
+		for _, constraint := range constraints.Constraints {
+			addToValidate(constraint)
+		}
+	}
+	for _, constraints := range zone.VoterConstraints {
 		for _, constraint := range constraints.Constraints {
 			addToValidate(constraint)
 		}
@@ -892,8 +945,9 @@ func getZoneConfigRaw(
 }
 
 // RemoveIndexZoneConfigs removes the zone configurations for some
-// indexs being dropped. It is a no-op if there is no zone
-// configuration or run on behalf of a tenant.
+// indexes being dropped. It is a no-op if there is no zone
+// configuration, there's no index zone configs to be dropped,
+// or it is run on behalf of a tenant.
 //
 // It operates entirely on the current goroutine and is thus able to
 // reuse an existing client.Txn safely.
@@ -901,35 +955,45 @@ func RemoveIndexZoneConfigs(
 	ctx context.Context,
 	txn *kv.Txn,
 	execCfg *ExecutorConfig,
-	tableID descpb.ID,
+	tableDesc catalog.TableDescriptor,
 	indexDescs []descpb.IndexDescriptor,
 ) error {
 	if !execCfg.Codec.ForSystemTenant() {
 		// Tenants are agnostic to zone configs.
 		return nil
 	}
-	desc, err := catalogkv.GetDescriptorByID(ctx, txn, execCfg.Codec, tableID,
-		catalogkv.Mutable, catalogkv.TableDescriptorKind, true)
+	zone, err := getZoneConfigRaw(ctx, txn, execCfg.Codec, tableDesc.GetID())
 	if err != nil {
 		return err
 	}
-	tableDesc := desc.(catalog.TableDescriptor)
-
-	zone, err := getZoneConfigRaw(ctx, txn, execCfg.Codec, tableID)
-	if err != nil {
-		return err
-	} else if zone == nil {
-		zone = zonepb.NewZoneConfig()
+	// If there are no zone configs, there's nothing to remove.
+	if zone == nil {
+		return nil
 	}
 
+	// Look through all of the subzones and determine if we need to remove any
+	// of them. We only want to rewrite the zone config below if there's actual
+	// work to be done here.
+	zcRewriteNecessary := false
 	for _, indexDesc := range indexDescs {
-		zone.DeleteIndexSubzones(uint32(indexDesc.ID))
+		for _, s := range zone.Subzones {
+			if s.IndexID == uint32(indexDesc.ID) {
+				// We've found an subzone that matches the given indexID. Delete all of
+				// this index's subzones and move on to the next index.
+				zone.DeleteIndexSubzones(uint32(indexDesc.ID))
+				zcRewriteNecessary = true
+				break
+			}
+		}
 	}
 
-	// Ignore CCL required error to allow schema change to progress.
-	_, err = writeZoneConfig(ctx, txn, tableID, tableDesc, zone, execCfg, false /* hasNewSubzones */)
-	if err != nil && !sqlerrors.IsCCLRequiredError(err) {
-		return err
+	if zcRewriteNecessary {
+		// Ignore CCL required error to allow schema change to progress.
+		_, err = writeZoneConfig(ctx, txn, tableDesc.GetID(), tableDesc, zone, execCfg, false /* hasNewSubzones */)
+		if err != nil && !sqlerrors.IsCCLRequiredError(err) {
+			return err
+		}
 	}
+
 	return nil
 }

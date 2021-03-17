@@ -94,7 +94,7 @@ func (s *Store) ComputeMVCCStats() (enginepb.MVCCStats, error) {
 // store's consistency queue.
 func ConsistencyQueueShouldQueue(
 	ctx context.Context,
-	now hlc.Timestamp,
+	now hlc.ClockTimestamp,
 	desc *roachpb.RangeDescriptor,
 	getQueueLastProcessed func(ctx context.Context) (hlc.Timestamp, error),
 	isNodeLive func(nodeID roachpb.NodeID) (bool, error),
@@ -147,7 +147,7 @@ func (s *Store) SetSplitQueueActive(active bool) {
 	s.setSplitQueueActive(active)
 }
 
-// SetMergeQueueActive enables or disables the split queue.
+// SetMergeQueueActive enables or disables the merge queue.
 func (s *Store) SetMergeQueueActive(active bool) {
 	s.setMergeQueueActive(active)
 }
@@ -216,32 +216,6 @@ func (s *Store) RequestClosedTimestamp(nodeID roachpb.NodeID, rangeID roachpb.Ra
 	s.cfg.ClosedTimestamp.Clients.Request(nodeID, rangeID)
 }
 
-// AssertInvariants verifies that the store's bookkeping is self-consistent. It
-// is only valid to call this method when there is no in-flight traffic to the
-// store (e.g., after the store is shut down).
-func (s *Store) AssertInvariants() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	s.mu.replicas.Range(func(_ int64, p unsafe.Pointer) bool {
-		ctx := s.cfg.AmbientCtx.AnnotateCtx(context.Background())
-		repl := (*Replica)(p)
-		// We would normally need to hold repl.raftMu. Otherwise we can observe an
-		// initialized replica that is not in s.replicasByKey, e.g., if we race with
-		// a goroutine that is currently initializing repl. The lock ordering makes
-		// acquiring repl.raftMu challenging; instead we require that this method is
-		// called only when there is no in-flight traffic to the store, at which
-		// point acquiring repl.raftMu is unnecessary.
-		if repl.IsInitialized() {
-			if ex := s.mu.replicasByKey.Get(repl); ex != repl {
-				log.Fatalf(ctx, "%v misplaced in replicasByKey; found %v instead", repl, ex)
-			}
-		} else if _, ok := s.mu.uninitReplicas[repl.RangeID]; !ok {
-			log.Fatalf(ctx, "%v missing from uninitReplicas", repl)
-		}
-		return true // keep iterating
-	})
-}
-
 func NewTestStorePool(cfg StoreConfig) *StorePool {
 	TimeUntilStoreDead.Override(&cfg.Settings.SV, TestTimeUntilStoreDeadOff)
 	return NewStorePool(
@@ -263,9 +237,9 @@ func NewTestStorePool(cfg StoreConfig) *StorePool {
 func (r *Replica) AssertState(ctx context.Context, reader storage.Reader) {
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.assertStateLocked(ctx, reader)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	r.assertStateRaftMuLockedReplicaMuRLocked(ctx, reader)
 }
 
 func (r *Replica) RaftLock() {
@@ -512,6 +486,14 @@ func (r *Replica) ReadProtectedTimestamps(ctx context.Context) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	ts = r.readProtectedTimestampsRLocked(ctx, nil /* f */)
+}
+
+// ClosedTimestampPolicy returns the closed timestamp policy of the range, which
+// is updated asynchronously through gossip of zone configurations.
+func (r *Replica) ClosedTimestampPolicy() roachpb.RangeClosedTimestampPolicy {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.closedTimestampPolicyRLocked()
 }
 
 // GetCircuitBreaker returns the circuit breaker controlling

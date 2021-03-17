@@ -45,11 +45,12 @@ go_library(
 
 go_test(
     name = "opttester_test",
+    size = "small",
     srcs = ["opt_tester_test.go"],
     data = glob(["testdata/**"]),
     deps = [
+        ":opttester",
         "//pkg/sql/opt/memo",
-        "//pkg/sql/opt/testutils/opttester",
         "//pkg/sql/opt/testutils/testcat",
         "@com_github_cockroachdb_datadriven//:datadriven",
     ],

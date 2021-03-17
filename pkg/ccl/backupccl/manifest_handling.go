@@ -16,7 +16,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"net/url"
 	"path"
 	"sort"
@@ -72,13 +71,31 @@ const (
 const (
 	// BackupFormatDescriptorTrackingVersion added tracking of complete DBs.
 	BackupFormatDescriptorTrackingVersion uint32 = 1
-	// ZipType is the format of a GZipped compressed file.
-	ZipType = "application/x-gzip"
 
-	dateBasedIncFolderName  = "/20060102/150405.00"
-	dateBasedIntoFolderName = "/2006/01/02-150405.00"
+	// DateBasedIncFolderName is the date format used when creating sub-directories
+	// storing incremental backups for auto-appendable backups.
+	// It is exported for testing backup inspection tooling.
+	DateBasedIncFolderName = "/20060102/150405.00"
+	// DateBasedIntoFolderName is the date format used when creating sub-directories
+	// for storing backups in a collection.
+	// Also exported for testing backup inspection tooling.
+	DateBasedIntoFolderName = "/2006/01/02-150405.00"
 	latestFileName          = "LATEST"
 )
+
+// isGZipped detects whether the given bytes represent GZipped data. This check
+// is used rather than a standard implementation such as http.DetectContentType
+// since some zipped data may be mis-identified by that method. We've seen
+// gzipped data incorrectly identified as "application/vnd.ms-fontobject". The
+// magic bytes are from the MIME sniffing algorithm http.DetectContentType is
+// based which can be found at https://mimesniff.spec.whatwg.org/.
+//
+// This method is only used to detect if protobufs are GZipped, and there are no
+// conflicts between the starting bytes of a protobuf and these magic bytes.
+func isGZipped(dat []byte) bool {
+	gzipPrefix := []byte("\x1F\x8B\x08")
+	return bytes.HasPrefix(dat, gzipPrefix)
+}
 
 // BackupFileDescriptors is an alias on which to implement sort's interface.
 type BackupFileDescriptors []BackupManifest_File
@@ -93,7 +110,7 @@ func (r BackupFileDescriptors) Less(i, j int) bool {
 }
 
 // ReadBackupManifestFromURI creates an export store from the given URI, then
-// reads and unmarshals a BackupManifest at the standard location in the
+// reads and unmarshalls a BackupManifest at the standard location in the
 // export storage.
 func ReadBackupManifestFromURI(
 	ctx context.Context,
@@ -108,10 +125,12 @@ func ReadBackupManifestFromURI(
 		return BackupManifest{}, err
 	}
 	defer exportStore.Close()
-	return readBackupManifestFromStore(ctx, exportStore, encryption)
+	return ReadBackupManifestFromStore(ctx, exportStore, encryption)
 }
 
-func readBackupManifestFromStore(
+// ReadBackupManifestFromStore reads and unmarshalls a BackupManifest
+// from an export store.
+func ReadBackupManifestFromStore(
 	ctx context.Context,
 	exportStore cloud.ExternalStorage,
 	encryption *jobspb.BackupEncryptionOptions,
@@ -223,8 +242,7 @@ func readBackupManifest(
 		}
 	}
 
-	fileType := http.DetectContentType(descBytes)
-	if fileType == ZipType {
+	if isGZipped(descBytes) {
 		descBytes, err = decompressData(descBytes)
 		if err != nil {
 			return BackupManifest{}, errors.Wrap(
@@ -290,8 +308,7 @@ func readBackupPartitionDescriptor(
 		}
 	}
 
-	fileType := http.DetectContentType(descBytes)
-	if fileType == ZipType {
+	if isGZipped(descBytes) {
 		descBytes, err = decompressData(descBytes)
 		if err != nil {
 			return BackupPartitionDescriptor{}, errors.Wrap(
@@ -583,12 +600,12 @@ func findPriorBackupNames(ctx context.Context, store cloud.ExternalStorage) ([]s
 	return prev, nil
 }
 
-// findPriorBackupLocations finds "appended" incremental backups by searching
+// FindPriorBackupLocations finds "appended" incremental backups by searching
 // for the subdirectories matching the naming pattern (e.g. YYMMDD/HHmmss.ss).
 // Using file-system searching rather than keeping an explicit list allows
 // layers to be manually moved/removed/etc without needing to update/maintain
 // said list.
-func findPriorBackupLocations(ctx context.Context, store cloud.ExternalStorage) ([]string, error) {
+func FindPriorBackupLocations(ctx context.Context, store cloud.ExternalStorage) ([]string, error) {
 	backupManifestSuffix := backupManifestName
 	prev, err := store.ListFiles(ctx, incBackupSubdirGlob+backupManifestSuffix)
 	if err != nil {
@@ -632,7 +649,7 @@ func resolveBackupManifests(
 	localityInfo []jobspb.RestoreDetails_BackupLocalityInfo,
 	_ error,
 ) {
-	baseManifest, err := readBackupManifestFromStore(ctx, baseStores[0], encryption)
+	baseManifest, err := ReadBackupManifestFromStore(ctx, baseStores[0], encryption)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -657,7 +674,7 @@ func resolveBackupManifests(
 				defer stores[j].Close()
 			}
 
-			mainBackupManifests[i], err = readBackupManifestFromStore(ctx, stores[0], encryption)
+			mainBackupManifests[i], err = ReadBackupManifestFromStore(ctx, stores[0], encryption)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -669,9 +686,6 @@ func resolveBackupManifests(
 					return nil, nil, nil, err
 				}
 			}
-		}
-		if err != nil {
-			return nil, nil, nil, err
 		}
 	} else {
 		// Since incremental layers were *not* explicitly specified, search for any
@@ -829,7 +843,7 @@ func loadSQLDescsFromBackupsAtTime(
 	unwrapDescriptors := func(raw []descpb.Descriptor) []catalog.Descriptor {
 		ret := make([]catalog.Descriptor, 0, len(raw))
 		for i := range raw {
-			ret = append(ret, catalogkv.UnwrapDescriptorRaw(context.TODO(), &raw[i]))
+			ret = append(ret, catalogkv.NewBuilder(&raw[i]).BuildExistingMutable())
 		}
 		return ret
 	}
@@ -863,7 +877,7 @@ func loadSQLDescsFromBackupsAtTime(
 	for _, raw := range byID {
 		// A revision may have been captured before it was in a DB that is
 		// backed up -- if the DB is missing, filter the object.
-		desc := catalogkv.UnwrapDescriptorRaw(context.TODO(), raw)
+		desc := catalogkv.NewBuilder(raw).BuildExistingMutable()
 		var isObject bool
 		switch desc.(type) {
 		case catalog.TableDescriptor, catalog.TypeDescriptor, catalog.SchemaDescriptor:
@@ -988,6 +1002,21 @@ func checkForPreviousBackup(
 }
 
 // tempCheckpointFileNameForJob returns temporary filename for backup manifest checkpoint.
-func tempCheckpointFileNameForJob(jobID int64) string {
+func tempCheckpointFileNameForJob(jobID jobspb.JobID) string {
 	return fmt.Sprintf("%s-%d", backupManifestCheckpointName, jobID)
+}
+
+// ListFullBackupsInCollection lists full backup paths in the collection
+// of an export store
+func ListFullBackupsInCollection(
+	ctx context.Context, store cloud.ExternalStorage,
+) ([]string, error) {
+	backupPaths, err := store.ListFiles(ctx, "/*/*/*/"+backupManifestName)
+	if err != nil {
+		return nil, err
+	}
+	for i, backupPath := range backupPaths {
+		backupPaths[i] = strings.TrimSuffix(backupPath, "/"+backupManifestName)
+	}
+	return backupPaths, nil
 }
